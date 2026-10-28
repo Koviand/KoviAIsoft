@@ -1150,3 +1150,78 @@ button {
     gap: 10px;
   }
 }
+
+/* Splash / onboarding */
+.splash-shell,
+.wizard-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    radial-gradient(1200px 600px at 10% -10%, color-mix(in srgb, var(--accent) 22%, transparent), transparent),
+    linear-gradient(165deg, #dfe6ef 0%, var(--bg) 45%, #edf1f6 100%);
+}
+.splash-card,
+.wizard-card {
+  width: min(560px, 100%);
+  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--ink) 8%, transparent);
+  border-radius: calc(var(--radius) + 4px);
+  padding: 28px;
+  box-shadow: 0 18px 50px color-mix(in srgb, var(--ink) 10%, transparent);
+}
+.splash-mark { width: 56px; height: 56px; font-size: 1.4rem; }
+.splash-title,
+.wizard-title {
+  font-family: "Syne", sans-serif;
+  font-size: 1.6rem;
+  font-weight: 700;
+  margin-top: 10px;
+}
+.wizard-brand {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 22px;
+}
+.wizard-step h2 {
+  font-family: "Syne", sans-serif;
+  font-size: 1.25rem;
+  margin: 0 0 8px;
+}
+.wizard-step label { display: block; margin-top: 12px; font-size: 0.85rem; }
+.wizard-step .input { margin-top: 6px; width: 100%; }
+
+.topbar-model-select {
+  max-width: 180px;
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--ink) 12%, transparent);
+  background: color-mix(in srgb, var(--surface) 88%, white);
+  color: var(--ink);
+  font-size: 0.78rem;
+  padding: 0 8px;
+}
+.session-search,
+.session-folder-filter {
+  width: calc(100% - 16px);
+  margin: 0 8px 8px;
+  font-size: 0.8rem;
+}
+.diff-preview {
+  margin-top: 10px;
+  max-height: 220px;
+  overflow: auto;
+  padding: 10px;
+  border-radius: 10px;
+  background: #0f172a;
+  color: #e2e8f0;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  white-space: pre-wrap;
+}
+.badge-danger {
+  background: color-mix(in srgb, #b91c1c 18%, transparent);
+  color: #b91c1c;
+}

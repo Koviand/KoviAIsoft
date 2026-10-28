@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import type { McpServerConfig } from "@kovi/shared";
+import type { McpHealthResult, McpServerConfig } from "@kovi/shared";
 
 export interface McpToolInfo {
   serverId: string;
@@ -111,5 +111,71 @@ export class McpManager {
     }
     this.clients.clear();
     this.tools = [];
+  }
+
+  /** Probe one or more MCP servers without mutating the live tool set. */
+  async healthCheck(configs: McpServerConfig[]): Promise<McpHealthResult[]> {
+    let sdk: ReturnType<typeof loadMcp>;
+    try {
+      sdk = loadMcp();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return configs.map((cfg) => ({
+        serverId: cfg.id,
+        name: cfg.name,
+        ok: false,
+        toolCount: 0,
+        message: `MCP SDK недоступен: ${message}`,
+        checkedAt: new Date().toISOString(),
+      }));
+    }
+
+    const results: McpHealthResult[] = [];
+    for (const cfg of configs) {
+      const checkedAt = new Date().toISOString();
+      let client: McpClient | null = null;
+      try {
+        client = new sdk.Client({ name: "KoviAIsoft-health", version: "0.1.0" });
+        if (cfg.transport === "stdio") {
+          if (!cfg.command) throw new Error("Не задана команда stdio");
+          const transport = new sdk.StdioClientTransport({
+            command: cfg.command,
+            args: cfg.args || [],
+            env: { ...process.env, ...(cfg.env || {}) } as Record<string, string>,
+          });
+          await client.connect(transport);
+        } else {
+          if (!cfg.url) throw new Error("Не задан URL SSE");
+          const transport = new sdk.SSEClientTransport(new URL(cfg.url));
+          await client.connect(transport);
+        }
+        const listed = await client.listTools();
+        const toolCount = listed.tools?.length || 0;
+        results.push({
+          serverId: cfg.id,
+          name: cfg.name,
+          ok: true,
+          toolCount,
+          message: `OK · ${toolCount} tools`,
+          checkedAt,
+        });
+      } catch (err) {
+        results.push({
+          serverId: cfg.id,
+          name: cfg.name,
+          ok: false,
+          toolCount: 0,
+          message: err instanceof Error ? err.message : String(err),
+          checkedAt,
+        });
+      } finally {
+        try {
+          await client?.close();
+        } catch {
+          // ignore
+        }
+      }
+    }
+    return results;
   }
 }

@@ -1,5 +1,5 @@
 import path from "node:path";
-import type { FileAccessMode } from "@kovi/shared";
+import type { AgentRiskMode, FileAccessMode } from "@kovi/shared";
 
 export function normalizePath(p: string): string {
   return path.resolve(p);
@@ -57,4 +57,31 @@ export function riskForTool(
   }
   if (name.startsWith("mcp_") && /write|delete|create|update|exec/i.test(name)) return "medium";
   return "low";
+}
+
+/**
+ * Whether the agent should prompt the user before running a tool.
+ * - ask: confirm medium + high
+ * - auto-safe: auto-approve medium when path is inside project; always confirm high
+ * - full: skip confirms except dangerous system paths (forced high)
+ */
+export function shouldConfirmRisk(
+  risk: "low" | "medium" | "high",
+  mode: AgentRiskMode,
+  args: Record<string, unknown>,
+  projectRoot: string | null,
+): boolean {
+  if (risk === "low") return false;
+  const target = String(args.path || args.file || args.cwd || "");
+  if (target && isDangerousWrite(target)) return true;
+  if (mode === "full") return risk === "high" && Boolean(target && isDangerousWrite(target));
+  if (mode === "auto-safe") {
+    if (risk === "high") return true;
+    if (projectRoot && target && isPathInside(target, projectRoot)) {
+      return false;
+    }
+    return true;
+  }
+  // ask
+  return true;
 }

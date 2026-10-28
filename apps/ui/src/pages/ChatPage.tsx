@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ChatMessage, ChatSession } from "@kovi/shared";
+import type { AppSettings, ChatMessage, ChatSession } from "@kovi/shared";
 import { sessionToolsEnabled } from "@kovi/shared";
 import { api } from "../api";
 import { paramLabel, statusRu } from "../lib/labels";
@@ -33,11 +33,13 @@ export function ChatPage(props: {
   activeSessionId: string | null;
   messages: ChatMessage[];
   busy: boolean;
+  settings: AppSettings | null;
   setSessions: (s: ChatSession[]) => void;
   setActiveSessionId: (id: string | null) => void;
   setMessages: (m: ChatMessage[]) => void;
   setBusy: (b: boolean) => void;
   setError: (e: string | null) => void;
+  setSettings: (s: AppSettings) => void;
 }) {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState("");
@@ -48,6 +50,8 @@ export function ChatPage(props: {
   >([]);
   const [agentOn, setAgentOn] = useState(false);
   const [showParams, setShowParams] = useState(false);
+  const [sessionQuery, setSessionQuery] = useState("");
+  const [folderFilter, setFolderFilter] = useState<string>("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const activeIdRef = useRef(props.activeSessionId);
   const paramTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -57,6 +61,23 @@ export function ChatPage(props: {
     () => props.sessions.find((s) => s.id === props.activeSessionId) || null,
     [props.sessions, props.activeSessionId],
   );
+
+  const folders = useMemo(() => {
+    const fromSessions = props.sessions
+      .map((s) => s.folder)
+      .filter((f): f is string => Boolean(f && f.trim()));
+    const catalog = props.settings?.sessionFolders || [];
+    return [...new Set([...catalog, ...fromSessions])].sort((a, b) => a.localeCompare(b));
+  }, [props.sessions, props.settings?.sessionFolders]);
+
+  const filteredSessions = useMemo(() => {
+    const q = sessionQuery.trim().toLowerCase();
+    return props.sessions.filter((s) => {
+      if (folderFilter && (s.folder || "") !== folderFilter) return false;
+      if (!q) return true;
+      return s.title.toLowerCase().includes(q) || (s.folder || "").toLowerCase().includes(q);
+    });
+  }, [props.sessions, sessionQuery, folderFilter]);
 
   useEffect(() => {
     if (!activeSession) {
@@ -237,6 +258,50 @@ export function ChatPage(props: {
 
   const isEmpty = props.messages.length === 0 && !streaming && !thinking;
 
+  async function exportActive(): Promise<void> {
+    if (!props.activeSessionId) return;
+    try {
+      const bundle = await api.exportSession(props.activeSessionId);
+      const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `kovi-session-${props.activeSessionId.slice(0, 8)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      props.setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function importSessionFile(file: File): Promise<void> {
+    try {
+      const text = await file.text();
+      const bundle = JSON.parse(text);
+      const session = await api.importSession(bundle);
+      props.setSessions(await api.listSessions());
+      props.setActiveSessionId(session.id);
+    } catch (e) {
+      props.setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function setSessionFolder(folder: string): Promise<void> {
+    if (!activeSession) return;
+    try {
+      const next = { ...activeSession, folder: folder.trim() || undefined };
+      await api.updateSession(next);
+      props.setSessions(await api.listSessions());
+      if (folder.trim() && props.settings) {
+        const foldersNext = [...new Set([...(props.settings.sessionFolders || []), folder.trim()])];
+        const saved = await api.saveSettings({ ...props.settings, sessionFolders: foldersNext });
+        props.setSettings(saved);
+      }
+    } catch (e) {
+      props.setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   return (
     <div className="panel chat-panel">
       <div className="panel-list">
@@ -256,11 +321,48 @@ export function ChatPage(props: {
           >
             Новый диалог
           </button>
+          <label className="btn ghost" style={{ cursor: "pointer" }}>
+            Импорт
+            <input
+              type="file"
+              accept="application/json,.json"
+              hidden
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void importSessionFile(f);
+                e.target.value = "";
+              }}
+            />
+          </label>
         </div>
-        {props.sessions.length === 0 && (
-          <div className="empty-hint">Пока нет диалогов — создайте первый.</div>
+        <input
+          className="input session-search"
+          placeholder="Поиск диалогов…"
+          value={sessionQuery}
+          onChange={(e) => setSessionQuery(e.target.value)}
+        />
+        {folders.length > 0 && (
+          <select
+            className="select session-folder-filter"
+            value={folderFilter}
+            onChange={(e) => setFolderFilter(e.target.value)}
+          >
+            <option value="">Все папки</option>
+            {folders.map((f) => (
+              <option key={f} value={f}>
+                {f}
+              </option>
+            ))}
+          </select>
         )}
-        {props.sessions.map((s) => (
+        {filteredSessions.length === 0 && (
+          <div className="empty-hint">
+            {props.sessions.length === 0
+              ? "Пока нет диалогов — создайте первый."
+              : "Ничего не найдено."}
+          </div>
+        )}
+        {filteredSessions.map((s) => (
           <div
             key={s.id}
             className={`list-item session-item ${props.activeSessionId === s.id ? "active" : ""}`}
@@ -279,6 +381,7 @@ export function ChatPage(props: {
                   {sessionToolsEnabled(s) ? <span className="badge">агент</span> : null}
                 </div>
                 <div className="muted session-meta">
+                  {s.folder ? `${s.folder} · ` : ""}
                   {new Date(s.updatedAt).toLocaleString()}
                 </div>
               </span>
@@ -303,7 +406,25 @@ export function ChatPage(props: {
               Обычный ответ или режим «Агент» (файлы, терминал, web). Enter — отправить
             </p>
           </div>
-          <div className="row">
+          <div className="row" style={{ flexWrap: "wrap" }}>
+            {activeSession ? (
+              <input
+                className="input"
+                style={{ width: 140 }}
+                placeholder="Папка"
+                defaultValue={activeSession.folder || ""}
+                key={`folder-${activeSession.id}-${activeSession.folder || ""}`}
+                onBlur={(e) => void setSessionFolder(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.currentTarget.blur();
+                  }
+                }}
+              />
+            ) : null}
+            <button className="btn ghost" type="button" disabled={!activeSession} onClick={() => void exportActive()}>
+              Экспорт
+            </button>
             <button
               className="btn ghost"
               type="button"

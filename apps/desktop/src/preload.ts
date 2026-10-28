@@ -36,6 +36,13 @@ const api: KoviApi = {
   getMonitorSnapshot: () => ipcRenderer.invoke(IPC.getMonitorSnapshot),
   openMonitorWindow: () => ipcRenderer.invoke(IPC.openMonitorWindow),
   setMonitorAlwaysOnTop: (flag) => ipcRenderer.invoke(IPC.setMonitorAlwaysOnTop, flag),
+  exportSession: (sessionId) => ipcRenderer.invoke(IPC.exportSession, sessionId),
+  importSession: (bundle) => ipcRenderer.invoke(IPC.importSession, bundle),
+  getErrorLog: () => ipcRenderer.invoke(IPC.getErrorLog),
+  checkMcpHealth: (server) => ipcRenderer.invoke(IPC.checkMcpHealth, server),
+  verifyGguf: (modelId) => ipcRenderer.invoke(IPC.verifyGguf, modelId),
+  previewFileDiff: (filePath, content) =>
+    ipcRenderer.invoke(IPC.previewFileDiff, filePath, content),
   onRuntimeProgress: (cb) => {
     const listener = (_: Electron.IpcRendererEvent, p: { progress: number; label: string }) =>
       cb(p);

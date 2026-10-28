@@ -1,4 +1,4 @@
-import type { AppView, StatusBarInfo } from "@kovi/shared";
+import type { AppView, LocalModel, StatusBarInfo } from "@kovi/shared";
 import { api } from "../api";
 
 const NAV: Array<{ id: AppView; label: string }> = [
@@ -15,15 +15,23 @@ export function Topbar(props: {
   status: StatusBarInfo | null;
   generating?: boolean;
   booting?: boolean;
+  models?: LocalModel[];
   onStop?: () => void;
+  onLoadModel?: (modelId: string) => void;
 }) {
   const online = Boolean(props.status?.serverPort);
+  const tps = props.status?.tokensPerSecond;
+  const agentStep = props.status?.agentStepLabel;
   const stateLabel = props.booting
     ? "загрузка…"
     : props.generating
-      ? "генерация…"
+      ? agentStep
+        ? `агент · ${agentStep}`
+        : "генерация…"
       : online
-        ? "сервер online"
+        ? tps != null && tps > 0
+          ? `${tps} tok/s`
+          : "сервер online"
         : "модель не загружена";
 
   return (
@@ -55,7 +63,26 @@ export function Topbar(props: {
           className={`status-dot ${props.generating ? "busy" : online ? "online" : ""}`}
           title={stateLabel}
         />
-        <span className="topbar-model">{props.status?.modelName || "нет модели"}</span>
+        {(props.models?.length ?? 0) > 0 ? (
+          <select
+            className="topbar-model-select"
+            value={props.status?.loadedModelId || ""}
+            title="Быстрая смена модели"
+            onChange={(e) => {
+              const id = e.target.value;
+              if (id) props.onLoadModel?.(id);
+            }}
+          >
+            <option value="">модель…</option>
+            {props.models!.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <span className="topbar-model">{props.status?.modelName || "нет модели"}</span>
+        )}
         <span className="topbar-state">{stateLabel}</span>
         {props.generating ? (
           <button

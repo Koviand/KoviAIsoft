@@ -540,6 +540,17 @@ export class RuntimeManager {
     }
     await this.stopServer();
     const port = await findFreePort(8080);
+    if (model.integrityOk === false) {
+      throw new Error(
+        `Модель не прошла проверку GGUF: ${model.integrityError || "повреждённый файл"}`,
+      );
+    }
+    if (model.fitsInVram === false && params.gpuLayers > 0) {
+      // Soft warning into lastError after start; still allow load with profile override.
+      console.warn(
+        `Модель ${model.name} может не влезть в VRAM (ngl=${params.gpuLayers}, ctx=${params.context}).`,
+      );
+    }
     const args = [
       "-m",
       model.path,
@@ -556,6 +567,9 @@ export class RuntimeManager {
       "--jinja",
       "--no-webui",
     ];
+    if (params.flashAttn) {
+      args.push("-fa");
+    }
     if (model.mmprojPath) {
       args.push("--mmproj", model.mmprojPath);
     }
@@ -591,11 +605,22 @@ export class RuntimeManager {
       await waitForServer(port);
     } catch (err) {
       await this.stopServer();
-      this.lastError =
+      const oom =
+        /out of memory|cuda.?error|failed to allocate|ggml_cuda|VRAM|insufficient/i.test(
+          stderr,
+        );
+      const base =
         (err instanceof Error ? err.message : String(err)) +
         (stderr ? `\n${stderr.slice(-800)}` : "");
+      this.lastError = oom
+        ? `Нехватка VRAM/памяти при загрузке модели. Уменьшите GPU layers / context или выберите профиль «Мало VRAM».\n${base}`
+        : base;
       throw new Error(this.lastError);
     }
+  }
+
+  getLastStderrSnippet(): string {
+    return this.lastError || "";
   }
 }
 

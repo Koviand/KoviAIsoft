@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { LocalModel, SystemInfo } from "@kovi/shared";
 import { createHash } from "node:crypto";
+import { withIntegrity } from "./integrity.js";
 
 const QUANT_RE =
   /(Q[2-8](?:_[A-Z0-9_]+)?|IQ[1-4](?:_[A-Z0-9_]+)?|BF16|F16|F32|FP16|FP32)/i;
@@ -88,18 +89,20 @@ export function scanLocalModels(roots: string[], sys?: SystemInfo): LocalModel[]
     const dir = path.dirname(filePath);
     const quant = detectQuant(name);
     const est = estimateFit(st.size, 8192, sys);
-    models.push({
-      id: modelIdFor(filePath),
-      name: name.replace(/\.gguf$/i, ""),
-      path: filePath,
-      sizeBytes: st.size,
-      quant,
-      mmprojPath: findMmproj(dir, name),
-      directory: dir,
-      recommendedNgl: est.recommendedNgl,
-      recommendedContext: est.recommendedContext,
-      fitsInVram: est.fitsInVram,
-    });
+    models.push(
+      withIntegrity({
+        id: modelIdFor(filePath),
+        name: name.replace(/\.gguf$/i, ""),
+        path: filePath,
+        sizeBytes: st.size,
+        quant,
+        mmprojPath: findMmproj(dir, name),
+        directory: dir,
+        recommendedNgl: est.recommendedNgl,
+        recommendedContext: est.recommendedContext,
+        fitsInVram: est.fitsInVram,
+      }),
+    );
   }
 
   return models.sort((a, b) => a.name.localeCompare(b.name));

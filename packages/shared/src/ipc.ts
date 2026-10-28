@@ -10,10 +10,13 @@ import type {
   HfSearchResult,
   InstalledRuntime,
   LocalModel,
+  McpHealthResult,
+  McpServerConfig,
   RuntimeAsset,
   RuntimeBackend,
   RuntimeStatus,
   RuntimeUpdateInfo,
+  SessionExportBundle,
   SystemInfo,
 } from "./types.js";
 
@@ -50,6 +53,12 @@ export const IPC = {
   getMonitorSnapshot: "kovi:getMonitorSnapshot",
   openMonitorWindow: "kovi:openMonitorWindow",
   setMonitorAlwaysOnTop: "kovi:setMonitorAlwaysOnTop",
+  exportSession: "kovi:exportSession",
+  importSession: "kovi:importSession",
+  getErrorLog: "kovi:getErrorLog",
+  checkMcpHealth: "kovi:checkMcpHealth",
+  verifyGguf: "kovi:verifyGguf",
+  previewFileDiff: "kovi:previewFileDiff",
   runtimeProgress: "kovi:runtimeProgress",
   downloadProgress: "kovi:downloadProgress",
   chatToken: "kovi:chatToken",
@@ -90,6 +99,7 @@ export interface MonitorSnapshot {
 
 export interface StatusBarInfo {
   modelName: string | null;
+  loadedModelId: string | null;
   backend: RuntimeBackend | null;
   serverPort: number | null;
   vramUsedGb: number | null;
@@ -97,6 +107,10 @@ export interface StatusBarInfo {
   ramUsedGb: number | null;
   ramTotalGb: number | null;
   view: AppView;
+  tokensPerSecond: number | null;
+  agentStepLabel: string | null;
+  busy: boolean;
+  lastError: string | null;
 }
 
 export interface SendChatRequest {
@@ -167,6 +181,12 @@ export interface KoviApi {
   getMonitorSnapshot(): Promise<MonitorSnapshot>;
   openMonitorWindow(): Promise<void>;
   setMonitorAlwaysOnTop(flag: boolean): Promise<boolean>;
+  exportSession(sessionId: string): Promise<SessionExportBundle>;
+  importSession(bundle: SessionExportBundle): Promise<ChatSession>;
+  getErrorLog(): Promise<string>;
+  checkMcpHealth(server?: McpServerConfig): Promise<McpHealthResult[]>;
+  verifyGguf(modelId: string): Promise<LocalModel>;
+  previewFileDiff(path: string, content: string): Promise<string>;
   onRuntimeProgress(cb: (p: { progress: number; label: string }) => void): () => void;
   onDownloadProgress(cb: (p: { progress: number; label: string }) => void): () => void;
   onChatToken(cb: (p: { sessionId: string; text: string; thinking?: boolean }) => void): () => void;

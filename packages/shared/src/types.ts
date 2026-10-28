@@ -14,6 +14,9 @@ export type LegacyAppView = AppView | "agent";
 
 export type ThemePreset = "light" | "dark" | "high-contrast" | "custom";
 
+/** Agent confirmation policy. */
+export type AgentRiskMode = "ask" | "auto-safe" | "full";
+
 export interface ThemeCustom {
   accent: string;
   background: string;
@@ -98,6 +101,9 @@ export interface LocalModel {
   recommendedNgl: number;
   recommendedContext: number;
   fitsInVram?: boolean;
+  /** Quick GGUF header validation. */
+  integrityOk?: boolean | null;
+  integrityError?: string;
 }
 
 export interface HfSearchResult {
@@ -169,6 +175,18 @@ export interface GenerationParams {
   context: number;
   gpuLayers: number;
   seed: number | null;
+  /** Pass --flash-attn to llama-server when true. */
+  flashAttn?: boolean;
+}
+
+/** Named load preset for GPU layers / context / flash-attn. */
+export interface LoadProfile {
+  id: string;
+  name: string;
+  gpuLayers: number;
+  context: number;
+  flashAttn: boolean;
+  maxTokens?: number;
 }
 
 export interface AgentPlanStep {
@@ -185,6 +203,8 @@ export interface AgentConfirmation {
   args: Record<string, unknown>;
   risk: "medium" | "high";
   createdAt: string;
+  /** Unified diff preview for write/patch tools. */
+  diff?: string;
 }
 
 export type AgentEvent =
@@ -211,6 +231,22 @@ export interface McpServerConfig {
   url?: string;
 }
 
+export interface McpHealthResult {
+  serverId: string;
+  name: string;
+  ok: boolean;
+  toolCount: number;
+  message: string;
+  checkedAt: string;
+}
+
+export interface SessionExportBundle {
+  version: 1;
+  exportedAt: string;
+  session: ChatSession;
+  messages: ChatMessage[];
+}
+
 export interface AppSettings {
   language: "ru" | "en";
   themePreset: ThemePreset;
@@ -234,6 +270,15 @@ export interface AppSettings {
   mcpServers: McpServerConfig[];
   agentMaxSteps: number;
   defaultParams: GenerationParams;
+  /** First-run wizard completed. */
+  onboardingCompleted: boolean;
+  /** Ask = confirm medium+high; auto-safe = auto medium in project; full = skip most confirms. */
+  agentRiskMode: AgentRiskMode;
+  /** Named model-load presets. */
+  loadProfiles: LoadProfile[];
+  activeLoadProfileId: string | null;
+  /** Known session folder labels (UI catalog). */
+  sessionFolders: string[];
 }
 
 export const DEFAULT_GENERATION_PARAMS: GenerationParams = {
@@ -245,7 +290,43 @@ export const DEFAULT_GENERATION_PARAMS: GenerationParams = {
   context: 8192,
   gpuLayers: 99,
   seed: null,
+  flashAttn: false,
 };
+
+export const DEFAULT_LOAD_PROFILES: LoadProfile[] = [
+  {
+    id: "balanced",
+    name: "Баланс",
+    gpuLayers: 99,
+    context: 8192,
+    flashAttn: false,
+    maxTokens: 2048,
+  },
+  {
+    id: "max-quality",
+    name: "Макс. качество",
+    gpuLayers: 99,
+    context: 16384,
+    flashAttn: true,
+    maxTokens: 4096,
+  },
+  {
+    id: "low-vram",
+    name: "Мало VRAM",
+    gpuLayers: 20,
+    context: 4096,
+    flashAttn: false,
+    maxTokens: 1024,
+  },
+  {
+    id: "cpu",
+    name: "Только CPU",
+    gpuLayers: 0,
+    context: 4096,
+    flashAttn: false,
+    maxTokens: 1024,
+  },
+];
 
 export const DEFAULT_THEME_CUSTOM: ThemeCustom = {
   accent: "#2a4bff",
@@ -255,6 +336,37 @@ export const DEFAULT_THEME_CUSTOM: ThemeCustom = {
   radius: 12,
   density: "comfortable",
 };
+
+export const MCP_PRESETS: Array<Omit<McpServerConfig, "id" | "enabled"> & { id: string; blurb: string }> = [
+  {
+    id: presetId("filesystem"),
+    name: "Filesystem",
+    transport: "stdio",
+    command: "npx",
+    args: ["-y", "@modelcontextprotocol/server-filesystem"],
+    blurb: "Чтение/запись файлов через MCP (нужен путь в args).",
+  },
+  {
+    id: presetId("memory"),
+    name: "Memory",
+    transport: "stdio",
+    command: "npx",
+    args: ["-y", "@modelcontextprotocol/server-memory"],
+    blurb: "Простая память ключ→значение.",
+  },
+  {
+    id: presetId("fetch"),
+    name: "Fetch",
+    transport: "stdio",
+    command: "npx",
+    args: ["-y", "@modelcontextprotocol/server-fetch"],
+    blurb: "HTTP fetch для агента.",
+  },
+];
+
+function presetId(slug: string): string {
+  return `preset-${slug}`;
+}
 
 export function createDefaultSettings(appData: string): AppSettings {
   return {
@@ -275,5 +387,10 @@ export function createDefaultSettings(appData: string): AppSettings {
     mcpServers: [],
     agentMaxSteps: 40,
     defaultParams: { ...DEFAULT_GENERATION_PARAMS },
+    onboardingCompleted: false,
+    agentRiskMode: "ask",
+    loadProfiles: DEFAULT_LOAD_PROFILES.map((p) => ({ ...p })),
+    activeLoadProfileId: "balanced",
+    sessionFolders: [],
   };
 }

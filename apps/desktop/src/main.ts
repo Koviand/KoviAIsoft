@@ -1,5 +1,6 @@
+import fs from "node:fs";
 import path from "node:path";
-import { app, BrowserWindow, dialog, ipcMain } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeImage } from "electron";
 import { IPC } from "@kovi/shared";
 import { AppService, setAppDataDir } from "@kovi/core";
 
@@ -7,6 +8,15 @@ let mainWindow: BrowserWindow | null = null;
 let monitorWindow: BrowserWindow | null = null;
 let service: AppService | null = null;
 let monitorTimer: NodeJS.Timeout | null = null;
+
+function appIconPath(): string | undefined {
+  const candidates = [
+    path.join(__dirname, "..", "build", "icon.png"),
+    path.join(__dirname, "..", "build", "icon.ico"),
+    path.join(process.resourcesPath || "", "icon.png"),
+  ];
+  return candidates.find((p) => p && fs.existsSync(p));
+}
 
 function portableRoot(): string {
   if (app.isPackaged) {
@@ -51,6 +61,7 @@ async function loadUi(win: BrowserWindow, hash = ""): Promise<void> {
 }
 
 async function createWindow(): Promise<void> {
+  const icon = appIconPath();
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -59,6 +70,8 @@ async function createWindow(): Promise<void> {
     backgroundColor: "#e7ebf0",
     title: "KoviAIsoft",
     autoHideMenuBar: true,
+    show: false,
+    ...(icon ? { icon } : {}),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -67,6 +80,16 @@ async function createWindow(): Promise<void> {
       webSecurity: true,
     },
   });
+  mainWindow.once("ready-to-show", () => mainWindow?.show());
+  if (icon) {
+    try {
+      app.setAppUserModelId("com.kovi.aisoft");
+      const img = nativeImage.createFromPath(icon);
+      if (!img.isEmpty()) mainWindow.setIcon(img);
+    } catch {
+      // ignore
+    }
+  }
 
   await loadUi(mainWindow);
 
@@ -89,6 +112,7 @@ async function createMonitorWindow(): Promise<void> {
     return;
   }
 
+  const icon = appIconPath();
   monitorWindow = new BrowserWindow({
     width: 420,
     height: 640,
@@ -98,6 +122,7 @@ async function createMonitorWindow(): Promise<void> {
     title: "KoviAIsoft · Monitor",
     autoHideMenuBar: true,
     show: false,
+    ...(icon ? { icon } : {}),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -238,6 +263,14 @@ function registerIpc(svc: AppService): void {
     monitorWindow.setAlwaysOnTop(Boolean(flag));
     return monitorWindow.isAlwaysOnTop();
   });
+  ipcMain.handle(IPC.exportSession, (_e, sessionId: string) => svc.exportSession(sessionId));
+  ipcMain.handle(IPC.importSession, (_e, bundle) => svc.importSession(bundle));
+  ipcMain.handle(IPC.getErrorLog, () => svc.getErrorLog());
+  ipcMain.handle(IPC.checkMcpHealth, (_e, server) => svc.checkMcpHealth(server));
+  ipcMain.handle(IPC.verifyGguf, (_e, modelId: string) => svc.verifyGguf(modelId));
+  ipcMain.handle(IPC.previewFileDiff, (_e, filePath: string, content: string) =>
+    svc.previewFileDiff(filePath, content),
+  );
 
   svc.onRuntimeProgress = (p) => broadcast(IPC.runtimeProgress, p);
   svc.onDownloadProgress = (p) => broadcast(IPC.downloadProgress, p);

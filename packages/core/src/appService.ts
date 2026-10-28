@@ -9,10 +9,14 @@ import type {
   HfSearchResult,
   InstalledRuntime,
   LocalModel,
+  McpHealthResult,
+  McpServerConfig,
   MonitorSnapshot,
   RuntimeAsset,
   RuntimeBackend,
   RuntimeStatus,
+  SessionExportBundle,
+  StatusBarInfo,
   SystemInfo,
 } from "@kovi/shared";
 import { DEFAULT_GENERATION_PARAMS } from "@kovi/shared";
@@ -26,6 +30,7 @@ import {
   recommendHfFiles,
   searchHfModels,
 } from "./models/huggingface.js";
+import { verifyGgufFile, withIntegrity } from "./models/integrity.js";
 import { scanLocalModels } from "./models/scanner.js";
 import { getAppDataDir } from "./paths.js";
 import { OpenAiProxy } from "./proxy/openaiProxy.js";
@@ -34,6 +39,7 @@ import { RuntimeManager } from "./runtime/manager.js";
 import { fetchLlamaServerMetrics } from "./runtime/serverMetrics.js";
 import { SettingsStore } from "./settings.js";
 import { detectSystemInfo, sampleVram } from "./system/detect.js";
+import { previewWriteDiff } from "./tools/diff.js";
 
 /** Quiet auto-update interval for llama.cpp GitHub checks. */
 export const RUNTIME_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -56,6 +62,8 @@ export class AppService {
     tokenApprox: 0,
   };
   private lastTokensPerSecond: number | null = null;
+  private agentStepLabel: string | null = null;
+  private errorLog: string[] = [];
 
   onRuntimeProgress?: (p: { progress: number; label: string }) => void;
   onDownloadProgress?: (p: { progress: number; label: string }) => void;
@@ -90,11 +98,29 @@ export class AppService {
         this.genStats.tokenChars += event.text.length;
         this.genStats.tokenApprox += Math.max(1, Math.round(event.text.length / 4));
       }
+      if (event.type === "step_start") {
+        this.agentStepLabel = event.stepId;
+      }
+      if (event.type === "tool_call") {
+        this.agentStepLabel = event.name;
+      }
+      if (event.type === "plan" && event.steps.length) {
+        this.agentStepLabel = `план · ${event.steps.length}`;
+      }
+      if (event.type === "error") {
+        this.pushErrorLog(`agent:${sessionId}`, event.message);
+      }
       if (event.type === "done" || event.type === "cancelled" || event.type === "error") {
-        // keep last tok/s visible until next gen
+        this.agentStepLabel = null;
       }
       this.onAgentEvent?.({ sessionId, event });
     });
+  }
+
+  private pushErrorLog(source: string, message: string): void {
+    const line = `[${new Date().toISOString()}] ${source}: ${message}`;
+    this.errorLog.push(line);
+    if (this.errorLog.length > 200) this.errorLog = this.errorLog.slice(-200);
   }
 
   private resetGenStats(): void {
@@ -288,18 +314,45 @@ export class AppService {
   async loadModel(modelId: string, params?: Partial<GenerationParams>): Promise<void> {
     const model = this.modelsCache.find((m) => m.id === modelId);
     if (!model) throw new Error("Модель не найдена. Выполните сканирование.");
+    if (model.integrityOk === false) {
+      throw new Error(
+        `GGUF повреждён: ${model.integrityError || model.name}. Проверьте файл или скачайте заново.`,
+      );
+    }
+    const settings = this.settings.get();
+    const profile = settings.loadProfiles.find((p) => p.id === settings.activeLoadProfileId);
+    const profileParams: Partial<GenerationParams> = profile
+      ? {
+          gpuLayers: profile.gpuLayers,
+          context: profile.context,
+          flashAttn: profile.flashAttn,
+          maxTokens: profile.maxTokens ?? settings.defaultParams.maxTokens,
+        }
+      : {};
     const merged: GenerationParams = {
       ...DEFAULT_GENERATION_PARAMS,
-      ...this.settings.get().defaultParams,
+      ...settings.defaultParams,
       gpuLayers: model.recommendedNgl,
       context: model.recommendedContext,
+      ...profileParams,
       ...params,
     };
-    const settings = this.settings.get();
+    if (model.fitsInVram === false && merged.gpuLayers > 32) {
+      this.pushErrorLog(
+        "vram",
+        `Модель ${model.name} может не влезть в VRAM (ngl=${merged.gpuLayers}, ctx=${merged.context}).`,
+      );
+    }
     // Do not block model load on GitHub updates — only ensure a local binary exists.
     await this.runtime.ensureInstalled(settings.runtimeBackendPreference);
     this.resetGenStats();
-    await this.runtime.loadModel(model, merged);
+    try {
+      await this.runtime.loadModel(model, merged);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.pushErrorLog("loadModel", msg);
+      throw err;
+    }
     // Quiet update only AFTER model is up — ensureLatest defers while server is running.
     if (settings.autoUpdateRuntime !== false) {
       void this.ensureLatestRuntime(settings.runtimeBackendPreference).catch((err) => {
@@ -440,25 +493,60 @@ export class AppService {
     this.agent.cancel();
   }
 
-  async getStatusBar(): Promise<{
-    modelName: string | null;
-    backend: RuntimeBackend | null;
-    serverPort: number | null;
-    vramUsedGb: number | null;
-    vramTotalGb: number | null;
-    ramUsedGb: number | null;
-    ramTotalGb: number | null;
-  }> {
+  async getStatusBar(): Promise<Omit<StatusBarInfo, "view">> {
     const snap = await this.getMonitorSnapshot();
     return {
       modelName: snap.modelName,
+      loadedModelId: snap.loadedModelId,
       backend: snap.backend,
       serverPort: snap.serverPort,
       vramUsedGb: snap.vramUsedGb,
       vramTotalGb: snap.vramTotalGb,
       ramUsedGb: snap.ramUsedGb,
       ramTotalGb: snap.ramTotalGb,
+      tokensPerSecond: snap.tokensPerSecond,
+      agentStepLabel: this.agentStepLabel,
+      busy: snap.busy,
+      lastError: snap.lastError,
     };
+  }
+
+  exportSession(sessionId: string): SessionExportBundle {
+    return this.store.exportSession(sessionId);
+  }
+
+  importSession(bundle: SessionExportBundle): ChatSession {
+    return this.store.importSession(bundle);
+  }
+
+  getErrorLog(): string {
+    const runtimeErr = this.runtime.getStatus().lastError;
+    const lines = [...this.errorLog];
+    if (runtimeErr) lines.push(`[runtime] ${runtimeErr}`);
+    return lines.join("\n") || "Лог пуст — ошибок пока не было.";
+  }
+
+  async checkMcpHealth(server?: McpServerConfig): Promise<McpHealthResult[]> {
+    const list = server ? [server] : this.settings.get().mcpServers;
+    return this.mcp.healthCheck(list);
+  }
+
+  async verifyGguf(modelId: string): Promise<LocalModel> {
+    const model = this.modelsCache.find((m) => m.id === modelId);
+    if (!model) throw new Error("Модель не найдена");
+    const v = await verifyGgufFile(model.path);
+    const next = withIntegrity({
+      ...model,
+      integrityOk: v.ok,
+      integrityError: v.error,
+    });
+    this.modelsCache = this.modelsCache.map((m) => (m.id === modelId ? next : m));
+    if (!v.ok) this.pushErrorLog("gguf", `${model.name}: ${v.error}`);
+    return next;
+  }
+
+  previewFileDiff(filePath: string, content: string): string {
+    return previewWriteDiff(filePath, content);
   }
 
   async getMonitorSnapshot(): Promise<MonitorSnapshot> {

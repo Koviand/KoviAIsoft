@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { HfFile, HfSearchResult, LocalModel } from "@kovi/shared";
+import type { AppSettings, HfFile, HfSearchResult, LocalModel } from "@kovi/shared";
 import { api } from "../api";
 
 function fmtGb(bytes: number): string {
@@ -9,7 +9,9 @@ function fmtGb(bytes: number): string {
 export function ModelsPage(props: {
   models: LocalModel[];
   loadedModelId: string | null;
+  settings: AppSettings | null;
   setModels: (m: LocalModel[]) => void;
+  setSettings: (s: AppSettings) => void;
   setError: (e: string | null) => void;
   refresh: () => Promise<void>;
 }) {
@@ -95,6 +97,37 @@ export function ModelsPage(props: {
     }
   }
 
+  async function verify(modelId: string): Promise<void> {
+    setWorking(true);
+    try {
+      const next = await api.verifyGguf(modelId);
+      props.setModels(props.models.map((m) => (m.id === modelId ? next : m)));
+      setHint(
+        next.integrityOk
+          ? `GGUF OK: ${next.name}`
+          : `Проблема GGUF: ${next.integrityError || "ошибка"}`,
+      );
+      if (!next.integrityOk) props.setError(next.integrityError || "GGUF повреждён");
+    } catch (e) {
+      props.setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function setProfile(id: string): Promise<void> {
+    if (!props.settings) return;
+    try {
+      const saved = await api.saveSettings({ ...props.settings, activeLoadProfileId: id });
+      props.setSettings(saved);
+    } catch (e) {
+      props.setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  const profiles = props.settings?.loadProfiles || [];
+  const activeProfileId = props.settings?.activeLoadProfileId;
+
   return (
     <div className="stack-page">
       <header className="page-header">
@@ -111,6 +144,27 @@ export function ModelsPage(props: {
         </div>
       </header>
 
+      {profiles.length > 0 && (
+        <section className="card">
+          <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap" }}>
+            <strong>Профиль загрузки</strong>
+            <div className="row" style={{ flexWrap: "wrap" }}>
+              {profiles.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  className={`btn ${activeProfileId === p.id ? "primary" : "ghost"}`}
+                  disabled={working}
+                  onClick={() => void setProfile(p.id)}
+                >
+                  {p.name}
+                </button>
+              ))}
+            </div>
+          </div>
+        </section>
+      )}
+
       {hint && (
         <div className="page-hint" role="status">
           {hint}
@@ -121,7 +175,7 @@ export function ModelsPage(props: {
         <section className="card elevated">
           <h3>На этом компьютере</h3>
           <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-            Папки моделей задаются в «Настройки». ★ / ngl — рекомендация под вашу VRAM.
+            ★ / ngl — рекомендация под VRAM. Красный статус — битый GGUF.
           </p>
           <div className="stack" style={{ maxHeight: 420, marginTop: 10 }}>
             {props.models.map((m) => {
@@ -130,21 +184,35 @@ export function ModelsPage(props: {
                 <div key={m.id} className="list-item model-row" style={{ padding: "12px 10px" }}>
                   <div className="row" style={{ justifyContent: "space-between" }}>
                     <strong>{m.name}</strong>
-                    {loaded ? <span className="badge">в памяти</span> : null}
+                    <span className="row">
+                      {m.integrityOk === false ? (
+                        <span className="badge badge-danger">битый GGUF</span>
+                      ) : null}
+                      {loaded ? <span className="badge">в памяти</span> : null}
+                    </span>
                   </div>
                   <div className="muted mono" style={{ fontSize: "0.8rem", marginTop: 4 }}>
                     {fmtGb(m.sizeBytes)} · {m.quant || "квант ?"} · слои GPU {m.recommendedNgl}
                     {m.mmprojPath ? " · есть vision (mmproj)" : ""}
                     {m.fitsInVram === false ? " · может не влезть в VRAM" : ""}
+                    {m.integrityOk === false && m.integrityError ? ` · ${m.integrityError}` : ""}
                   </div>
                   <div className="row" style={{ marginTop: 10 }}>
                     <button
                       className="btn primary"
                       type="button"
-                      disabled={working}
+                      disabled={working || m.integrityOk === false}
                       onClick={() => void load(m.id, m.name)}
                     >
                       {loaded ? "Перезагрузить" : "Загрузить в память"}
+                    </button>
+                    <button
+                      className="btn ghost"
+                      type="button"
+                      disabled={working}
+                      onClick={() => void verify(m.id)}
+                    >
+                      Проверить GGUF
                     </button>
                   </div>
                 </div>

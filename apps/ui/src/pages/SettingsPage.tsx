@@ -120,6 +120,69 @@ export function SettingsPage(props: {
       </section>
 
       <section className="card">
+        <h3>Режим подтверждений агента</h3>
+        <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
+          Ask — спрашивать medium/high; Auto-safe — тихо в папке проекта; Full — почти без диалогов.
+        </p>
+        <div className="row" style={{ marginTop: 10 }}>
+          {(
+            [
+              ["ask", "Ask"],
+              ["auto-safe", "Auto-safe"],
+              ["full", "Full"],
+            ] as const
+          ).map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              className={`btn ${(s.agentRiskMode || "ask") === id ? "primary" : ""}`}
+              onClick={() => void saveNow({ ...s, agentRiskMode: id })}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <label style={{ display: "block", marginTop: 12 }}>
+          Лимит шагов агента
+          <input
+            className="input"
+            type="number"
+            value={s.agentMaxSteps}
+            onChange={(e) => queueSave({ ...s, agentMaxSteps: Number(e.target.value) || 40 })}
+          />
+        </label>
+      </section>
+
+      <section className="card">
+        <h3>Профили загрузки модели</h3>
+        <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
+          GPU layers / context / flash-attn при «Загрузить в память».
+        </p>
+        <div className="row" style={{ marginTop: 10, flexWrap: "wrap" }}>
+          {(s.loadProfiles || []).map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              className={`btn ${s.activeLoadProfileId === p.id ? "primary" : ""}`}
+              onClick={() => void saveNow({ ...s, activeLoadProfileId: p.id })}
+            >
+              {p.name}
+            </button>
+          ))}
+        </div>
+        {(() => {
+          const active = (s.loadProfiles || []).find((p) => p.id === s.activeLoadProfileId);
+          if (!active) return null;
+          return (
+            <div className="muted mono" style={{ marginTop: 10, fontSize: "0.8rem" }}>
+              ngl {active.gpuLayers} · ctx {active.context}
+              {active.flashAttn ? " · flash-attn" : ""}
+            </div>
+          );
+        })()}
+      </section>
+
+      <section className="card">
         <h3>Доступ к файлам для агента</h3>
         <div className="row" style={{ marginTop: 10 }}>
           <button
@@ -150,6 +213,9 @@ export function SettingsPage(props: {
         <div className="muted mono" style={{ marginTop: 10 }}>
           проект: {s.projectRoot || "не задан"}
         </div>
+        <p className="muted" style={{ marginTop: 8, fontSize: "0.82rem" }}>
+          Файл <code>AGENTS.md</code> в корне проекта подхватывается агентом автоматически.
+        </p>
       </section>
 
       <section className="card">
@@ -270,6 +336,19 @@ export function SettingsPage(props: {
               />
             </label>
           ))}
+          <label className="row" style={{ alignItems: "center", marginTop: 8 }}>
+            <input
+              type="checkbox"
+              checked={Boolean(s.defaultParams.flashAttn)}
+              onChange={(e) =>
+                queueSave({
+                  ...s,
+                  defaultParams: { ...s.defaultParams, flashAttn: e.target.checked },
+                })
+              }
+            />
+            Flash Attention по умолчанию
+          </label>
         </div>
       </section>
     </div>

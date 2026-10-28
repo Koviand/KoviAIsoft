@@ -44,6 +44,7 @@ export function useAppState() {
     sessionId: string;
     summary: string;
     risk: string;
+    diff?: string;
   } | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [booting, setBooting] = useState(true);
@@ -108,11 +109,19 @@ export function useAppState() {
           sessionId: p.sessionId,
           summary: ev.confirmation.summary,
           risk: ev.confirmation.risk,
+          diff: ev.confirmation.diff,
         });
         setConfirmBusy(false);
         setActiveSessionId(p.sessionId);
         setViewRaw("chat");
         setGenerating(true);
+      }
+      if (ev.type === "step_start" || ev.type === "tool_call" || ev.type === "plan") {
+        setGenerating(true);
+        void api
+          .getStatusBar()
+          .then((bar) => setStatus({ ...bar, view: viewRef.current }))
+          .catch(() => undefined);
       }
       if (ev.type === "done" || ev.type === "cancelled" || ev.type === "error") {
         setGenerating(false);

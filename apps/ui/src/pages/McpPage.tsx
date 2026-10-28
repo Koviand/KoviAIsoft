@@ -1,9 +1,9 @@
 import { useState } from "react";
-import type { AppSettings, McpServerConfig } from "@kovi/shared";
+import type { AppSettings, McpHealthResult, McpServerConfig } from "@kovi/shared";
+import { MCP_PRESETS } from "@kovi/shared";
 import { api } from "../api";
 
 function splitArgs(raw: string): string[] {
-  // Keep quoted segments so paths with spaces survive.
   const out: string[] = [];
   const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
   let m: RegExpExecArray | null;
@@ -24,6 +24,7 @@ export function McpPage(props: {
     '-y @modelcontextprotocol/server-filesystem "C:\\Models\\LFM"',
   );
   const [saving, setSaving] = useState(false);
+  const [health, setHealth] = useState<McpHealthResult[]>([]);
 
   if (!props.settings) return <div className="stack-page">Загрузка…</div>;
 
@@ -58,14 +59,73 @@ export function McpPage(props: {
     });
   }
 
+  function addPreset(preset: (typeof MCP_PRESETS)[number]): void {
+    if (props.settings!.mcpServers.some((s) => s.id === preset.id || s.name === preset.name)) {
+      props.setError(`Сервер «${preset.name}» уже добавлен`);
+      return;
+    }
+    const cfg: McpServerConfig = {
+      id: preset.id,
+      name: preset.name,
+      enabled: true,
+      transport: preset.transport,
+      command: preset.command,
+      args: [...(preset.args || [])],
+      url: preset.url,
+      env: preset.env,
+    };
+    void save({
+      ...props.settings!,
+      mcpServers: [...props.settings!.mcpServers, cfg],
+    });
+  }
+
+  async function runHealth(server?: McpServerConfig): Promise<void> {
+    setSaving(true);
+    try {
+      const results = await api.checkMcpHealth(server);
+      setHealth(results);
+    } catch (e) {
+      props.setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <div className="stack-page">
       <header className="page-header">
-        <h1 className="h1">MCP-серверы</h1>
-        <p className="muted page-sub">
-          Внешние инструменты для режима «Агент» (stdio). Включаются только при работе агента.
-        </p>
+        <div className="row" style={{ justifyContent: "space-between", width: "100%" }}>
+          <div>
+            <h1 className="h1">MCP-серверы</h1>
+            <p className="muted page-sub">
+              Внешние инструменты для режима «Агент». Пресеты и проверка «жив/не жив».
+            </p>
+          </div>
+          <button className="btn" type="button" disabled={saving} onClick={() => void runHealth()}>
+            Проверить все
+          </button>
+        </div>
       </header>
+
+      <section className="card elevated">
+        <h3>Пресеты</h3>
+        <div className="stack" style={{ marginTop: 10 }}>
+          {MCP_PRESETS.map((p) => (
+            <div key={p.id} className="row" style={{ justifyContent: "space-between" }}>
+              <div>
+                <strong>{p.name}</strong>
+                <div className="muted" style={{ fontSize: "0.8rem" }}>
+                  {p.blurb}
+                </div>
+              </div>
+              <button className="btn" type="button" disabled={saving} onClick={() => addPreset(p)}>
+                Добавить
+              </button>
+            </div>
+          ))}
+        </div>
+      </section>
 
       <section className="card elevated">
         <h3>Добавить сервер</h3>
@@ -105,6 +165,23 @@ export function McpPage(props: {
         </div>
       </section>
 
+      {health.length > 0 && (
+        <section className="card">
+          <h3>Статус</h3>
+          {health.map((h) => (
+            <div key={h.serverId} className="row" style={{ marginTop: 8, justifyContent: "space-between" }}>
+              <span>
+                <strong>{h.name}</strong>{" "}
+                <span className={h.ok ? "badge" : "badge badge-danger"}>{h.ok ? "OK" : "ошибка"}</span>
+              </span>
+              <span className="muted mono" style={{ fontSize: "0.78rem" }}>
+                {h.message}
+              </span>
+            </div>
+          ))}
+        </section>
+      )}
+
       {props.settings.mcpServers.length === 0 && (
         <div className="muted">Пока нет MCP-серверов. Без них агент использует встроенные инструменты.</div>
       )}
@@ -119,6 +196,9 @@ export function McpPage(props: {
               </div>
             </div>
             <div className="row">
+              <button className="btn ghost" type="button" disabled={saving} onClick={() => void runHealth(s)}>
+                Проверить
+              </button>
               <label className="row">
                 <input
                   type="checkbox"

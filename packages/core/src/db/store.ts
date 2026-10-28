@@ -2,7 +2,12 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { v4 as uuid } from "uuid";
-import type { ChatMessage, ChatSession, GenerationParams } from "@kovi/shared";
+import type {
+  ChatMessage,
+  ChatSession,
+  GenerationParams,
+  SessionExportBundle,
+} from "@kovi/shared";
 import { DEFAULT_GENERATION_PARAMS } from "@kovi/shared";
 import { ensureDir } from "../paths.js";
 
@@ -170,6 +175,42 @@ export class Store {
     }
     this.persist();
     return full;
+  }
+
+  exportSession(sessionId: string): SessionExportBundle {
+    const session = this.data.sessions.find((s) => s.id === sessionId);
+    if (!session) throw new Error("Сессия не найдена");
+    return {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      session: structuredClone(session),
+      messages: structuredClone(this.data.messages[sessionId] || []),
+    };
+  }
+
+  importSession(bundle: SessionExportBundle): ChatSession {
+    if (!bundle?.session || !Array.isArray(bundle.messages)) {
+      throw new Error("Некорректный файл экспорта сессии");
+    }
+    const now = new Date().toISOString();
+    const id = uuid();
+    const session = normalizeSession({
+      ...bundle.session,
+      id,
+      title: bundle.session.title?.startsWith("[импорт]")
+        ? bundle.session.title
+        : `[импорт] ${bundle.session.title || "Диалог"}`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    this.data.sessions.unshift(session);
+    this.data.messages[id] = bundle.messages.map((m) => ({
+      ...m,
+      id: m.id || uuid(),
+      createdAt: m.createdAt || now,
+    }));
+    this.persist();
+    return session;
   }
 
   close(): void {

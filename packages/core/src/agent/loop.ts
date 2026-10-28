@@ -19,8 +19,10 @@ import {
   searchFiles,
   writeFileTool,
 } from "../tools/files.js";
-import { riskForTool } from "../tools/sandbox.js";
+import { previewPatchDiff, previewWriteDiff } from "../tools/diff.js";
+import { riskForTool, shouldConfirmRisk } from "../tools/sandbox.js";
 import { webSearch } from "../tools/websearch.js";
+import { loadProjectMemory } from "./projectMemory.js";
 import { toolsPromptBlock } from "./toolsCatalog.js";
 
 type EventFn = (sessionId: string, event: AgentEvent) => void;
@@ -120,10 +122,28 @@ export class AgentLoop {
     sessionId: string,
     toolName: string,
     args: Record<string, unknown>,
+    settings: AppSettings,
   ): Promise<boolean> {
     const risk = riskForTool(toolName, args);
     if (risk === "low") return true;
     if (this.allowFor(sessionId).has(toolName)) return true;
+    if (
+      !shouldConfirmRisk(risk, settings.agentRiskMode || "ask", args, settings.projectRoot)
+    ) {
+      return true;
+    }
+
+    let diff: string | undefined;
+    if (toolName === "write_file") {
+      diff = previewWriteDiff(String(args.path || ""), String(args.content ?? ""));
+    } else if (toolName === "apply_patch") {
+      diff = previewPatchDiff(
+        String(args.path || ""),
+        String(args.oldText ?? ""),
+        String(args.newText ?? ""),
+      );
+    }
+
     const confirmation: AgentConfirmation = {
       id: uuid(),
       toolName,
@@ -131,6 +151,7 @@ export class AgentLoop {
       args,
       risk: risk === "high" ? "high" : "medium",
       createdAt: new Date().toISOString(),
+      diff,
     };
     this.emit(sessionId, { type: "confirmation_required", confirmation });
     return new Promise<boolean>((resolve) => {
@@ -205,10 +226,15 @@ export class AgentLoop {
         this.mcp.listTools().map((t) => ({ name: t.name, description: t.description })),
       );
 
+      const memory = loadProjectMemory(settings.projectRoot);
+      const memoryBlock = memory
+        ? `\n\n# Память проекта (AGENTS.md)\n${memory}`
+        : "";
+
       const transcript: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
         {
           role: "system",
-          content: `${systemPrompt}\n\n${projectHint}\n\n${toolBlock}`,
+          content: `${systemPrompt}\n\n${projectHint}\n\n${toolBlock}${memoryBlock}`,
         },
       ];
 
@@ -235,6 +261,8 @@ export class AgentLoop {
           this.emit(sessionId, { type: "cancelled" });
           return;
         }
+        const stepId = `step-${i + 1}`;
+        this.emit(sessionId, { type: "step_start", stepId });
 
         let raw: string;
         try {
@@ -318,7 +346,7 @@ export class AgentLoop {
           return;
         }
 
-        const approved = await this.confirmIfNeeded(sessionId, toolName, args);
+        const approved = await this.confirmIfNeeded(sessionId, toolName, args, settings);
         if (this.cancelled) {
           this.emit(sessionId, { type: "cancelled" });
           return;
@@ -326,6 +354,7 @@ export class AgentLoop {
         if (!approved) {
           const deny = "Пользователь отклонил действие";
           this.emit(sessionId, { type: "tool_result", callId, result: deny, isError: true });
+          this.emit(sessionId, { type: "step_done", stepId, detail: deny });
           transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
           transcript.push({ role: "user", content: `Результат инструмента ${toolName}: ${deny}` });
           continue;
@@ -340,6 +369,11 @@ export class AgentLoop {
             toolName,
           });
           this.emit(sessionId, { type: "tool_result", callId, result });
+          this.emit(sessionId, {
+            type: "step_done",
+            stepId,
+            detail: `${toolName} ok`,
+          });
           transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
           transcript.push({
             role: "user",
@@ -353,6 +387,7 @@ export class AgentLoop {
             result: message,
             isError: true,
           });
+          this.emit(sessionId, { type: "step_done", stepId, detail: message });
           transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
           transcript.push({
             role: "user",

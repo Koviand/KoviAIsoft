@@ -106,12 +106,13 @@ function stagePackageJson() {
       "electron-builder": "^25.1.8",
     },
     build: {
-      appId: "com.kovi.aichat",
+      appId: "com.kovi.aisoft",
       productName: "KoviAIsoft",
       copyright: "Copyright © Kovi",
       directories: {
         output: path.join(outDir, "builder-out"),
         app: stage,
+        buildResources: path.join(root, "apps", "desktop", "build"),
       },
       files: [
         "dist/**/*",
@@ -128,12 +129,17 @@ function stagePackageJson() {
           from: path.join(root, "apps", "ui", "dist"),
           to: "ui",
         },
+        {
+          from: path.join(root, "apps", "desktop", "build", "icon.png"),
+          to: "icon.png",
+        },
       ],
       win: {
         target: [
           { target: "dir", arch: ["x64"] },
           { target: "portable", arch: ["x64"] },
         ],
+        icon: path.join(root, "apps", "desktop", "build", "icon.png"),
         artifactName: "KoviAIsoft-${version}-portable.${ext}",
         signAndEditExecutable: false,
       },
