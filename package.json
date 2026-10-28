@@ -1,0 +1,29 @@
+{
+  "name": "kovi-ai-soft",
+  "version": "0.1.0",
+  "private": true,
+  "description": "KoviAIsoft — local LM Studio-like desktop app with Hermes-style agent",
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "dev:ui": "pnpm --filter @kovi/ui dev",
+    "dev:desktop": "pnpm --filter @kovi/desktop dev",
+    "build": "pnpm build:shared && pnpm build:core && pnpm build:ui && pnpm build:desktop",
+    "build:shared": "pnpm --filter @kovi/shared build",
+    "build:core": "pnpm --filter @kovi/core build",
+    "build:ui": "pnpm --filter @kovi/ui build",
+    "build:desktop": "pnpm --filter @kovi/desktop build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "pnpm -r run typecheck",
+    "pack": "node scripts/pack-portable.mjs",
+    "pack:win": "node scripts/pack-portable.mjs",
+    "postinstall": "pnpm build:shared && pnpm build:core",
+    "playwright:install": "pnpm --filter @kovi/core exec playwright install chromium",
+    "smoke:lfm3": "node scripts/smoke-lfm3.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}
