@@ -55,6 +55,7 @@ export class AppService {
     tokenChars: 0,
     tokenApprox: 0,
   };
+  private lastTokensPerSecond: number | null = null;
 
   onRuntimeProgress?: (p: { progress: number; label: string }) => void;
   onDownloadProgress?: (p: { progress: number; label: string }) => void;
@@ -232,7 +233,10 @@ export class AppService {
       return { updated: false, installed, update };
     }
     const result = await this.runtime.ensureLatest(pref, { force: opts.force });
-    await this.markRuntimeChecked();
+    // Only throttle after GitHub actually resolved an asset (not on rate-limit/network fail).
+    if (result.update.latestAsset) {
+      await this.markRuntimeChecked();
+    }
     return result;
   }
 
@@ -294,13 +298,14 @@ export class AppService {
     const settings = this.settings.get();
     // Do not block model load on GitHub updates — only ensure a local binary exists.
     await this.runtime.ensureInstalled(settings.runtimeBackendPreference);
+    this.resetGenStats();
+    await this.runtime.loadModel(model, merged);
+    // Quiet update only AFTER model is up — ensureLatest defers while server is running.
     if (settings.autoUpdateRuntime !== false) {
       void this.ensureLatestRuntime(settings.runtimeBackendPreference).catch((err) => {
         console.error("Background runtime update failed:", err);
       });
     }
-    this.resetGenStats();
-    await this.runtime.loadModel(model, merged);
   }
 
   unloadModel(): Promise<void> {
@@ -326,6 +331,7 @@ export class AppService {
   }
 
   deleteSession(sessionId: string): void {
+    this.agent.clearSessionAllow(sessionId);
     this.store.deleteSession(sessionId);
   }
 
@@ -366,6 +372,7 @@ export class AppService {
     }
     const session = this.store.listSessions().find((s) => s.id === sessionId);
     if (!session) throw new Error("Сессия не найдена");
+    this.noteGenerationStart();
     const merged = { ...session.params, ...params };
     const result = await this.chat.send(sessionId, content, merged, session.systemPrompt);
     this.maybeRenameSession(session, content);
@@ -410,6 +417,7 @@ export class AppService {
     }
     const session = this.store.listSessions().find((s) => s.id === sessionId);
     if (!session) throw new Error("Сессия не найдена");
+    this.noteGenerationStart();
     this.maybeRenameSession(session, content);
     await this.agent.run(
       sessionId,
@@ -476,9 +484,17 @@ export class AppService {
       metricsSource = m.source;
     }
 
-    if (tokensPerSecond == null && busy) {
+    const metricsUseless =
+      tokensPerSecond == null || (tokensPerSecond === 0 && busy);
+    if (metricsUseless && busy) {
       tokensPerSecond = this.fallbackTokensPerSecond();
-      if (tokensPerSecond != null && metricsSource === "none") metricsSource = "stream";
+      if (tokensPerSecond != null) metricsSource = "stream";
+    }
+    if (tokensPerSecond != null && tokensPerSecond > 0) {
+      this.lastTokensPerSecond = tokensPerSecond;
+    } else if (!busy && this.lastTokensPerSecond != null) {
+      tokensPerSecond = this.lastTokensPerSecond;
+      if (metricsSource === "none") metricsSource = "last";
     }
 
     const settings = this.settings.get();

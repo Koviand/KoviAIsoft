@@ -248,18 +248,18 @@ export const DEFAULT_GENERATION_PARAMS: GenerationParams = {
 };
 
 export const DEFAULT_THEME_CUSTOM: ThemeCustom = {
-  accent: "#2a6f6f",
-  background: "#0f1414",
-  surface: "#18201f",
-  text: "#e7eeed",
-  radius: 10,
+  accent: "#2a4bff",
+  background: "#e7ebf0",
+  surface: "#f7f8fb",
+  text: "#12141a",
+  radius: 12,
   density: "comfortable",
 };
 
 export function createDefaultSettings(appData: string): AppSettings {
   return {
     language: "ru",
-    themePreset: "dark",
+    themePreset: "light",
     themeCustom: { ...DEFAULT_THEME_CUSTOM },
     modelRoots: ["C:\\Models\\LFM"],
     downloadDir: `${appData}\\models`,

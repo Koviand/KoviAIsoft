@@ -56,7 +56,7 @@ async function createWindow(): Promise<void> {
     height: 900,
     minWidth: 1100,
     minHeight: 700,
-    backgroundColor: "#0a100f",
+    backgroundColor: "#e7ebf0",
     title: "KoviAIsoft",
     autoHideMenuBar: true,
     webPreferences: {
@@ -94,7 +94,7 @@ async function createMonitorWindow(): Promise<void> {
     height: 640,
     minWidth: 360,
     minHeight: 480,
-    backgroundColor: "#0a100f",
+    backgroundColor: "#e7ebf0",
     title: "KoviAIsoft · Monitor",
     autoHideMenuBar: true,
     show: false,
@@ -107,12 +107,15 @@ async function createMonitorWindow(): Promise<void> {
     },
   });
 
-  await loadUi(monitorWindow, "#/monitor");
-  monitorWindow.once("ready-to-show", () => monitorWindow?.show());
+  // Register before load so we never miss the first ready-to-show.
+  monitorWindow.once("ready-to-show", () => {
+    if (monitorWindow && !monitorWindow.isDestroyed()) monitorWindow.show();
+  });
   monitorWindow.on("closed", () => {
     monitorWindow = null;
     stopMonitorPush();
   });
+  await loadUi(monitorWindow, "#/monitor");
   startMonitorPush();
 }
 

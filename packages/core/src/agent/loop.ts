@@ -57,9 +57,11 @@ export class AgentLoop {
     {
       resolve: (approved: boolean) => void;
       toolName: string;
+      sessionId: string;
     }
   >();
-  private sessionAllow = new Set<string>();
+  /** Remembered tool approvals keyed by chat session (survive multiple agent turns). */
+  private allowBySession = new Map<string, Set<string>>();
   private running = false;
 
   constructor(chat: ChatEngine, store: Store, mcp: McpManager) {
@@ -89,9 +91,25 @@ export class AgentLoop {
   resolveConfirmation(id: string, approved: boolean, remember = false): void {
     const pending = this.pendingConfirm.get(id);
     if (!pending) return;
-    if (approved && remember) this.sessionAllow.add(pending.toolName);
+    if (approved && remember && pending.sessionId) {
+      this.allowFor(pending.sessionId).add(pending.toolName);
+    }
     pending.resolve(approved);
     this.pendingConfirm.delete(id);
+  }
+
+  private allowFor(sessionId: string): Set<string> {
+    let set = this.allowBySession.get(sessionId);
+    if (!set) {
+      set = new Set();
+      this.allowBySession.set(sessionId, set);
+    }
+    return set;
+  }
+
+  /** Drop remembered approvals when a session is deleted. */
+  clearSessionAllow(sessionId: string): void {
+    this.allowBySession.delete(sessionId);
   }
 
   private emit(sessionId: string, event: AgentEvent): void {
@@ -105,7 +123,7 @@ export class AgentLoop {
   ): Promise<boolean> {
     const risk = riskForTool(toolName, args);
     if (risk === "low") return true;
-    if (this.sessionAllow.has(toolName)) return true;
+    if (this.allowFor(sessionId).has(toolName)) return true;
     const confirmation: AgentConfirmation = {
       id: uuid(),
       toolName,
@@ -116,7 +134,7 @@ export class AgentLoop {
     };
     this.emit(sessionId, { type: "confirmation_required", confirmation });
     return new Promise<boolean>((resolve) => {
-      this.pendingConfirm.set(confirmation.id, { resolve, toolName });
+      this.pendingConfirm.set(confirmation.id, { resolve, toolName, sessionId });
     });
   }
 
@@ -175,7 +193,6 @@ export class AgentLoop {
     if (this.running) throw new Error("Агент уже выполняется");
     this.running = true;
     this.cancelled = false;
-    this.sessionAllow.clear();
 
     try {
       this.store.addMessage(sessionId, { role: "user", content: userContent });
@@ -193,8 +210,23 @@ export class AgentLoop {
           role: "system",
           content: `${systemPrompt}\n\n${projectHint}\n\n${toolBlock}`,
         },
-        { role: "user", content: userContent },
       ];
+
+      // Include prior chat history so multi-turn agent runs keep context.
+      const prior = this.store.getMessages(sessionId);
+      for (const m of prior) {
+        if (m.role === "system") continue;
+        if (m.role === "tool") {
+          transcript.push({
+            role: "user",
+            content: `Результат инструмента ${m.toolName || "tool"}:\n${m.content.slice(0, 6000)}`,
+          });
+          continue;
+        }
+        if (m.role === "user" || m.role === "assistant") {
+          transcript.push({ role: m.role, content: m.content });
+        }
+      }
 
       let steps: AgentPlanStep[] = [];
 

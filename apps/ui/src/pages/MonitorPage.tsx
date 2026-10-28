@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { MonitorSnapshot } from "@kovi/shared";
 import { api } from "../api";
+import { applyTheme } from "../hooks/useAppState";
 
 function pct(used: number | null, total: number | null): number {
   if (used == null || total == null || total <= 0) return 0;
@@ -19,6 +20,12 @@ export function MonitorPage() {
 
   useEffect(() => {
     let alive = true;
+    void api
+      .getSettings()
+      .then((s) => {
+        if (alive) applyTheme(s.themePreset, s.themeCustom);
+      })
+      .catch(() => undefined);
     const pull = async () => {
       try {
         const next = await api.getMonitorSnapshot();

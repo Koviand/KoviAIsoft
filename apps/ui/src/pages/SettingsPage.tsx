@@ -72,8 +72,8 @@ export function SettingsPage(props: {
         <div className="row" style={{ marginTop: 10 }}>
           {(
             [
-              ["dark", "Тёмная"],
               ["light", "Светлая"],
+              ["dark", "Тёмная"],
               ["high-contrast", "Контраст"],
               ["custom", "Своя"],
             ] as const

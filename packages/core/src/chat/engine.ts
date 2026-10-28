@@ -58,16 +58,23 @@ export class ChatEngine {
     this.stop();
     this.store.addMessage(sessionId, { role: "user", content: userContent });
     const history = this.store.getMessages(sessionId);
+    // Skip orphan tool rows from agent turns — plain chat has no tool_calls protocol.
     const messages: OpenAiMessage[] = [
       { role: "system", content: systemPrompt },
-      ...history
-        .filter((m) => m.role !== "system")
-        .map((m) => ({
-          role: m.role,
-          content: m.content,
-          tool_call_id: m.toolCallId,
-          name: m.toolName,
-        })),
+      ...history.flatMap((m): OpenAiMessage[] => {
+        if (m.role === "user" || m.role === "assistant") {
+          return [{ role: m.role, content: m.content }];
+        }
+        if (m.role === "tool") {
+          return [
+            {
+              role: "user",
+              content: `[результат ${m.toolName || "tool"}]\n${m.content.slice(0, 6000)}`,
+            },
+          ];
+        }
+        return [];
+      }),
     ];
 
     this.abort = new AbortController();

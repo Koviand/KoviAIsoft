@@ -19,8 +19,12 @@ export class SettingsStore {
   }
 
   async save(next: AppSettings): Promise<AppSettings> {
-    this.settings = next;
-    await fsp.writeFile(getSettingsPath(this.appData), JSON.stringify(next, null, 2), "utf8");
+    this.settings = structuredClone(next);
+    await fsp.writeFile(
+      getSettingsPath(this.appData),
+      JSON.stringify(this.settings, null, 2),
+      "utf8",
+    );
     return this.get();
   }
 

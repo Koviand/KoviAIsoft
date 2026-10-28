@@ -73,6 +73,7 @@ export class RuntimeManager {
     installed: InstalledRuntime;
     update: RuntimeUpdateInfo;
   }> | null = null;
+  private installPromise: Promise<InstalledRuntime> | null = null;
 
   constructor(appData: string) {
     this.appData = appData;
@@ -118,13 +119,25 @@ export class RuntimeManager {
       ? raw.serverPath
       : path.join(root, raw.serverPath);
 
-    if (!fs.existsSync(absServer)) {
-      // Fallback: search inside install folder (portable move / renamed layout).
-      if (fs.existsSync(absPath)) {
-        const found = fs.existsSync(path.join(absPath, "llama-server.exe"))
-          ? path.join(absPath, "llama-server.exe")
-          : null;
-        if (found) absServer = found;
+    if (!fs.existsSync(absServer) && fs.existsSync(absPath)) {
+      // Sync walk — same as findLlamaServer but without async for hydrate.
+      const stack = [absPath];
+      while (stack.length && !fs.existsSync(absServer)) {
+        const dir = stack.pop()!;
+        let entries: fs.Dirent[];
+        try {
+          entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const e of entries) {
+          const full = path.join(dir, e.name);
+          if (e.isFile() && e.name.toLowerCase() === "llama-server.exe") {
+            absServer = full;
+            break;
+          }
+          if (e.isDirectory() && e.name !== "node_modules") stack.push(full);
+        }
       }
     }
     if (!fs.existsSync(absServer)) return null;
@@ -138,12 +151,19 @@ export class RuntimeManager {
 
   private toStoredMeta(meta: InstalledRuntime): InstalledRuntime {
     const root = this.runtimesRoot();
-    const relPath = path.isAbsolute(meta.path)
-      ? path.relative(root, meta.path) || path.basename(meta.path)
+    let relPath = path.isAbsolute(meta.path)
+      ? path.relative(root, meta.path)
       : meta.path;
-    const relServer = path.isAbsolute(meta.serverPath)
+    let relServer = path.isAbsolute(meta.serverPath)
       ? path.relative(root, meta.serverPath)
       : meta.serverPath;
+    // Avoid storing paths that escape the runtimes root (other drive / ..).
+    if (!relPath || relPath.startsWith("..") || path.isAbsolute(relPath)) {
+      relPath = path.basename(meta.path);
+    }
+    if (!relServer || relServer.startsWith("..") || path.isAbsolute(relServer)) {
+      relServer = path.join(path.basename(meta.path), path.basename(meta.serverPath));
+    }
     return {
       ...meta,
       path: relPath.replace(/\\/g, "/"),
@@ -162,7 +182,10 @@ export class RuntimeManager {
   }
 
   private async writeInstalledMeta(meta: InstalledRuntime): Promise<void> {
-    const hydrated = this.hydrateMeta(meta) || meta;
+    const hydrated = this.hydrateMeta(meta);
+    if (!hydrated) {
+      throw new Error("Не удалось сохранить runtime: llama-server.exe не найден");
+    }
     await fsp.writeFile(
       this.metaPath(),
       JSON.stringify(this.toStoredMeta(hydrated), null, 2),
@@ -229,7 +252,11 @@ export class RuntimeManager {
     backendPref: RuntimeBackend | "auto" = "auto",
     opts: { force?: boolean } = {},
   ): Promise<{ updated: boolean; installed: InstalledRuntime; update: RuntimeUpdateInfo }> {
-    if (this.ensurePromise) return this.ensurePromise;
+    // Coalesce only non-force checks; force always starts a dedicated pass after in-flight ends.
+    if (this.ensurePromise && !opts.force) return this.ensurePromise;
+    if (this.ensurePromise && opts.force) {
+      await this.ensurePromise.catch(() => undefined);
+    }
     this.ensurePromise = this.ensureLatestInner(backendPref, opts).finally(() => {
       this.ensurePromise = null;
     });
@@ -253,10 +280,22 @@ export class RuntimeManager {
       return { updated: false, installed: this.installed, update };
     }
 
+    // Never tear down a running model for a quiet background update.
+    if (!opts.force && this.process && !this.process.killed) {
+      const deferred: RuntimeUpdateInfo = {
+        ...update,
+        message: `Доступно обновление ${update.latestTag}, отложено пока загружена модель.`,
+      };
+      this.updateInfo = deferred;
+      return { updated: false, installed: this.installed!, update: deferred };
+    }
+
     const previousModelId = this.loadedModelId;
     await this.stopServer();
 
-    const installed = await this.install(backendPref, update.latestAsset);
+    const installed = await this.install(backendPref, update.latestAsset, {
+      force: Boolean(opts.force),
+    });
     const refreshed: RuntimeUpdateInfo = {
       ...update,
       updateAvailable: false,
@@ -289,10 +328,23 @@ export class RuntimeManager {
   async install(
     backendPref: RuntimeBackend | "auto" = "auto",
     preselected?: RuntimeAsset,
+    opts: { force?: boolean } = {},
   ): Promise<InstalledRuntime> {
-    if (this.downloading) {
-      throw new Error("Уже идёт скачивание runtime");
+    if (this.installPromise) {
+      if (!opts.force) return this.installPromise;
+      await this.installPromise.catch(() => undefined);
     }
+    this.installPromise = this.installInner(backendPref, preselected, opts).finally(() => {
+      this.installPromise = null;
+    });
+    return this.installPromise;
+  }
+
+  private async installInner(
+    backendPref: RuntimeBackend | "auto",
+    preselected: RuntimeAsset | undefined,
+    opts: { force?: boolean },
+  ): Promise<InstalledRuntime> {
     this.downloading = true;
     this.downloadProgress = 0;
     this.lastError = null;
@@ -303,8 +355,12 @@ export class RuntimeManager {
         `${asset.tag}-${asset.backend}`,
       );
 
+      if (opts.force) {
+        await fsp.rm(destRoot, { recursive: true, force: true });
+      }
+
       const existingServer = await findLlamaServer(destRoot);
-      if (existingServer) {
+      if (existingServer && !opts.force) {
         const meta: InstalledRuntime = {
           tag: asset.tag,
           backend: asset.backend,

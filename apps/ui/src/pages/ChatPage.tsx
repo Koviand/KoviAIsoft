@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChatMessage, ChatSession } from "@kovi/shared";
 import { sessionToolsEnabled } from "@kovi/shared";
 import { api } from "../api";
-import { paramLabel, riskRu, statusRu } from "../lib/labels";
+import { paramLabel, statusRu } from "../lib/labels";
 
 const PROMPT_CHIPS = [
   "Кратко объясни, что умеет этот чат",
@@ -46,12 +46,6 @@ export function ChatPage(props: {
   const [toolTrail, setToolTrail] = useState<
     Array<{ callId: string; name: string; status: "running" | "done" | "error"; detail?: string }>
   >([]);
-  const [confirm, setConfirm] = useState<{
-    id: string;
-    summary: string;
-    risk: string;
-  } | null>(null);
-  const [confirmBusy, setConfirmBusy] = useState(false);
   const [agentOn, setAgentOn] = useState(false);
   const [showParams, setShowParams] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -72,15 +66,13 @@ export function ChatPage(props: {
     setAgentOn(sessionToolsEnabled(activeSession));
     setPlan([]);
     setToolTrail([]);
-    setConfirm(null);
-    setConfirmBusy(false);
     setStreaming("");
     setThinking("");
   }, [activeSession?.id]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [props.messages, streaming, thinking, plan, confirm, toolTrail]);
+  }, [props.messages, streaming, thinking, plan, toolTrail]);
 
   useEffect(() => {
     const offToken = api.onChatToken((p) => {
@@ -116,19 +108,9 @@ export function ChatPage(props: {
           void api.getMessages(activeIdRef.current).then(props.setMessages);
         }
       }
-      if (ev.type === "confirmation_required") {
-        setConfirmBusy(false);
-        setConfirm({
-          id: ev.confirmation.id,
-          summary: ev.confirmation.summary,
-          risk: ev.confirmation.risk,
-        });
-      }
       if (ev.type === "done" || ev.type === "cancelled" || ev.type === "error") {
         setStreaming("");
         setThinking("");
-        setConfirm(null);
-        setConfirmBusy(false);
         props.setBusy(false);
         if (activeIdRef.current) {
           void api.getMessages(activeIdRef.current).then(props.setMessages);
@@ -193,7 +175,6 @@ export function ChatPage(props: {
     setThinking("");
     setPlan([]);
     setToolTrail([]);
-    setConfirm(null);
     props.setBusy(true);
     props.setError(null);
     try {
@@ -233,7 +214,6 @@ export function ChatPage(props: {
       await api.stopGeneration();
     } finally {
       props.setBusy(false);
-      setConfirm(null);
       setStreaming("");
       setThinking("");
       if (props.activeSessionId) {
@@ -252,26 +232,6 @@ export function ChatPage(props: {
       }
     } catch (e) {
       props.setError(e instanceof Error ? e.message : String(e));
-    }
-  }
-
-  async function resolveConfirm(
-    approved: boolean,
-    rememberForSession?: boolean,
-  ): Promise<void> {
-    if (!confirm || confirmBusy) return;
-    setConfirmBusy(true);
-    const id = confirm.id;
-    setConfirm(null);
-    try {
-      await api.resolveConfirmation({
-        confirmationId: id,
-        approved,
-        rememberForSession,
-      });
-    } catch (e) {
-      props.setError(e instanceof Error ? e.message : String(e));
-      setConfirmBusy(false);
     }
   }
 
@@ -436,50 +396,15 @@ export function ChatPage(props: {
               </div>
             )}
 
-            {confirm && (
-              <div className="confirm-banner" style={{ width: "100%", margin: 0 }}>
-                <div>
-                  <strong>Нужно подтверждение ({riskRu(confirm.risk)})</strong>
-                  <div className="mono" style={{ marginTop: 6 }}>
-                    {confirm.summary}
-                  </div>
-                </div>
-                <div className="row" style={{ marginTop: 10 }}>
-                  <button
-                    className="btn primary"
-                    type="button"
-                    disabled={confirmBusy}
-                    onClick={() => void resolveConfirm(true)}
-                  >
-                    Разрешить
-                  </button>
-                  <button
-                    className="btn"
-                    type="button"
-                    disabled={confirmBusy}
-                    onClick={() => void resolveConfirm(true, true)}
-                  >
-                    Разрешить до конца диалога
-                  </button>
-                  <button
-                    className="btn danger"
-                    type="button"
-                    disabled={confirmBusy}
-                    onClick={() => void resolveConfirm(false)}
-                  >
-                    Отклонить
-                  </button>
-                </div>
-              </div>
-            )}
-
             <div className="messages">
               {isEmpty && (
                 <div className="empty-chat">
-                  <div className="empty-chat-brand">KoviAIsoft</div>
+                  <div className="empty-chat-brand">
+                    Kovi<span>AI</span>soft
+                  </div>
                   <p className="muted">
-                    Сначала загрузите модель во вкладке «Модели». Пишите как обычно или включите
-                    «Агент» для работы с файлами и инструментами.
+                    Загрузите модель во вкладке «Модели», затем напишите сюда. Режим «Агент» —
+                    для файлов, терминала и инструментов.
                   </p>
                   <div className="prompt-chips">
                     {PROMPT_CHIPS.map((chip) => (

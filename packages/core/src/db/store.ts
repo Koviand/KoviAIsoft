@@ -75,6 +75,8 @@ export class Store {
         fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), "utf8");
       } catch {
         this.dirty = true;
+        // Retry once shortly after I/O failure.
+        setTimeout(() => this.persist(), 250);
       }
     }, 80);
   }

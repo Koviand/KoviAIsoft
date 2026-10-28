@@ -77,7 +77,8 @@ export async function downloadFile(
       `Размер файла не совпал для ${path.basename(destPath)}: ${st.size} != ${expectedSize}`,
     );
   }
-  if (total > 0 && st.size !== total) {
+  // Content-Length is advisory for progress only — skip hard fail when SHA/size provided.
+  if (!expectedSize && !expectedSha && total > 0 && st.size !== total) {
     await fsp.unlink(destPath).catch(() => undefined);
     throw new Error(
       `Неполная загрузка ${path.basename(destPath)}: ${st.size} из ${total} байт`,

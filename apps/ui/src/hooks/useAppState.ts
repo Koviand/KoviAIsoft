@@ -39,6 +39,13 @@ export function useAppState() {
   /** Only chat/agent generation — not Models/Runtime page work. */
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pendingConfirm, setPendingConfirm] = useState<{
+    id: string;
+    sessionId: string;
+    summary: string;
+    risk: string;
+  } | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
   const [booting, setBooting] = useState(true);
   const activeSessionRef = useRef<string | null>(null);
   const viewRef = useRef<AppView>(view);
@@ -91,12 +98,26 @@ export function useAppState() {
     setStatus((prev) => (prev ? { ...prev, view } : prev));
   }, [view]);
 
-  // Keep generating flag correct even if user leaves Chat page mid-agent.
+  // Keep generating / confirmations correct even if user leaves Chat mid-agent.
   useEffect(() => {
     const off = api.onAgentEvent((p) => {
       const ev = p.event;
+      if (ev.type === "confirmation_required") {
+        setPendingConfirm({
+          id: ev.confirmation.id,
+          sessionId: p.sessionId,
+          summary: ev.confirmation.summary,
+          risk: ev.confirmation.risk,
+        });
+        setConfirmBusy(false);
+        setActiveSessionId(p.sessionId);
+        setViewRaw("chat");
+        setGenerating(true);
+      }
       if (ev.type === "done" || ev.type === "cancelled" || ev.type === "error") {
         setGenerating(false);
+        setPendingConfirm(null);
+        setConfirmBusy(false);
         if (ev.type === "error") setError(ev.message);
         if (activeSessionRef.current === p.sessionId) {
           void api.getMessages(p.sessionId).then(setMessages).catch(() => undefined);
@@ -111,22 +132,45 @@ export function useAppState() {
     return off;
   }, []);
 
+  const resolvePendingConfirm = useCallback(
+    async (approved: boolean, remember = false) => {
+      if (!pendingConfirm || confirmBusy) return;
+      setConfirmBusy(true);
+      try {
+        await api.resolveConfirmation({
+          confirmationId: pendingConfirm.id,
+          approved,
+          rememberForSession: remember,
+        });
+        setPendingConfirm(null);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setConfirmBusy(false);
+      }
+    },
+    [pendingConfirm, confirmBusy],
+  );
+
   useEffect(() => {
     if (!activeSessionId) {
       setMessages([]);
       return;
     }
-    // Clear immediately so we never flash another session's history.
-    setMessages([]);
     let cancelled = false;
     const sid = activeSessionId;
+    // Don't wipe optimistic tmp bubbles (new session mid-send). Otherwise clear to avoid
+    // flashing the previous session while the next history loads.
+    setMessages((current) =>
+      current.some((m) => m.id.startsWith("tmp-")) ? current : [],
+    );
     api
       .getMessages(sid)
       .then((msgs) => {
         if (cancelled || activeSessionRef.current !== sid) return;
         setMessages((current) => {
-          // Keep optimistic tmp user bubble if server still has an empty new session.
           const hasTmp = current.some((m) => m.id.startsWith("tmp-"));
+          // Keep optimistic bubble until the server has persisted the user message.
           if (hasTmp && msgs.length === 0) return current;
           return msgs;
         });
@@ -165,6 +209,9 @@ export function useAppState() {
     /** @deprecated alias — chat generation only */
     busy: generating,
     setBusy: setGenerating,
+    pendingConfirm,
+    confirmBusy,
+    resolvePendingConfirm,
     error,
     setError,
     booting,
@@ -178,18 +225,22 @@ export function applyTheme(
 ): void {
   const root = document.documentElement;
   if (preset === "custom") {
-    root.dataset.theme = "dark";
+    root.dataset.theme = "light";
     root.style.setProperty("--bg", custom.background);
     root.style.setProperty("--surface", custom.surface);
     root.style.setProperty("--text", custom.text);
+    root.style.setProperty("--ink", custom.text);
     root.style.setProperty("--accent", custom.accent);
+    root.style.setProperty("--accent-2", custom.accent);
     root.style.setProperty("--radius", `${custom.radius}px`);
   } else {
     root.dataset.theme = preset;
     root.style.removeProperty("--bg");
     root.style.removeProperty("--surface");
     root.style.removeProperty("--text");
+    root.style.removeProperty("--ink");
     root.style.removeProperty("--accent");
+    root.style.removeProperty("--accent-2");
     root.style.removeProperty("--radius");
   }
 }
