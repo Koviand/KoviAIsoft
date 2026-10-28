@@ -105,6 +105,7 @@ export class ChatEngine {
     let content = "";
     let thinking = "";
     let inThink = false;
+    let truncated = false;
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -124,45 +125,60 @@ export class ChatEngine {
           if (data === "[DONE]") continue;
           try {
             const json = JSON.parse(data) as {
-              choices?: Array<{ delta?: { content?: string; reasoning_content?: string } }>;
+              choices?: Array<{
+                finish_reason?: string | null;
+                delta?: { content?: string; reasoning_content?: string };
+              }>;
             };
-            const delta = json.choices?.[0]?.delta;
-            const piece = delta?.content || "";
-            const reason = delta?.reasoning_content || "";
+            const finish = json.choices?.[0]?.finish_reason;
+            if (finish === "length") truncated = true;
+            const delta = json.choices?.[0]?.delta as
+              | {
+                  content?: string;
+                  reasoning_content?: string;
+                  reasoning?: string;
+                  text?: string;
+                }
+              | undefined;
+            const piece = delta?.content || delta?.text || "";
+            const reason = delta?.reasoning_content || delta?.reasoning || "";
             if (reason) {
               thinking += reason;
               this.onToken?.({ sessionId, text: reason, thinking: true });
             }
             if (!piece) continue;
-            // Support <think> tags from some models
+            // Support <think> / <thinking> tags from some models (LFM, Qwen, etc.)
             let rest = piece;
             while (rest.length) {
               if (!inThink) {
-                const idx = rest.indexOf("<think>");
-                if (idx === -1) {
+                const m = rest.match(/<(?:think|thinking)>/i);
+                if (!m || m.index == null) {
                   content += rest;
                   this.onToken?.({ sessionId, text: rest });
                   rest = "";
                 } else {
-                  const before = rest.slice(0, idx);
+                  const before = rest.slice(0, m.index);
                   if (before) {
                     content += before;
                     this.onToken?.({ sessionId, text: before });
                   }
                   inThink = true;
-                  rest = rest.slice(idx + 7);
+                  rest = rest.slice(m.index + m[0].length);
                 }
               } else {
-                const idx = rest.indexOf("</think>");
-                if (idx === -1) {
+                const m = rest.match(/<\/(?:think|thinking)>/i);
+                if (!m || m.index == null) {
                   thinking += rest;
                   this.onToken?.({ sessionId, text: rest, thinking: true });
                   rest = "";
                 } else {
-                  thinking += rest.slice(0, idx);
-                  this.onToken?.({ sessionId, text: rest.slice(0, idx), thinking: true });
+                  const chunk = rest.slice(0, m.index);
+                  if (chunk) {
+                    thinking += chunk;
+                    this.onToken?.({ sessionId, text: chunk, thinking: true });
+                  }
                   inThink = false;
-                  rest = rest.slice(idx + 8);
+                  rest = rest.slice(m.index + m[0].length);
                 }
               }
             }
@@ -181,10 +197,19 @@ export class ChatEngine {
       }
     }
 
+    let finalContent = content || (signal.aborted ? "(остановлено)" : "(пусто)");
+    if (truncated) {
+      finalContent +=
+        "\n\n⚠️ Ответ обрезан по лимиту max tokens. Увеличьте параметр «Макс. токены» в параметрах диалога или попросите продолжить.";
+      this.onToken?.({
+        sessionId,
+        text: "\n\n⚠️ Ответ обрезан по лимиту max tokens.",
+      });
+    }
     const assistant = this.store.addMessage(sessionId, {
       id: uuid(),
       role: "assistant",
-      content: content || (signal.aborted ? "(остановлено)" : "(пусто)"),
+      content: finalContent,
       thinking: thinking || undefined,
     });
     this.abort = null;

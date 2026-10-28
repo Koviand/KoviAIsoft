@@ -286,7 +286,7 @@ export const DEFAULT_GENERATION_PARAMS: GenerationParams = {
   topP: 0.95,
   topK: 40,
   minP: 0.05,
-  maxTokens: 2048,
+  maxTokens: 4096,
   context: 8192,
   gpuLayers: 99,
   seed: null,

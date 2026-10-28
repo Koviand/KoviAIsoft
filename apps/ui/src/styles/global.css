@@ -1225,3 +1225,43 @@ button {
   background: color-mix(in srgb, #b91c1c 18%, transparent);
   color: #b91c1c;
 }
+
+.gen-pending {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+.gen-dots,
+.caret {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: gen-pulse 1s ease-in-out infinite;
+  vertical-align: middle;
+}
+.caret {
+  width: 7px;
+  height: 1.05em;
+  border-radius: 1px;
+  margin-left: 2px;
+  animation: caret-blink 1s step-end infinite;
+}
+.thinking-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+  opacity: 0.8;
+}
+@keyframes gen-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1); }
+}
+@keyframes caret-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}

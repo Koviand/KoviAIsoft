@@ -412,7 +412,15 @@ export class AppService {
     if (prefix) {
       return { content: trimmed.slice(prefix[0].length).trim() || trimmed, useAgent: true };
     }
-    return { content: trimmed, useAgent: preferAgent };
+    // Coding / file-creation asks work poorly in plain chat (truncated, no write_file).
+    const codingIntent =
+      /(напис\p{L}*|напиш\p{L}*|созда\p{L}*|сдела\p{L}*|реализ\p{L}*|постро\p{L}*).{0,80}(игр[уыае]|программ|скрипт|файл|проект|приложение|tetris|тетрис)/iu.test(
+        trimmed,
+      ) ||
+      /\b(write|create|implement|build)\b.{0,80}\b(game|app|file|script|python|tetris)\b/i.test(
+        trimmed,
+      );
+    return { content: trimmed, useAgent: preferAgent || codingIntent };
   }
 
   async sendChat(

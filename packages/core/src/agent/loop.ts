@@ -255,6 +255,10 @@ export class AgentLoop {
       }
 
       let steps: AgentPlanStep[] = [];
+      let toolsUsed = 0;
+      const wantsFiles = /файл|код|игр[ауы]|напиш|создай|реализ|скрипт|программ|python|tetris|html|react/i.test(
+        userContent,
+      );
 
       for (let i = 0; i < settings.agentMaxSteps; i++) {
         if (this.cancelled) {
@@ -266,8 +270,10 @@ export class AgentLoop {
 
         let raw: string;
         try {
+          // File contents need more room than a short chat reply.
           raw = await this.chat.completeJson(transcript, {
             ...params,
+            maxTokens: Math.max(params.maxTokens || 0, wantsFiles ? 8192 : 4096),
             temperature: Math.min(params.temperature, 0.4),
           });
         } catch (err) {
@@ -306,6 +312,27 @@ export class AgentLoop {
         }
 
         if (parsed.final && !parsed.tool) {
+          // Don't abandon a coding plan: force write_file before final.
+          const mustWork =
+            toolsUsed === 0 &&
+            (wantsFiles || steps.length > 0) &&
+            i < settings.agentMaxSteps - 1;
+          if (mustWork) {
+            transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+            transcript.push({
+              role: "user",
+              content:
+                "Рано для final. Сначала выполни план инструментами: создай файлы через write_file (код целиком в args.content), при необходимости run_terminal. final только после записи файлов.",
+            });
+            continue;
+          }
+          const marked = steps.map((s) =>
+            s.status === "pending" ? { ...s, status: "skipped" as const } : s,
+          );
+          if (marked.length) {
+            steps = marked;
+            this.emit(sessionId, { type: "plan", steps });
+          }
           const msg = this.store.addMessage(sessionId, {
             role: "assistant",
             content: parsed.final,
@@ -320,7 +347,9 @@ export class AgentLoop {
           transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
           transcript.push({
             role: "user",
-            content: "Нужен tool или final. Продолжай.",
+            content: wantsFiles
+              ? "Нужен tool (write_file) или final. Для кода сначала write_file."
+              : "Нужен tool или final. Продолжай.",
           });
           continue;
         }
@@ -362,6 +391,16 @@ export class AgentLoop {
 
         try {
           const result = await this.execTool(toolName, args, settings);
+          toolsUsed += 1;
+          if (steps.length) {
+            const idx = steps.findIndex((s) => s.status === "pending");
+            if (idx >= 0) {
+              steps = steps.map((s, j) =>
+                j === idx ? { ...s, status: "done" as const, detail: toolName } : s,
+              );
+              this.emit(sessionId, { type: "plan", steps });
+            }
+          }
           this.store.addMessage(sessionId, {
             role: "tool",
             content: result,

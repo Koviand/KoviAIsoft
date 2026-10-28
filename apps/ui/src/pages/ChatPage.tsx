@@ -54,6 +54,8 @@ export function ChatPage(props: {
   const [folderFilter, setFolderFilter] = useState<string>("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const activeIdRef = useRef(props.activeSessionId);
+  /** Session currently receiving a stream — survives activeSessionId race on first send. */
+  const streamSessionRef = useRef<string | null>(null);
   const paramTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   activeIdRef.current = props.activeSessionId;
 
@@ -85,6 +87,10 @@ export function ChatPage(props: {
       return;
     }
     setAgentOn(sessionToolsEnabled(activeSession));
+    // Never wipe an in-flight stream when setActiveSessionId fires mid-send.
+    if (streamSessionRef.current && streamSessionRef.current === activeSession.id) {
+      return;
+    }
     setPlan([]);
     setToolTrail([]);
     setStreaming("");
@@ -93,20 +99,31 @@ export function ChatPage(props: {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [props.messages, streaming, thinking, plan, toolTrail]);
+  }, [props.messages, streaming, thinking, plan, toolTrail, props.busy]);
+
+  function acceptsStream(sessionId: string): boolean {
+    return (
+      sessionId === activeIdRef.current ||
+      sessionId === streamSessionRef.current
+    );
+  }
 
   useEffect(() => {
     const offToken = api.onChatToken((p) => {
-      if (p.sessionId !== activeIdRef.current) return;
+      if (!acceptsStream(p.sessionId)) return;
       if (p.thinking) setThinking((t) => t + p.text);
       else setStreaming((t) => t + p.text);
     });
     const offAgent = api.onAgentEvent((p) => {
-      if (p.sessionId !== activeIdRef.current) return;
+      if (!acceptsStream(p.sessionId)) return;
       const ev = p.event;
       if (ev.type === "token") setStreaming((t) => t + ev.text);
       if (ev.type === "thinking") setThinking((t) => t + (t ? "\n" : "") + ev.text);
-      if (ev.type === "plan") setPlan(ev.steps);
+      if (ev.type === "plan") {
+        setPlan(ev.steps);
+        // Coding runs should flip UI into agent mode for visibility.
+        setAgentOn(true);
+      }
       if (ev.type === "tool_call") {
         setToolTrail((prev) => [
           ...prev.filter((t) => t.callId !== ev.callId),
@@ -130,6 +147,7 @@ export function ChatPage(props: {
         }
       }
       if (ev.type === "done" || ev.type === "cancelled" || ev.type === "error") {
+        streamSessionRef.current = null;
         setStreaming("");
         setThinking("");
         props.setBusy(false);
@@ -200,6 +218,9 @@ export function ChatPage(props: {
     props.setError(null);
     try {
       const { id: sessionId, existed } = await ensureSessionId();
+      // Pin stream target before React re-renders so early tokens are not dropped.
+      streamSessionRef.current = sessionId;
+      activeIdRef.current = sessionId;
       const baseMsgs = existed ? props.messages : [];
       const optimistic: ChatMessage = {
         id: `tmp-user-${Date.now()}`,
@@ -220,11 +241,13 @@ export function ChatPage(props: {
         props.setMessages(msgs);
         setStreaming("");
         setThinking("");
+        streamSessionRef.current = null;
         props.setBusy(false);
         props.setSessions(await api.listSessions());
         void result;
       }
     } catch (e) {
+      streamSessionRef.current = null;
       props.setError(e instanceof Error ? e.message : String(e));
       props.setBusy(false);
     }
@@ -234,6 +257,7 @@ export function ChatPage(props: {
     try {
       await api.stopGeneration();
     } finally {
+      streamSessionRef.current = null;
       props.setBusy(false);
       setStreaming("");
       setThinking("");
@@ -549,11 +573,31 @@ export function ChatPage(props: {
                   <div className="msg-body">{m.content}</div>
                 </div>
               ))}
-              {(streaming || thinking) && (
-                <div className="msg assistant msg-enter streaming">
+              {props.busy && !streaming && !thinking && (
+                <div className="msg assistant msg-enter streaming" aria-live="polite">
                   <div className="role">Ассистент</div>
-                  {thinking ? <div className="thinking">{thinking}</div> : null}
-                  <div className="msg-body">{streaming}</div>
+                  <div className="msg-body gen-pending">
+                    <span className="gen-dots" aria-hidden="true" />
+                    {agentOn
+                      ? "Агент думает и готовит шаги…"
+                      : "Модель обрабатывает запрос (prefill)…"}
+                  </div>
+                </div>
+              )}
+              {(streaming || thinking) && (
+                <div className="msg assistant msg-enter streaming" aria-live="polite">
+                  <div className="role">Ассистент</div>
+                  {thinking ? (
+                    <div className="thinking">
+                      <div className="thinking-label">Размышление</div>
+                      {thinking}
+                      {!streaming ? <span className="caret" aria-hidden="true" /> : null}
+                    </div>
+                  ) : null}
+                  <div className="msg-body">
+                    {streaming}
+                    {streaming ? <span className="caret" aria-hidden="true" /> : null}
+                  </div>
                 </div>
               )}
               <div ref={messagesEndRef} />
@@ -582,8 +626,8 @@ export function ChatPage(props: {
               </div>
               <span className="muted composer-hint">
                 {agentOn
-                  ? "Агент может читать файлы, запускать команды и просить подтверждение"
-                  : "Обычный ответ модели. Для разового агента начните с @agent"}
+                  ? "Агент пишет файлы и выполняет план — подтвердите опасные шаги"
+                  : "Чат отвечает текстом. Запросы вроде «напиши игру/код» сами включают агента"}
               </span>
             </div>
             <textarea

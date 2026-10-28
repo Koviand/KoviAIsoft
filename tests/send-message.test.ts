@@ -29,6 +29,12 @@ describe("unified send / session tools", () => {
       content: "do stuff",
       useAgent: true,
     });
+    expect(
+      AppService.parseAgentIntent(
+        "Я хочу чтобы ты написал игру Tetris на Python",
+        false,
+      ).useAgent,
+    ).toBe(true);
   });
 
   it("normalizes legacy agent sessions and toolsEnabled", async () => {
