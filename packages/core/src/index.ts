@@ -25,4 +25,22 @@ export {
   buildModelRecommendations,
 } from "./models/recommend.js";
 export * from "./tools/sandbox.js";
+export {
+  adaptCommandForWindows,
+  isBlankCwd,
+  isShellFileWriteAttempt,
+  resolveTerminalCwd,
+  runTerminal,
+} from "./tools/terminal.js";
+export { applyTextReplace } from "./tools/textReplace.js";
+export { writeFileAtomic, writeFileAtomicSync } from "./fsAtomic.js";
+// resolveAgentPath exported via sandbox *
 export * from "./agent/toolsCatalog.js";
+export * from "./context/index.js";
+export {
+  estimateTokens,
+  estimateMessagesTokens,
+  fitMessagesToContext,
+  truncateToTokens,
+  isContextOverflowError,
+} from "./chat/contextBudget.js";

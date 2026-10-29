@@ -2,7 +2,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
-import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import type {
   GenerationParams,
   InstalledRuntime,
@@ -59,13 +59,15 @@ async function waitForServer(port: number, timeoutMs = 120_000): Promise<void> {
 export class RuntimeManager {
   private appData: string;
   private installed: InstalledRuntime | null = null;
-  private process: ChildProcessWithoutNullStreams | null = null;
+  private process: ChildProcess | null = null;
   private port: number | null = null;
   private loadedModelId: string | null = null;
   private downloading = false;
   private downloadProgress = 0;
   private downloadLabel = "";
   private lastError: string | null = null;
+  /** Ring buffer of recent llama-server stdout/stderr for diagnostics. */
+  private serverLog = "";
   private updateInfo: RuntimeUpdateInfo | null = null;
   private onProgress?: ProgressFn;
   private ensurePromise: Promise<{
@@ -99,8 +101,93 @@ export class RuntimeManager {
   }
 
   getOpenAiBaseUrl(): string | null {
-    if (!this.port) return null;
+    if (!this.isProcessAlive() || !this.port) return null;
     return `http://127.0.0.1:${this.port}/v1`;
+  }
+
+  /** True when we still have a live llama-server child process. */
+  isProcessAlive(): boolean {
+    const proc = this.process;
+    if (!proc || proc.killed) return false;
+    // exitCode set after process exit; null while running.
+    if (proc.exitCode != null) return false;
+    return true;
+  }
+
+  private appendServerLog(chunk: string): void {
+    this.serverLog += chunk;
+    if (this.serverLog.length > 40_000) {
+      this.serverLog = this.serverLog.slice(-40_000);
+    }
+  }
+
+  getServerLogTail(max = 800): string {
+    return this.serverLog.slice(-max);
+  }
+
+  /**
+   * Ensure OpenAI endpoint is reachable. Clears stale port if process died.
+   * Throws a Russian actionable error for the UI/agent.
+   */
+  async assertLlmReady(): Promise<string> {
+    if (!this.isProcessAlive() || !this.port) {
+      this.port = null;
+      this.loadedModelId = null;
+      this.process = null;
+      const hint = this.lastError ? ` Последняя ошибка runtime: ${this.lastError}` : "";
+      throw new Error(
+        `Модель не загружена или llama-server не запущен.${hint} Откройте «Модели» → «Загрузить в память».`,
+      );
+    }
+    const port = this.port;
+    const bases = [`http://127.0.0.1:${port}/v1`, `http://localhost:${port}/v1`];
+    const probes = [
+      (base: string) => `${base.replace(/\/v1$/, "")}/health`,
+      (base: string) => `${base}/models`,
+    ];
+    let lastDetail = "";
+    // Longer budget: Vulkan can stall briefly under load; short 2.5s probes false-negative.
+    for (let attempt = 0; attempt < 8; attempt++) {
+      if (!this.isProcessAlive()) break;
+      for (const base of bases) {
+        for (const makeUrl of probes) {
+          try {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), 8_000);
+            const res = await fetch(makeUrl(base), { signal: ctrl.signal });
+            clearTimeout(t);
+            if (res.ok) return base;
+            lastDetail = `HTTP ${res.status} @ ${makeUrl(base)}`;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            const cause =
+              err instanceof Error && "cause" in err && err.cause instanceof Error
+                ? err.cause.message
+                : "";
+            lastDetail = cause ? `${msg} (${cause})` : msg;
+          }
+        }
+      }
+      await new Promise((r) => setTimeout(r, 500 + attempt * 200));
+    }
+
+    const logTail = this.getServerLogTail(600);
+    const runtimeErr = this.lastError ? ` Runtime: ${this.lastError}` : "";
+    // Process looks alive but HTTP is dead — usually stalled pipe or crashed worker.
+    if (this.isProcessAlive()) {
+      this.lastError =
+        `llama-server не отвечает на порту ${port} (${lastDetail}).${runtimeErr}` +
+        (logTail ? ` Лог: …${logTail}` : "");
+    } else {
+      this.port = null;
+      this.loadedModelId = null;
+      this.process = null;
+    }
+    throw new Error(
+      `Нет связи с локальной моделью (порт ${port}): ${lastDetail}.${runtimeErr} ` +
+        `Нажмите «Загрузить в память» снова. Если падает сразу — профиль «Мало VRAM» или «Только CPU».` +
+        (logTail ? ` Детали: ${logTail.slice(-300)}` : ""),
+    );
   }
 
   private metaPath(): string {
@@ -562,6 +649,9 @@ export class RuntimeManager {
       String(params.context),
       "-ngl",
       String(params.gpuLayers),
+      // Keep HTTP accept queue responsive while a completion is running.
+      "--threads-http",
+      "4",
       "--alias",
       model.name,
       "--jinja",
@@ -575,28 +665,37 @@ export class RuntimeManager {
     }
 
     const cwd = path.dirname(this.installed.serverPath);
+    // CRITICAL on Windows: default piped stdout fills (~64KB) and freezes llama-server
+    // if nobody reads it — HTTP then looks like "fetch failed" while the process is "alive".
     const child = spawn(this.installed.serverPath, args, {
       cwd,
       windowsHide: true,
       env: { ...process.env },
+      stdio: ["ignore", "pipe", "pipe"],
     });
     this.process = child;
     this.port = port;
     this.loadedModelId = model.id;
     this.lastError = null;
+    this.serverLog = "";
 
-    let stderr = "";
-    child.stderr.on("data", (buf: Buffer) => {
-      stderr += buf.toString();
-      if (stderr.length > 20_000) stderr = stderr.slice(-20_000);
+    const onChunk = (buf: Buffer) => this.appendServerLog(buf.toString());
+    child.stdout?.on("data", onChunk);
+    child.stderr?.on("data", onChunk);
+    child.on("error", (err) => {
+      this.appendServerLog(`\n[spawn error] ${err.message}\n`);
+      this.lastError = `Не удалось запустить llama-server: ${err.message}`;
     });
-    child.on("exit", (code) => {
+    child.on("exit", (code, signal) => {
       if (this.process === child) {
         this.process = null;
         this.port = null;
         this.loadedModelId = null;
+        const tail = this.getServerLogTail(500);
         if (code && code !== 0) {
-          this.lastError = `llama-server завершился с кодом ${code}. ${stderr.slice(-500)}`;
+          this.lastError = `llama-server завершился с кодом ${code}. ${tail}`;
+        } else if (signal) {
+          this.lastError = `llama-server остановлен (${signal}). ${tail}`;
         }
       }
     });
@@ -604,23 +703,20 @@ export class RuntimeManager {
     try {
       await waitForServer(port);
     } catch (err) {
+      const log = this.serverLog;
       await this.stopServer();
       const oom =
-        /out of memory|cuda.?error|failed to allocate|ggml_cuda|VRAM|insufficient/i.test(
-          stderr,
+        /out of memory|cuda.?error|failed to allocate|ggml_cuda|VRAM|insufficient|vk::|vulkan/i.test(
+          log,
         );
       const base =
         (err instanceof Error ? err.message : String(err)) +
-        (stderr ? `\n${stderr.slice(-800)}` : "");
+        (log ? `\n${log.slice(-800)}` : "");
       this.lastError = oom
-        ? `Нехватка VRAM/памяти при загрузке модели. Уменьшите GPU layers / context или выберите профиль «Мало VRAM».\n${base}`
+        ? `Нехватка VRAM/памяти при загрузке модели. Выберите профиль «Мало VRAM» или «Только CPU».\n${base}`
         : base;
       throw new Error(this.lastError);
     }
-  }
-
-  getLastStderrSnippet(): string {
-    return this.lastError || "";
   }
 }
 

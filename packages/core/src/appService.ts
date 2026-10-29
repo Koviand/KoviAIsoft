@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type {
@@ -23,6 +24,7 @@ import type {
 import { DEFAULT_GENERATION_PARAMS } from "@kovi/shared";
 import { AgentLoop } from "./agent/loop.js";
 import { ChatEngine } from "./chat/engine.js";
+import { buildProjectContext } from "./context/packer.js";
 import { Store } from "./db/store.js";
 import { McpManager } from "./mcp/manager.js";
 import {
@@ -451,7 +453,26 @@ export class AppService {
     if (!session) throw new Error("Сессия не найдена");
     this.noteGenerationStart();
     const merged = { ...session.params, ...params };
-    const result = await this.chat.send(sessionId, content, merged, session.systemPrompt);
+    const settings = this.settings.get();
+    let system = session.systemPrompt;
+    // Lightweight Cursor-style project context for plain chat (no tool catalog).
+    if (settings.projectRoot) {
+      try {
+        const packed = await buildProjectContext({
+          settings,
+          userQuery: content,
+          baseSystem: session.systemPrompt,
+          toolBlock:
+            "Инструменты недоступны в обычном чате. Для правок файлов включите режим агента (/agent).",
+          contextTokens: merged.context || 8192,
+          reserveTokens: Math.min(Math.floor((merged.context || 8192) * 0.5), 4000),
+        });
+        system = packed.systemPrompt;
+      } catch {
+        // fall back to bare system prompt
+      }
+    }
+    const result = await this.chat.send(sessionId, content, merged, system);
     this.maybeRenameSession(session, content);
     return result;
   }
@@ -494,12 +515,36 @@ export class AppService {
     }
     const session = this.store.listSessions().find((s) => s.id === sessionId);
     if (!session) throw new Error("Сессия не найдена");
+    const settings = this.settings.get();
+    if (settings.fileAccessMode === "project") {
+      if (!settings.projectRoot) {
+        throw new Error(
+          "Режим project: выберите папку проекта в Настройках перед запуском агента",
+        );
+      }
+      try {
+        const st = fs.statSync(settings.projectRoot);
+        if (!st.isDirectory()) {
+          throw new Error(`Папка проекта не является каталогом: ${settings.projectRoot}`);
+        }
+      } catch (err) {
+        if (err instanceof Error && /Настройках|каталогом/.test(err.message)) throw err;
+        throw new Error(`Папка проекта недоступна: ${settings.projectRoot}`);
+      }
+    } else if (!settings.projectRoot) {
+      this.pushErrorLog(
+        "agent",
+        "Папка проекта не задана — shell/относительные пути могут не работать. Укажите projectRoot в Настройках.",
+      );
+    }
+    // Fail fast with a clear message instead of opaque "fetch failed" mid-loop.
+    await this.runtime.assertLlmReady();
     this.noteGenerationStart();
     this.maybeRenameSession(session, content);
     await this.agent.run(
       sessionId,
       content,
-      this.settings.get(),
+      settings,
       session.params,
       session.systemPrompt,
     );

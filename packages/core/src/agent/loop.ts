@@ -15,19 +15,95 @@ import {
   deletePathTool,
   listDir,
   readFileTool,
-  runTerminal,
   searchFiles,
   writeFileTool,
 } from "../tools/files.js";
+import { runTerminal } from "../tools/terminal.js";
 import { previewPatchDiff, previewWriteDiff } from "../tools/diff.js";
 import {
   approvalRememberKey,
+  resolveAgentPath,
   riskForTool,
   shouldConfirmRisk,
 } from "../tools/sandbox.js";
 import { webSearch } from "../tools/websearch.js";
-import { loadProjectMemory } from "./projectMemory.js";
+import {
+  fitMessagesToContext,
+  isContextOverflowError,
+} from "../chat/contextBudget.js";
+import { buildProjectContext } from "../context/packer.js";
+import { condenseTranscript } from "../context/summarize.js";
 import { toolsPromptBlock } from "./toolsCatalog.js";
+
+const TOOL_RESULT_TRANSCRIPT_CHARS = 2_500;
+const PRIOR_LOOKBACK_MESSAGES = 10;
+
+/** Alias common model mistakes before path normalization. */
+function coerceToolArgs(
+  toolName: string,
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = { ...args };
+  if ((next.path == null || String(next.path).trim() === "") && next.file != null) {
+    next.path = next.file;
+  }
+  if (toolName === "write_file" && (next.content == null || next.content === "")) {
+    if (typeof next.text === "string") next.content = next.text;
+    else if (typeof next.code === "string") next.content = next.code;
+    else if (typeof next.body === "string") next.content = next.body;
+  }
+  if (toolName === "apply_patch") {
+    if (next.oldText == null && typeof next.old === "string") next.oldText = next.old;
+    if (next.newText == null && typeof next.new === "string") next.newText = next.new;
+  }
+  if (toolName === "run_terminal") {
+    if ((next.cwd == null || String(next.cwd).trim() === "") && next.dir != null) {
+      next.cwd = next.dir;
+    }
+    if ((next.cwd == null || String(next.cwd).trim() === "") && next.workdir != null) {
+      next.cwd = next.workdir;
+    }
+    if ((next.command == null || String(next.command).trim() === "") && next.cmd != null) {
+      next.command = next.cmd;
+    }
+  }
+  return next;
+}
+
+/** Normalize path-like tool args to absolute Windows paths under projectRoot. */
+function normalizeToolArgs(
+  toolName: string,
+  args: Record<string, unknown>,
+  projectRoot: string | null,
+): Record<string, unknown> {
+  const next = coerceToolArgs(toolName, args);
+  const pathKeys =
+    toolName === "run_terminal"
+      ? (["cwd", "dir", "workdir"] as const)
+      : (["path", "file"] as const);
+  for (const key of pathKeys) {
+    if (!(key in next)) continue;
+    const raw = next[key];
+    if (raw == null || String(raw).trim() === "") {
+      if (toolName === "run_terminal" && projectRoot) {
+        next[key] = projectRoot;
+      }
+      continue;
+    }
+    try {
+      next[key] = resolveAgentPath(raw, projectRoot, {
+        allowBlankAsProject: toolName === "run_terminal",
+      });
+    } catch {
+      // leave raw; tool will throw with a clear error
+    }
+  }
+  return next;
+}
+
+const FILE_MUTATION_TOOLS = new Set(["write_file", "apply_patch"]);
+/** Heuristic: stub/skeleton writes that should not unlock final for coding tasks. */
+const MIN_CODING_WRITE_CHARS = 400;
 
 type EventFn = (sessionId: string, event: AgentEvent) => void;
 
@@ -129,12 +205,23 @@ export class AgentLoop {
     args: Record<string, unknown>,
     settings: AppSettings,
   ): Promise<boolean> {
-    const risk = riskForTool(toolName, args);
+    const normalized = normalizeToolArgs(toolName, args, settings.projectRoot);
+    const risk = riskForTool(toolName, normalized, settings.projectRoot);
     if (risk === "low") return true;
-    const rememberKey = approvalRememberKey(toolName, args);
+    const rememberKey = approvalRememberKey(
+      toolName,
+      normalized,
+      settings.projectRoot,
+    );
     if (rememberKey && this.allowFor(sessionId).has(rememberKey)) return true;
     if (
-      !shouldConfirmRisk(risk, settings.agentRiskMode || "ask", args, settings.projectRoot)
+      !shouldConfirmRisk(
+        risk,
+        settings.agentRiskMode || "ask",
+        normalized,
+        settings.projectRoot,
+        toolName,
+      )
     ) {
       return true;
     }
@@ -142,12 +229,16 @@ export class AgentLoop {
     let diff: string | undefined;
     try {
       if (toolName === "write_file") {
-        diff = previewWriteDiff(String(args.path || ""), String(args.content ?? ""), settings);
+        diff = previewWriteDiff(
+          String(normalized.path || ""),
+          String(normalized.content ?? ""),
+          settings,
+        );
       } else if (toolName === "apply_patch") {
         diff = previewPatchDiff(
-          String(args.path || ""),
-          String(args.oldText ?? ""),
-          String(args.newText ?? ""),
+          String(normalized.path || ""),
+          String(normalized.oldText ?? ""),
+          String(normalized.newText ?? ""),
           settings,
         );
       }
@@ -155,11 +246,12 @@ export class AgentLoop {
       diff = undefined;
     }
 
+    const argPreview = JSON.stringify(normalized);
     const confirmation: AgentConfirmation = {
       id: uuid(),
       toolName,
-      summary: `${toolName} ${JSON.stringify(args).slice(0, 240)}`,
-      args,
+      summary: `${toolName} ${argPreview.length > 1200 ? argPreview.slice(0, 1200) + "…" : argPreview}`,
+      args: normalized,
       risk: risk === "high" ? "high" : "medium",
       createdAt: new Date().toISOString(),
       diff,
@@ -180,26 +272,31 @@ export class AgentLoop {
     args: Record<string, unknown>,
     settings: AppSettings,
   ): Promise<string> {
+    const a = normalizeToolArgs(name, args, settings.projectRoot);
     switch (name) {
       case "list_dir":
-        return listDir(String(args.path), settings);
+        return listDir(String(a.path), settings);
       case "read_file":
-        return readFileTool(String(args.path), settings);
+        return readFileTool(String(a.path), settings);
       case "write_file":
-        return writeFileTool(String(args.path), String(args.content ?? ""), settings);
+        return writeFileTool(String(a.path), String(a.content ?? ""), settings);
       case "apply_patch":
         return applyPatchTool(
-          String(args.path),
-          String(args.oldText ?? ""),
-          String(args.newText ?? ""),
+          String(a.path),
+          String(a.oldText ?? ""),
+          String(a.newText ?? ""),
           settings,
         );
       case "delete_path":
-        return deletePathTool(String(args.path), settings);
+        return deletePathTool(String(a.path), settings);
       case "search":
-        return searchFiles(String(args.query), String(args.path), settings);
+        return searchFiles(String(a.query ?? args.query), String(a.path), settings);
       case "run_terminal":
-        return runTerminal(String(args.command), String(args.cwd), settings);
+        return runTerminal(
+          String(a.command ?? a.cmd ?? ""),
+          String(a.cwd ?? a.dir ?? a.workdir ?? ""),
+          settings,
+        );
       case "web_search":
         return webSearch(String(args.query), settings);
       case "browser_navigate":
@@ -233,45 +330,68 @@ export class AgentLoop {
 
     try {
       this.store.addMessage(sessionId, { role: "user", content: userContent });
-      const projectHint =
-        settings.fileAccessMode === "project"
-          ? `Режим доступа: project. Корень: ${settings.projectRoot || "(не задан)"}`
-          : `Режим доступа: disk. Будь осторожен с записью/удалением.`;
-
+      const ctxWindow = params.context || 8192;
       const toolBlock = toolsPromptBlock(
         this.mcp.listTools().map((t) => ({ name: t.name, description: t.description })),
       );
 
-      const memory = loadProjectMemory(settings.projectRoot);
-      const memoryBlock = memory
-        ? `\n\n# Память проекта (AGENTS.md)\n${memory}`
-        : "";
+      // Cursor-like layered context: tools + rules + retrieval + project map (budgeted).
+      const projectCtx = await buildProjectContext({
+        settings,
+        userQuery: userContent,
+        baseSystem: systemPrompt,
+        toolBlock,
+        contextTokens: ctxWindow,
+        reserveTokens: Math.min(Math.floor(ctxWindow * 0.42), 3500),
+      });
+      this.emit(sessionId, {
+        type: "thinking",
+        text: `Контекст: map=${projectCtx.stats.filesMapped} файлов, retrieved=${projectCtx.stats.filesRetrieved}, ~${projectCtx.stats.usedTokens} tok` +
+          (projectCtx.stats.truncatedLayers.length
+            ? ` (урезано: ${projectCtx.stats.truncatedLayers.join(",")})`
+            : ""),
+      });
 
-      const transcript: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+      let transcript: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
         {
           role: "system",
-          content: `${systemPrompt}\n\n${projectHint}\n\n${toolBlock}${memoryBlock}`,
+          content: projectCtx.systemPrompt,
         },
       ];
 
-      // Include prior chat history so multi-turn agent runs keep context.
+      // Limited lookback — full session history (retries/duplicates) blows local ctx.
       const prior = this.store.getMessages(sessionId);
-      for (const m of prior) {
+      const recent = prior.slice(-PRIOR_LOOKBACK_MESSAGES);
+      let lastUser = "";
+      for (const m of recent) {
         if (m.role === "system") continue;
         if (m.role === "tool") {
           transcript.push({
             role: "user",
-            content: `Результат инструмента ${m.toolName || "tool"}:\n${m.content.slice(0, 6000)}`,
+            content: `Результат инструмента ${m.toolName || "tool"}:\n${m.content.slice(0, TOOL_RESULT_TRANSCRIPT_CHARS)}`,
           });
           continue;
         }
         if (m.role === "user" || m.role === "assistant") {
+          if (m.role === "user") {
+            const t = m.content.trim();
+            if (t && t === lastUser) continue; // drop duplicate user retries
+            lastUser = t;
+          }
           transcript.push({ role: m.role, content: m.content });
         }
       }
+      transcript = condenseTranscript(transcript, {
+        keepRecent: 8,
+        triggerMessages: 12,
+        summaryTokens: Math.min(400, Math.floor(ctxWindow * 0.05)),
+      });
 
       let steps: AgentPlanStep[] = [];
       let toolsUsed = 0;
+      let filesWritten = 0;
+      let substantialWrite = false;
+      let stubNudgeCount = 0;
       const wantsFiles = /файл|код|игр[ауы]|напиш|создай|реализ|скрипт|программ|python|tetris|html|react/i.test(
         userContent,
       );
@@ -286,12 +406,35 @@ export class AgentLoop {
 
         let raw: string;
         try {
-          // File contents need more room than a short chat reply.
-          raw = await this.chat.completeJson(transcript, {
+          // Cap vs context — leave headroom; never request completion that can't fit.
+          const ctx = params.context || 8192;
+          const want = wantsFiles
+            ? Math.max(params.maxTokens || 0, 2048)
+            : Math.max(params.maxTokens || 0, 1536);
+          const maxTokens = Math.min(want, Math.max(512, Math.floor(ctx * 0.35)), 3072);
+          const callParams = {
             ...params,
-            maxTokens: Math.max(params.maxTokens || 0, wantsFiles ? 8192 : 4096),
+            maxTokens,
             temperature: Math.min(params.temperature, 0.4),
+          };
+          // Fold old tool turns into an extractive summary as the run grows.
+          transcript = condenseTranscript(transcript, {
+            keepRecent: 8,
+            triggerMessages: 12,
+            summaryTokens: Math.min(400, Math.floor(ctx * 0.05)),
           });
+          let packed = fitMessagesToContext(transcript, ctx, maxTokens);
+          try {
+            raw = await this.chat.completeJson(packed, callParams);
+          } catch (err) {
+            if (!isContextOverflowError(err) || this.cancelled) throw err;
+            // Emergency shrink: drop oldest non-system turns and retry once.
+            const system = transcript[0];
+            const tail = transcript.slice(Math.max(1, transcript.length - 4));
+            transcript = system ? [system, ...tail] : [...tail];
+            packed = fitMessagesToContext(transcript, ctx, maxTokens);
+            raw = await this.chat.completeJson(packed, callParams);
+          }
         } catch (err) {
           if (this.cancelled || (err instanceof Error && /отмен/i.test(err.message))) {
             this.emit(sessionId, { type: "cancelled" });
@@ -328,17 +471,26 @@ export class AgentLoop {
         }
 
         if (parsed.final && !parsed.tool) {
-          // Don't abandon a coding plan: force write_file before final.
+          // Coding: list_dir/read alone must not unlock final (seen in Tetris sessions).
+          const noFileYet = wantsFiles && filesWritten === 0;
+          const stubOnly =
+            wantsFiles &&
+            filesWritten > 0 &&
+            !substantialWrite &&
+            stubNudgeCount < 2;
           const mustWork =
-            toolsUsed === 0 &&
-            (wantsFiles || steps.length > 0) &&
-            i < settings.agentMaxSteps - 1;
+            i < settings.agentMaxSteps - 1 &&
+            (noFileYet || stubOnly || (!wantsFiles && toolsUsed === 0 && steps.length > 0));
           if (mustWork) {
+            if (stubOnly) stubNudgeCount += 1;
             transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
             transcript.push({
               role: "user",
-              content:
-                "Рано для final. Сначала выполни план инструментами: создай файлы через write_file (код целиком в args.content), при необходимости run_terminal. final только после записи файлов.",
+              content: wantsFiles
+                ? filesWritten === 0
+                  ? "Рано для final. Сначала создай файлы через write_file (полный код в args.content). list_dir/read_file не считаются выполнением. final только после записи рабочих файлов."
+                  : `Рано для final: запись похожа на stub. Допиши полный код через write_file или apply_patch (цель ≥${MIN_CODING_WRITE_CHARS} символов на ключевой файл), затем final.`
+                : "Рано для final. Сначала выполни план инструментами.",
             });
             continue;
           }
@@ -376,6 +528,25 @@ export class AgentLoop {
         this.emit(sessionId, { type: "tool_call", name: toolName, args, callId });
 
         if (toolName === "finish") {
+          const blockFinishNoFile =
+            wantsFiles && filesWritten === 0 && i < settings.agentMaxSteps - 1;
+          const blockFinishStub =
+            wantsFiles &&
+            filesWritten > 0 &&
+            !substantialWrite &&
+            stubNudgeCount < 2 &&
+            i < settings.agentMaxSteps - 1;
+          if (blockFinishNoFile || blockFinishStub) {
+            if (blockFinishStub) stubNudgeCount += 1;
+            const deny = blockFinishNoFile
+              ? "finish отклонён: файлы ещё не записаны. Вызови write_file с полным кодом."
+              : "finish отклонён: код ещё stub. Допиши файлы (write_file/apply_patch), затем finish.";
+            this.emit(sessionId, { type: "tool_result", callId, result: deny, isError: true });
+            this.emit(sessionId, { type: "step_done", stepId, detail: deny });
+            transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+            transcript.push({ role: "user", content: deny });
+            continue;
+          }
           const summary = String(args.summary || parsed.final || "Готово");
           const msg = this.store.addMessage(sessionId, {
             role: "assistant",
@@ -406,8 +577,19 @@ export class AgentLoop {
         }
 
         try {
+          const normalizedArgs = normalizeToolArgs(toolName, args, settings.projectRoot);
           const result = await this.execTool(toolName, args, settings);
           toolsUsed += 1;
+          if (FILE_MUTATION_TOOLS.has(toolName)) {
+            filesWritten += 1;
+            const contentLen =
+              toolName === "write_file"
+                ? String(normalizedArgs.content ?? "").length
+                : String(normalizedArgs.newText ?? "").length;
+            if (contentLen >= MIN_CODING_WRITE_CHARS) {
+              substantialWrite = true;
+            }
+          }
           if (steps.length) {
             const idx = steps.findIndex((s) => s.status === "pending");
             if (idx >= 0) {
@@ -429,10 +611,18 @@ export class AgentLoop {
             stepId,
             detail: `${toolName} ok`,
           });
+          let followUp = `Результат инструмента ${toolName}:\n${result.slice(0, TOOL_RESULT_TRANSCRIPT_CHARS)}`;
+          if (
+            wantsFiles &&
+            toolName === "write_file" &&
+            String(normalizedArgs.content ?? "").length < MIN_CODING_WRITE_CHARS
+          ) {
+            followUp += `\n\nЗамечание: файл получился коротким (stub). Продолжи: допиши полную реализацию через write_file/apply_patch. Не вызывай final, пока программа не работает.`;
+          }
           transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
           transcript.push({
             role: "user",
-            content: `Результат инструмента ${toolName}:\n${result.slice(0, 12000)}`,
+            content: followUp,
           });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);

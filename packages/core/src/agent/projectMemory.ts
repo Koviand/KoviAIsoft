@@ -14,7 +14,8 @@ export function loadProjectMemory(projectRoot: string | null): string | null {
       if (!fs.existsSync(full) || !fs.statSync(full).isFile()) continue;
       const text = fs.readFileSync(full, "utf8").trim();
       if (!text) continue;
-      return text.slice(0, 24_000);
+      // Keep memory small — large AGENTS.md must not blow the local context window.
+      return text.slice(0, 6_000);
     } catch {
       // try next
     }

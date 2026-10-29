@@ -1,6 +1,19 @@
 import fs from "node:fs";
 import type { AppSettings } from "@kovi/shared";
-import { assertAllowedPath } from "./sandbox.js";
+import { assertAllowedPath, resolveAgentPath } from "./sandbox.js";
+import { applyTextReplace } from "./textReplace.js";
+
+function resolveDiffPath(filePath: string, settings?: AppSettings): string {
+  if (!settings) return filePath;
+  const resolved = resolveAgentPath(filePath, settings.projectRoot);
+  assertAllowedPath(
+    resolved,
+    settings.fileAccessMode,
+    settings.projectRoot,
+    settings.modelRoots,
+  );
+  return resolved;
+}
 
 /** Tiny unified-diff style preview (no external deps). */
 export function makeUnifiedDiff(
@@ -58,28 +71,21 @@ export function previewWriteDiff(
   newContent: string,
   settings?: AppSettings,
 ): string {
-  if (settings) {
-    assertAllowedPath(
-      filePath,
-      settings.fileAccessMode,
-      settings.projectRoot,
-      settings.modelRoots,
-    );
-  }
+  const resolved = resolveDiffPath(filePath, settings);
   let before = "";
   try {
-    if (fs.existsSync(filePath)) before = fs.readFileSync(filePath, "utf8");
+    if (fs.existsSync(resolved)) before = fs.readFileSync(resolved, "utf8");
   } catch {
     before = "";
   }
   if (!before && newContent) {
-    return `--- /dev/null\n+++ b/${filePath}\n${newContent
+    return `--- nul\n+++ b/${resolved}\n${newContent
       .split("\n")
       .slice(0, 120)
       .map((l) => `+${l}`)
       .join("\n")}`;
   }
-  return makeUnifiedDiff(filePath, before, newContent);
+  return makeUnifiedDiff(resolved, before, newContent);
 }
 
 export function previewPatchDiff(
@@ -88,23 +94,20 @@ export function previewPatchDiff(
   newText: string,
   settings?: AppSettings,
 ): string {
-  if (settings) {
-    assertAllowedPath(
-      filePath,
-      settings.fileAccessMode,
-      settings.projectRoot,
-      settings.modelRoots,
-    );
-  }
+  const resolved = resolveDiffPath(filePath, settings);
   let current = "";
   try {
-    current = fs.readFileSync(filePath, "utf8");
+    current = fs.readFileSync(resolved, "utf8");
   } catch {
-    return `Файл не найден: ${filePath}`;
+    return `Файл не найден: ${resolved}`;
   }
-  if (!current.includes(oldText)) {
-    return `Фрагмент для замены не найден в ${filePath}`;
+  if (!oldText) {
+    return `oldText пустой для ${resolved}`;
   }
-  const next = current.replace(oldText, newText);
-  return makeUnifiedDiff(filePath, current, next);
+  try {
+    const next = applyTextReplace(current, oldText, newText);
+    return makeUnifiedDiff(resolved, current, next);
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
 }

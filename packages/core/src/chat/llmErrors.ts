@@ -1,0 +1,75 @@
+/** Map opaque Node/Electron fetch failures to actionable Russian errors. */
+export function formatLlmFetchError(err: unknown, baseUrl: string | null): Error {
+  if (err instanceof Error && err.name === "AbortError") {
+    return new Error("Отменено");
+  }
+  const raw = err instanceof Error ? err.message : String(err);
+  // Keep our own already-localized diagnostics.
+  if (
+    /Нет связи с локальной моделью|Модель не загружена|llama-server не отвечает|Ответ LLM обрезан/i.test(
+      raw,
+    )
+  ) {
+    return err instanceof Error ? err : new Error(raw);
+  }
+  const cause =
+    err instanceof Error && "cause" in err && err.cause instanceof Error
+      ? err.cause.message
+      : err instanceof Error && "cause" in err && err.cause
+        ? String(err.cause)
+        : "";
+  const blob = `${raw} ${cause}`.toLowerCase();
+
+  if (
+    blob.includes("fetch failed") ||
+    blob.includes("econnrefused") ||
+    blob.includes("econnreset") ||
+    blob.includes("enotfound") ||
+    blob.includes("network") ||
+    blob.includes("socket hang up") ||
+    blob.includes("econnaborted")
+  ) {
+    const detail = cause && cause !== raw ? ` (${cause})` : "";
+    return new Error(
+      `Нет связи с локальной моделью${baseUrl ? ` (${baseUrl})` : ""}${detail}. ` +
+        `Загрузите модель: «Модели» → «Загрузить в память». ` +
+        `Если модель уже загружена — перезагрузите её (сервер мог упасть или был перегружен длинным запросом).`,
+    );
+  }
+  if (
+    blob.includes("exceed_context_size") ||
+    blob.includes("exceeds the available context") ||
+    blob.includes("n_prompt_tokens")
+  ) {
+    return new Error(
+      "Промпт не влезает в context окна модели. Создайте новый диалог или увеличьте context в профиле загрузки / параметрах сессии. История агента обрезается автоматически — повторите запрос.",
+    );
+  }
+  if (blob.includes("timeout") || blob.includes("aborted") || blob.includes("timed out")) {
+    return new Error(
+      "Таймаут ответа модели. Уменьшите max tokens / context или проверьте, что GPU не перегружен.",
+    );
+  }
+  return err instanceof Error ? err : new Error(raw);
+}
+
+/** Extract assistant text from OpenAI-compatible chat completion payloads (LFM puts JSON in reasoning). */
+export function pickCompletionText(message: {
+  content?: string | null;
+  reasoning_content?: string | null;
+  reasoning?: string | null;
+  text?: string | null;
+} | null | undefined): string {
+  if (!message) return "";
+  if (typeof message.content === "string" && message.content.trim()) {
+    return message.content;
+  }
+  if (typeof message.reasoning_content === "string" && message.reasoning_content.trim()) {
+    return message.reasoning_content;
+  }
+  if (typeof message.reasoning === "string" && message.reasoning.trim()) {
+    return message.reasoning;
+  }
+  if (typeof message.text === "string") return message.text;
+  return "";
+}

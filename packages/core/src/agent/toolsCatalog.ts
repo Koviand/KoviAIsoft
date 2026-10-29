@@ -19,7 +19,8 @@ export const BUILTIN_TOOL_SPECS = [
   },
   {
     name: "write_file",
-    description: "Записать файл (создаёт/перезаписывает)",
+    description:
+      "Записать файл целиком (создаёт/перезаписывает). В content — полный исходный код, не stub и не комментарий-заглушка.",
     parameters: {
       type: "object",
       properties: {
@@ -65,14 +66,22 @@ export const BUILTIN_TOOL_SPECS = [
   },
   {
     name: "run_terminal",
-    description: "Выполнить команду в shell (требует подтверждения)",
+    description:
+      "Выполнить команду в Windows shell (cmd.exe). cwd — папка проекта. Для PowerShell: command=\"powershell Get-ChildItem\". Требует подтверждения.",
     parameters: {
       type: "object",
       properties: {
-        command: { type: "string" },
-        cwd: { type: "string" },
+        command: {
+          type: "string",
+          description:
+            "Команда Windows: dir, type, npm, python, git… (не bash). PowerShell: префикс powershell …",
+        },
+        cwd: {
+          type: "string",
+          description: "Абсолютный путь рабочей папки (обычно projectRoot). Можно опустить — возьмётся папка проекта.",
+        },
       },
-      required: ["command", "cwd"],
+      required: ["command"],
     },
   },
   {
@@ -143,18 +152,25 @@ export function toolsPromptBlock(extraTools: Array<{ name: string; description?:
   ];
   return `Доступные инструменты:\n${all.join("\n")}
 
-Формат ответа на каждом шаге — строго JSON:
+Формат ответа на каждом шаге — строго JSON в обычном тексте ответа (не в reasoning/thinking):
 {
   "thought": "краткие рассуждения",
   "plan": [{"id":"1","title":"..."}],
   "tool": {"name":"tool_name","args":{...}} | null,
   "final": "текст пользователю если закончили" | null
 }
+Запрещены XML/Hermes tool_call и bash-heredoc — только JSON с tool.name из списка ниже.
 
 Правила:
 - Если нужно создать/изменить код или файлы — ОБЯЗАТЕЛЬНО вызывай write_file / apply_patch. Не клади длинный код в final.
-- После plan сразу вызови первый tool (обычно write_file). Нельзя завершать с final, пока файлы не созданы.
-- final — короткий итог для пользователя (пути файлов, как запустить), без огромных листингов.
+- После plan сразу вызови write_file с ПОЛНЫМ кодом в args.content (не skeleton из 5–10 строк).
+- list_dir / read_file не считаются выполнением задачи. final/finish только после реальной записи рабочих файлов.
+- Не выдумывай, что файл уже создан: сначала write_file, потом final с путём и командой запуска.
+- final — короткий итог (пути, как запустить), без огромных листингов.
 - Если нужен инструмент — заполни tool и оставь final=null.
-- Если задача реально сделана инструментами — tool=null и заполняй final.`;
+- ОС Windows: в run_terminal используй cmd (dir, type, del, copy, npm, python) или префикс powershell …. Bash (ls/cat/rm) адаптируется частично.
+- Пути: относительно папки проекта или Windows absolute (C:\\\\…). Не используй Unix /Users/… — система сама поправит, но лучше относительные.
+- Пустой cwd = папка проекта. Не удаляй корень проекта.
+- Код пиши только через write_file/apply_patch, не через echo/cat/heredoc в shell.
+- В system уже есть карта проекта и автоподобранные фрагменты (как @codebase в Cursor). Уточняй через search/read_file; можно опираться на пути из карты.`;
 }

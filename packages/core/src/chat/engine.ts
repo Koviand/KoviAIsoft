@@ -2,6 +2,11 @@ import { v4 as uuid } from "uuid";
 import type { ChatMessage, GenerationParams } from "@kovi/shared";
 import type { RuntimeManager } from "../runtime/manager.js";
 import type { Store } from "../db/store.js";
+import {
+  fitMessagesToContext,
+  isContextOverflowError,
+} from "./contextBudget.js";
+import { formatLlmFetchError, pickCompletionText } from "./llmErrors.js";
 
 export type TokenHandler = (p: {
   sessionId: string;
@@ -52,53 +57,85 @@ export class ChatEngine {
     params: GenerationParams,
     systemPrompt: string,
   ): Promise<ChatMessage> {
-    const base = this.runtime.getOpenAiBaseUrl();
-    if (!base) throw new Error("Модель не загружена. Загрузите модель во вкладке Runtime/Models.");
+    let base: string;
+    try {
+      base = await this.runtime.assertLlmReady();
+    } catch (err) {
+      throw formatLlmFetchError(err, this.runtime.getOpenAiBaseUrl());
+    }
 
     this.stop();
     this.store.addMessage(sessionId, { role: "user", content: userContent });
     const history = this.store.getMessages(sessionId);
     // Skip orphan tool rows from agent turns — plain chat has no tool_calls protocol.
-    const messages: OpenAiMessage[] = [
-      { role: "system", content: systemPrompt },
-      ...history.flatMap((m): OpenAiMessage[] => {
-        if (m.role === "user" || m.role === "assistant") {
-          return [{ role: m.role, content: m.content }];
-        }
-        if (m.role === "tool") {
-          return [
-            {
-              role: "user",
-              content: `[результат ${m.toolName || "tool"}]\n${m.content.slice(0, 6000)}`,
-            },
-          ];
-        }
-        return [];
-      }),
-    ];
+    const ctx = Math.max(512, params.context || 4096);
+    const maxTokens = Math.max(
+      64,
+      Math.min(params.maxTokens || 1024, Math.floor(ctx * 0.45), 4096),
+    );
+    const messages: OpenAiMessage[] = fitMessagesToContext(
+      [
+        { role: "system", content: systemPrompt },
+        ...history.flatMap((m): OpenAiMessage[] => {
+          if (m.role === "user" || m.role === "assistant") {
+            return [{ role: m.role, content: m.content }];
+          }
+          if (m.role === "tool") {
+            return [
+              {
+                role: "user",
+                content: `[результат ${m.toolName || "tool"}]\n${m.content.slice(0, 2500)}`,
+              },
+            ];
+          }
+          return [];
+        }),
+      ],
+      ctx,
+      maxTokens,
+    );
 
     this.abort = new AbortController();
     this.activeSessionId = sessionId;
     const signal = this.abort.signal;
-    const res = await fetch(`${base}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal,
-      body: JSON.stringify({
-        model: "local",
-        messages,
-        temperature: params.temperature,
-        top_p: params.topP,
-        max_tokens: params.maxTokens,
-        stream: true,
-        seed: params.seed ?? undefined,
-      }),
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${base}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal,
+        body: JSON.stringify({
+          model: "local",
+          messages,
+          temperature: params.temperature,
+          top_p: params.topP,
+          max_tokens: maxTokens,
+          stream: true,
+          seed: params.seed ?? undefined,
+        }),
+      });
+    } catch (err) {
+      this.abort = null;
+      this.activeSessionId = null;
+      // Re-probe: if server died mid-flight, clear stale "loaded" state via assert.
+      try {
+        await this.runtime.assertLlmReady();
+      } catch (probeErr) {
+        throw formatLlmFetchError(probeErr, base);
+      }
+      throw formatLlmFetchError(err, base);
+    }
 
     if (!res.ok || !res.body) {
       const text = await res.text().catch(() => "");
       this.abort = null;
       this.activeSessionId = null;
+      if (isContextOverflowError(text) || isContextOverflowError(`Ошибка генерации: ${res.status} ${text}`)) {
+        throw formatLlmFetchError(
+          new Error(`Ошибка генерации: ${res.status} ${text}`),
+          base,
+        );
+      }
       throw new Error(`Ошибка генерации: ${res.status} ${text}`);
     }
 
@@ -218,8 +255,61 @@ export class ChatEngine {
   }
 
   async completeJson(messages: OpenAiMessage[], params: GenerationParams): Promise<string> {
-    const base = this.runtime.getOpenAiBaseUrl();
-    if (!base) throw new Error("Модель не загружена");
+    let base: string;
+    try {
+      base = await this.runtime.assertLlmReady();
+    } catch (err) {
+      throw formatLlmFetchError(err, this.runtime.getOpenAiBaseUrl());
+    }
+
+    // Keep completion within context headroom — requesting 8k with ctx 8k hangs/resets Vulkan.
+    const ctx = Math.max(512, params.context || 4096);
+    const maxTokens = Math.max(
+      256,
+      Math.min(params.maxTokens || 1024, Math.floor(ctx * 0.45), 4096),
+    );
+
+    const attemptOnce = async (
+      signal: AbortSignal,
+      msgs: OpenAiMessage[],
+    ): Promise<string> => {
+      const packed = fitMessagesToContext(msgs, ctx, maxTokens);
+      const res = await fetch(`${base}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal,
+        body: JSON.stringify({
+          model: "local",
+          messages: packed,
+          temperature: params.temperature,
+          top_p: params.topP,
+          max_tokens: maxTokens,
+          stream: false,
+        }),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Ошибка LLM: ${res.status} ${text}`);
+      }
+      const json = (await res.json()) as {
+        choices?: Array<{
+          message?: {
+            content?: string;
+            reasoning_content?: string;
+            reasoning?: string;
+          };
+          finish_reason?: string;
+        }>;
+      };
+      const choice = json.choices?.[0];
+      const content = pickCompletionText(choice?.message);
+      if (choice?.finish_reason === "length" && !content.trim()) {
+        throw new Error(
+          "Ответ LLM обрезан по max_tokens (finish_reason=length). Упростите шаг: пишите один файл целиком через write_file или увеличьте лимит токенов.",
+        );
+      }
+      return content;
+    };
 
     // Reuse / replace abort so agent cancel (chat.stop) interrupts JSON calls too.
     this.stop();
@@ -227,31 +317,31 @@ export class ChatEngine {
     const signal = this.abort.signal;
 
     try {
-      const res = await fetch(`${base}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal,
-        body: JSON.stringify({
-          model: "local",
-          messages,
-          temperature: params.temperature,
-          top_p: params.topP,
-          max_tokens: params.maxTokens,
-          stream: false,
-        }),
-      });
-      if (!res.ok) {
-        throw new Error(`LLM error: ${res.status} ${await res.text()}`);
+      try {
+        return await attemptOnce(signal, messages);
+      } catch (err) {
+        if (signal.aborted || (err instanceof Error && err.name === "AbortError")) {
+          throw err;
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        if (isContextOverflowError(err)) {
+          // Hard shrink: system + last 2 messages only.
+          const system = messages.find((m) => m.role === "system");
+          const tail = messages.filter((m) => m.role !== "system").slice(-2);
+          const emergency = system ? [system, ...tail] : tail;
+          return await attemptOnce(signal, emergency);
+        }
+        // One reconnect for transient Electron/undici "fetch failed" while server still up.
+        if (!/fetch failed|econnreset|socket|network/i.test(msg)) {
+          throw err;
+        }
+        await new Promise((r) => setTimeout(r, 750));
+        base = await this.runtime.assertLlmReady();
+        if (signal.aborted) throw err;
+        return await attemptOnce(signal, messages);
       }
-      const json = (await res.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-      };
-      return json.choices?.[0]?.message?.content || "";
     } catch (err) {
-      if ((err as Error).name === "AbortError") {
-        throw new Error("Отменено");
-      }
-      throw err;
+      throw formatLlmFetchError(err, base);
     } finally {
       if (this.abort?.signal === signal) {
         this.abort = null;

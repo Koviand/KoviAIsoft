@@ -4,7 +4,19 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { AppSettings } from "@kovi/shared";
-import { assertAllowedPath } from "./sandbox.js";
+import { writeFileAtomic } from "../fsAtomic.js";
+import {
+  assertAllowedPath,
+  isPathInside,
+  normalizePath,
+  realPathSafe,
+  resolveAgentPath,
+} from "./sandbox.js";
+import { applyTextReplace } from "./textReplace.js";
+
+export { applyTextReplace } from "./textReplace.js";
+
+export { runTerminal } from "./terminal.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -15,11 +27,28 @@ export function isRipgrepNoMatch(err: unknown): boolean {
   return e.code === 1 || e.status === 1;
 }
 
+function resolveToolPath(raw: string, settings: AppSettings): string {
+  const resolved = resolveAgentPath(raw, settings.projectRoot);
+  return assertAllowedPath(
+    resolved,
+    settings.fileAccessMode,
+    settings.projectRoot,
+    settings.modelRoots,
+  );
+}
+
 export async function listDir(dirPath: string, settings: AppSettings): Promise<string> {
-  assertAllowedPath(dirPath, settings.fileAccessMode, settings.projectRoot, settings.modelRoots);
-  const entries = await fsp.readdir(dirPath, { withFileTypes: true });
+  const resolved = resolveToolPath(dirPath, settings);
+  const entries = await fsp.readdir(resolved, { withFileTypes: true });
   return entries
-    .map((e) => `${e.isDirectory() ? "dir" : "file"}\t${e.name}`)
+    .map((e) => {
+      const kind = e.isSymbolicLink()
+        ? "link"
+        : e.isDirectory()
+          ? "dir"
+          : "file";
+      return `${kind}\t${e.name}`;
+    })
     .join("\n");
 }
 
@@ -28,16 +57,30 @@ export async function readFileTool(
   settings: AppSettings,
   maxBytes = 200_000,
 ): Promise<string> {
-  assertAllowedPath(filePath, settings.fileAccessMode, settings.projectRoot, settings.modelRoots);
-  const st = await fsp.stat(filePath);
+  const resolved = resolveToolPath(filePath, settings);
+  const st = await fsp.stat(resolved);
   if (st.size > maxBytes) {
     const buf = Buffer.alloc(maxBytes);
-    const fh = await fsp.open(filePath, "r");
+    const fh = await fsp.open(resolved, "r");
     await fh.read(buf, 0, maxBytes, 0);
     await fh.close();
     return buf.toString("utf8") + `\n\n[truncated, file size ${st.size} bytes]`;
   }
-  return fsp.readFile(filePath, "utf8");
+  return fsp.readFile(resolved, "utf8");
+}
+
+/** Full-file read for patching (no truncation marker). */
+async function readFileRawForPatch(
+  filePath: string,
+  settings: AppSettings,
+  maxBytes = 2_000_000,
+): Promise<{ path: string; text: string }> {
+  const resolved = resolveToolPath(filePath, settings);
+  const st = await fsp.stat(resolved);
+  if (st.size > maxBytes) {
+    throw new Error(`Файл слишком большой для apply_patch (${st.size} bytes)`);
+  }
+  return { path: resolved, text: await fsp.readFile(resolved, "utf8") };
 }
 
 export async function writeFileTool(
@@ -45,10 +88,16 @@ export async function writeFileTool(
   content: string,
   settings: AppSettings,
 ): Promise<string> {
-  assertAllowedPath(filePath, settings.fileAccessMode, settings.projectRoot, settings.modelRoots);
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, content, "utf8");
-  return `Written ${content.length} chars to ${filePath}`;
+  if (typeof content !== "string") {
+    throw new Error("write_file: content должен быть строкой с полным текстом файла");
+  }
+  if (!content.length) {
+    throw new Error("write_file: пустой content запрещён — передайте полный код файла");
+  }
+  const resolved = resolveToolPath(filePath, settings);
+  await fsp.mkdir(path.dirname(resolved), { recursive: true });
+  await writeFileAtomic(resolved, content);
+  return `Written ${content.length} chars to ${resolved}`;
 }
 
 export async function applyPatchTool(
@@ -57,24 +106,57 @@ export async function applyPatchTool(
   newText: string,
   settings: AppSettings,
 ): Promise<string> {
-  const current = await readFileTool(filePath, settings);
-  if (!current.includes(oldText)) {
-    throw new Error("Фрагмент для замены не найден");
+  if (typeof oldText !== "string" || typeof newText !== "string") {
+    throw new Error("apply_patch: oldText и newText должны быть строками");
   }
-  const next = current.replace(oldText, newText);
-  await writeFileTool(filePath, next, settings);
-  return `Patched ${filePath}`;
+  const { path: resolved, text: current } = await readFileRawForPatch(filePath, settings);
+  const next = applyTextReplace(current, oldText, newText);
+  await writeFileAtomic(resolved, next);
+  return `Patched ${resolved} (${current.length} → ${next.length} chars)`;
 }
 
 export async function deletePathTool(target: string, settings: AppSettings): Promise<string> {
-  assertAllowedPath(target, settings.fileAccessMode, settings.projectRoot, settings.modelRoots);
-  const st = await fsp.stat(target);
-  if (st.isDirectory()) {
-    await fsp.rm(target, { recursive: true, force: true });
-  } else {
-    await fsp.unlink(target);
+  const resolved = resolveToolPath(target, settings);
+  if (settings.projectRoot) {
+    const root = normalizePath(settings.projectRoot);
+    if (normalizePath(resolved).toLowerCase() === root.toLowerCase()) {
+      throw new Error("Нельзя удалить корень проекта");
+    }
+    const rootReal = realPathSafe(root);
+    const targetReal = realPathSafe(resolved);
+    if (targetReal.toLowerCase() === rootReal.toLowerCase()) {
+      throw new Error("Нельзя удалить корень проекта");
+    }
   }
-  return `Deleted ${target}`;
+
+  let lst: fs.Stats;
+  try {
+    lst = await fsp.lstat(resolved);
+  } catch {
+    throw new Error(`Путь не найден: ${resolved}`);
+  }
+
+  if (lst.isSymbolicLink()) {
+    await fsp.unlink(resolved);
+    return `Deleted symlink ${resolved}`;
+  }
+  if (lst.isDirectory()) {
+    // Avoid following junctions into outside trees: only allow if realpath stays inside policy.
+    const real = realPathSafe(resolved);
+    assertAllowedPath(
+      real,
+      settings.fileAccessMode,
+      settings.projectRoot,
+      settings.modelRoots,
+    );
+    if (settings.projectRoot && !isPathInside(real, settings.projectRoot)) {
+      // disk mode may allow; project mode already enforced by assert
+    }
+    await fsp.rm(resolved, { recursive: true, force: true });
+  } else {
+    await fsp.unlink(resolved);
+  }
+  return `Deleted ${resolved}`;
 }
 
 export async function searchFiles(
@@ -82,12 +164,22 @@ export async function searchFiles(
   root: string,
   settings: AppSettings,
 ): Promise<string> {
-  assertAllowedPath(root, settings.fileAccessMode, settings.projectRoot, settings.modelRoots);
-  // Prefer ripgrep if available (exit code 1 = no matches)
+  const resolvedRoot = resolveToolPath(root, settings);
   try {
     const { stdout } = await execFileAsync(
       "rg",
-      ["-n", "--max-count", "50", "--glob", "!node_modules", query, root],
+      [
+        "-n",
+        "-F",
+        "--max-count",
+        "50",
+        "--glob",
+        "!node_modules",
+        "--glob",
+        "!.git",
+        query,
+        resolvedRoot,
+      ],
       { windowsHide: true, timeout: 15000, maxBuffer: 2 * 1024 * 1024 },
     );
     return stdout || "(нет совпадений)";
@@ -96,11 +188,19 @@ export async function searchFiles(
       const e = err as { stdout?: string };
       return e.stdout || "(нет совпадений)";
     }
-    // fallback naive walk (rg missing or other failure)
     const hits: string[] = [];
-    const stack = [root];
+    const stack = [resolvedRoot];
+    const visited = new Set<string>();
     while (stack.length && hits.length < 50) {
       const dir = stack.pop()!;
+      let realDir: string;
+      try {
+        realDir = realPathSafe(dir).toLowerCase();
+      } catch {
+        continue;
+      }
+      if (visited.has(realDir)) continue;
+      visited.add(realDir);
       let entries: fs.Dirent[] = [];
       try {
         entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -110,6 +210,7 @@ export async function searchFiles(
       for (const e of entries) {
         if (e.name === "node_modules" || e.name === ".git") continue;
         const full = path.join(dir, e.name);
+        if (e.isSymbolicLink()) continue;
         if (e.isDirectory()) stack.push(full);
         else if (e.isFile()) {
           try {
@@ -127,23 +228,4 @@ export async function searchFiles(
     }
     return hits.join("\n") || "(нет совпадений)";
   }
-}
-
-export async function runTerminal(
-  command: string,
-  cwd: string,
-  settings: AppSettings,
-): Promise<string> {
-  assertAllowedPath(cwd, settings.fileAccessMode, settings.projectRoot, settings.modelRoots);
-  const { stdout, stderr } = await execFileAsync(
-    process.env.ComSpec || "cmd.exe",
-    ["/d", "/s", "/c", command],
-    {
-      cwd,
-      windowsHide: true,
-      timeout: 60_000,
-      maxBuffer: 2 * 1024 * 1024,
-    },
-  );
-  return [`$ ${command}`, stdout, stderr].filter(Boolean).join("\n");
 }

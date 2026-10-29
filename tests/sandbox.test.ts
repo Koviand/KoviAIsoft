@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   approvalRememberKey,
   assertAllowedPath,
+  assertTerminalCwd,
   isPathInside,
   riskForTool,
 } from "../packages/core/src/tools/sandbox";
@@ -40,18 +41,20 @@ describe("sandbox", () => {
   });
 
   it("scopes remember keys by path and skips terminal", () => {
-    expect(approvalRememberKey("run_terminal", { command: "dir", cwd: root })).toBeNull();
+    expect(approvalRememberKey("run_terminal", { command: "dir", cwd: root }, root)).toBeNull();
     expect(approvalRememberKey("browser_click", { selector: "a" })).toBeNull();
-    const key = approvalRememberKey("write_file", {
-      path: path.join(root, "a.txt"),
-      content: "x",
-    });
+    const key = approvalRememberKey(
+      "write_file",
+      { path: path.join(root, "a.txt"), content: "x" },
+      root,
+    );
     expect(key).toMatch(/^write_file::/);
     expect(
-      approvalRememberKey("write_file", {
-        path: path.join(root, "b.txt"),
-        content: "y",
-      }),
+      approvalRememberKey(
+        "write_file",
+        { path: path.join(root, "b.txt"), content: "y" },
+        root,
+      ),
     ).not.toBe(key);
   });
 
@@ -60,4 +63,12 @@ describe("sandbox", () => {
     expect(riskForTool("write_file", { path: "C:\\Models\\LFM\\a.txt" })).toBe("medium");
     expect(riskForTool("run_terminal", { command: "dir" })).toBe("high");
   });
+
+  it("allows disk-mode terminal outside modelRoots but not System32", () => {
+    expect(() =>
+      assertTerminalCwd("C:\\Users\\Kovi\\Documents\\App", "disk", null),
+    ).not.toThrow();
+    expect(() => assertTerminalCwd("C:\\Windows\\System32", "disk", root)).toThrow();
+  });
 });
+
