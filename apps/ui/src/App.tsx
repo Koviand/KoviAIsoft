@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { api } from "./api";
+import { useEffect, useRef, useState } from "react";
+import { api, isElectronBridge } from "./api";
 import { Topbar } from "./components/Topbar";
 import { useAppState } from "./hooks/useAppState";
 import { riskRu } from "./lib/labels";
@@ -13,10 +13,17 @@ import { SettingsPage } from "./pages/SettingsPage";
 export function App() {
   const state = useAppState();
   const [logHint, setLogHint] = useState<string | null>(null);
+  const rejectBtnRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (state.pendingConfirm?.risk === "high") {
+      rejectBtnRef.current?.focus();
+    }
+  }, [state.pendingConfirm?.id, state.pendingConfirm?.risk]);
 
   if (state.booting) {
     return (
-      <div className="splash-shell">
+      <div className="splash-shell" role="status" aria-busy="true">
         <div className="splash-card">
           <span className="brand-mark splash-mark" aria-hidden="true">
             K
@@ -66,7 +73,15 @@ export function App() {
         }}
       />
       <main className="main">
-        {state.error && (
+        {!isElectronBridge && (
+          <div className="confirm-banner error-banner" role="status">
+            <div>
+              <strong>Desktop bridge недоступен</strong>
+              <div>Откройте приложение через `pnpm dev:desktop`, а не только Vite в браузере.</div>
+            </div>
+          </div>
+        )}
+        {state.error && !state.pendingConfirm && (
           <div className="confirm-banner error-banner" role="alert">
             <div>
               <strong>Ошибка</strong>
@@ -103,7 +118,12 @@ export function App() {
           </div>
         )}
         {state.pendingConfirm && (
-          <div className="confirm-banner" role="alertdialog" aria-label="Подтверждение действия">
+          <div
+            className="confirm-banner"
+            role="alertdialog"
+            aria-modal="true"
+            aria-label="Подтверждение действия"
+          >
             <div style={{ minWidth: 0, flex: 1 }}>
               <strong>Нужно подтверждение ({riskRu(state.pendingConfirm.risk)})</strong>
               <div className="mono" style={{ marginTop: 6 }}>
@@ -131,6 +151,7 @@ export function App() {
                 Разрешить до конца диалога
               </button>
               <button
+                ref={rejectBtnRef}
                 className="btn danger"
                 type="button"
                 disabled={state.confirmBusy}

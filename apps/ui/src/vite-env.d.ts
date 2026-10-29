@@ -4,7 +4,7 @@ import type { KoviApi } from "@kovi/shared";
 
 declare global {
   interface Window {
-    kovi: KoviApi;
+    kovi?: KoviApi;
   }
 }
 

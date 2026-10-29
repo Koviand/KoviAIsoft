@@ -23,8 +23,17 @@ export class BrowserTooling {
   }
 
   async navigate(url: string): Promise<string> {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error(`Некорректный URL: ${url}`);
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error(`Разрешены только http/https URL (получено ${parsed.protocol})`);
+    }
     const page = await this.ensurePage();
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.goto(parsed.toString(), { waitUntil: "domcontentloaded", timeout: 45000 });
     return `Opened ${page.url()} title=${await page.title()}`;
   }
 

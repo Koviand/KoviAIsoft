@@ -27,12 +27,18 @@ export function assertAllowedPath(
     }
     return;
   }
-  // disk mode: allow listed roots + project; still block obvious system-critical writes via risk gates elsewhere
+
+  // disk mode: only modelRoots + projectRoot
   const allowed = [...roots];
   if (projectRoot) allowed.push(projectRoot);
-  if (allowed.length === 0) return;
-  // In disk mode we allow any path; caller may still require confirmation for writes.
-  void resolved;
+  if (allowed.length === 0) {
+    throw new Error(
+      "Режим disk: задайте папки моделей или папку проекта в настройках",
+    );
+  }
+  if (!allowed.some((root) => isPathInside(resolved, root))) {
+    throw new Error(`Путь вне разрешённых папок: ${resolved}`);
+  }
 }
 
 export function isDangerousWrite(target: string): boolean {
@@ -43,6 +49,30 @@ export function isDangerousWrite(target: string): boolean {
     "\\program files (x86)\\",
   ];
   return blocked.some((b) => p.includes(b));
+}
+
+/** Tools that must never be auto-remembered for the whole session. */
+export const NEVER_REMEMBER_TOOLS = new Set([
+  "run_terminal",
+  "browser_click",
+  "browser_type",
+]);
+
+/**
+ * Stable approval key for "remember this action".
+ * Returns null when the approval must not be remembered.
+ */
+export function approvalRememberKey(
+  toolName: string,
+  args: Record<string, unknown>,
+): string | null {
+  if (NEVER_REMEMBER_TOOLS.has(toolName)) return null;
+  if (["write_file", "apply_patch", "delete_path"].includes(toolName)) {
+    const p = String(args.path || args.file || "").trim();
+    if (!p) return null;
+    return `${toolName}::${normalizePath(p).toLowerCase()}`;
+  }
+  return toolName;
 }
 
 export function riskForTool(

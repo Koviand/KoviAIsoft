@@ -1,8 +1,11 @@
 import type { KoviApi } from "@kovi/shared";
 
+export const isElectronBridge =
+  typeof window !== "undefined" && typeof window.kovi !== "undefined";
+
 function mockApi(): KoviApi {
   const err = async () => {
-    throw new Error("Electron bridge недоступен. Запустите через desktop app.");
+    throw new Error("Electron bridge недоступен. Запустите через desktop app (`pnpm dev:desktop`).");
   };
   return new Proxy({} as KoviApi, {
     get: (_t, prop) => {
@@ -20,4 +23,4 @@ function mockApi(): KoviApi {
   });
 }
 
-export const api: KoviApi = typeof window !== "undefined" && window.kovi ? window.kovi : mockApi();
+export const api: KoviApi = isElectronBridge ? window.kovi! : mockApi();

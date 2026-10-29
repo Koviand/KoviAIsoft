@@ -12,6 +12,7 @@ import type {
   LocalModel,
   McpHealthResult,
   McpServerConfig,
+  ModelRecommendationsReport,
   RuntimeAsset,
   RuntimeBackend,
   RuntimeStatus,
@@ -31,6 +32,7 @@ export const IPC = {
   ensureLatestRuntime: "kovi:ensureLatestRuntime",
   listModels: "kovi:listModels",
   scanModels: "kovi:scanModels",
+  getModelRecommendations: "kovi:getModelRecommendations",
   searchHf: "kovi:searchHf",
   listHfFiles: "kovi:listHfFiles",
   downloadHfFile: "kovi:downloadHfFile",
@@ -159,6 +161,7 @@ export interface KoviApi {
   }>;
   listModels(): Promise<LocalModel[]>;
   scanModels(): Promise<LocalModel[]>;
+  getModelRecommendations(): Promise<ModelRecommendationsReport>;
   searchHf(query: string): Promise<HfSearchResult[]>;
   listHfFiles(modelId: string): Promise<HfFile[]>;
   downloadHfFile(modelId: string, filePath: string): Promise<string>;

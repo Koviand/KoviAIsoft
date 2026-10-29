@@ -11,6 +11,7 @@ import type {
   LocalModel,
   McpHealthResult,
   McpServerConfig,
+  ModelRecommendationsReport,
   MonitorSnapshot,
   RuntimeAsset,
   RuntimeBackend,
@@ -39,6 +40,7 @@ import { RuntimeManager } from "./runtime/manager.js";
 import { fetchLlamaServerMetrics } from "./runtime/serverMetrics.js";
 import { SettingsStore } from "./settings.js";
 import { detectSystemInfo, sampleVram } from "./system/detect.js";
+import { buildModelRecommendations } from "./models/recommend.js";
 import { previewWriteDiff } from "./tools/diff.js";
 
 /** Quiet auto-update interval for llama.cpp GitHub checks. */
@@ -276,6 +278,11 @@ export class AppService {
     return this.modelsCache;
   }
 
+  async getModelRecommendations(): Promise<ModelRecommendationsReport> {
+    const sys = await this.getSystemInfo();
+    return buildModelRecommendations(sys);
+  }
+
   searchHf(query: string): Promise<HfSearchResult[]> {
     return searchHfModels(query);
   }
@@ -295,15 +302,24 @@ export class AppService {
   async downloadHf(modelId: string, filePath: string): Promise<string> {
     this.modelDownload = { active: true, progress: 0, label: "Скачивание модели…" };
     try {
+      const s = this.settings.get();
       const dest = await downloadHfFile(
         modelId,
         filePath,
-        this.settings.get().downloadDir,
+        s.downloadDir,
         (progress, label) => {
           this.modelDownload = { active: true, progress, label };
           this.onDownloadProgress?.({ progress, label });
         },
       );
+      // Ensure downloaded files appear in the local scan list.
+      const downloadRoot = path.resolve(s.downloadDir);
+      if (!s.modelRoots.some((r) => path.resolve(r).toLowerCase() === downloadRoot.toLowerCase())) {
+        await this.settings.save({
+          ...s,
+          modelRoots: [...s.modelRoots, s.downloadDir],
+        });
+      }
       await this.scanModels();
       return dest;
     } finally {
@@ -554,7 +570,7 @@ export class AppService {
   }
 
   previewFileDiff(filePath: string, content: string): string {
-    return previewWriteDiff(filePath, content);
+    return previewWriteDiff(filePath, content, this.getSettings());
   }
 
   async getMonitorSnapshot(): Promise<MonitorSnapshot> {

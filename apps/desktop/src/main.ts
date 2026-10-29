@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { app, BrowserWindow, dialog, ipcMain, nativeImage } from "electron";
+import type { AppSettings, McpServerConfig } from "@kovi/shared";
 import { IPC } from "@kovi/shared";
 import { AppService, setAppDataDir } from "@kovi/core";
 
@@ -42,10 +43,89 @@ function uiPath(): string {
   return path.join(process.resourcesPath, "ui", "index.html");
 }
 
-function broadcast(channel: string, payload: unknown): void {
+function isAllowedUiNavigation(url: string): boolean {
+  if (url === "about:blank") return true;
+  const target = uiPath();
+  if (target.startsWith("http")) {
+    try {
+      const u = new URL(url);
+      const allowed = new URL(target);
+      return u.origin === allowed.origin;
+    } catch {
+      return false;
+    }
+  }
+  return url.startsWith("file:");
+}
+
+function hardenWindow(win: BrowserWindow): void {
+  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  win.webContents.on("will-navigate", (event, url) => {
+    if (!isAllowedUiNavigation(url)) {
+      event.preventDefault();
+    }
+  });
+}
+
+/** Chat/agent stream events go to main UI only — not the monitor window. */
+function broadcastMain(channel: string, payload: unknown): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, payload);
+  }
+}
+
+function broadcastAll(channel: string, payload: unknown): void {
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) win.webContents.send(channel, payload);
   }
+}
+
+function parentForDialog(event: Electron.IpcMainInvokeEvent): BrowserWindow | undefined {
+  const from = BrowserWindow.fromWebContents(event.sender);
+  if (from && !from.isDestroyed()) return from;
+  if (mainWindow && !mainWindow.isDestroyed()) return mainWindow;
+  return undefined;
+}
+
+function assertSettingsShape(settings: unknown): AppSettings {
+  if (!settings || typeof settings !== "object") {
+    throw new Error("Некорректные настройки");
+  }
+  const s = settings as AppSettings;
+  if (s.projectRoot != null && typeof s.projectRoot !== "string") {
+    throw new Error("projectRoot должен быть строкой или null");
+  }
+  if (s.modelRoots && !Array.isArray(s.modelRoots)) {
+    throw new Error("modelRoots должен быть массивом");
+  }
+  if (s.downloadDir != null && typeof s.downloadDir !== "string") {
+    throw new Error("downloadDir должен быть строкой");
+  }
+  if (s.mcpServers && !Array.isArray(s.mcpServers)) {
+    throw new Error("mcpServers должен быть массивом");
+  }
+  return s;
+}
+
+function assertMcpServer(server: unknown): McpServerConfig {
+  if (!server || typeof server !== "object") {
+    throw new Error("Некорректный MCP server");
+  }
+  const s = server as McpServerConfig;
+  if (typeof s.id !== "string" || !s.id.trim()) {
+    throw new Error("MCP id обязателен");
+  }
+  if (s.transport === "stdio") {
+    if (typeof s.command !== "string" || !s.command.trim()) {
+      throw new Error("MCP command обязателен для stdio");
+    }
+  }
+  if (s.transport === "sse") {
+    if (typeof s.url !== "string" || !s.url.trim()) {
+      throw new Error("MCP url обязателен для sse");
+    }
+  }
+  return s;
 }
 
 async function loadUi(win: BrowserWindow, hash = ""): Promise<void> {
@@ -76,10 +156,11 @@ async function createWindow(): Promise<void> {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
       webSecurity: true,
     },
   });
+  hardenWindow(mainWindow);
   mainWindow.once("ready-to-show", () => mainWindow?.show());
   if (icon) {
     try {
@@ -127,10 +208,11 @@ async function createMonitorWindow(): Promise<void> {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
       webSecurity: true,
     },
   });
+  hardenWindow(monitorWindow);
 
   // Register before load so we never miss the first ready-to-show.
   monitorWindow.once("ready-to-show", () => {
@@ -176,7 +258,9 @@ async function shutdown(): Promise<void> {
 function registerIpc(svc: AppService): void {
   ipcMain.handle(IPC.getSystemInfo, () => svc.getSystemInfo());
   ipcMain.handle(IPC.getSettings, () => svc.getSettings());
-  ipcMain.handle(IPC.saveSettings, (_e, settings) => svc.saveSettings(settings));
+  ipcMain.handle(IPC.saveSettings, (_e, settings) =>
+    svc.saveSettings(assertSettingsShape(settings)),
+  );
   ipcMain.handle(IPC.getRuntimeStatus, () => svc.getRuntimeStatus());
   ipcMain.handle(IPC.detectRuntimeAsset, (_e, backend) => svc.detectRuntimeAsset(backend));
   ipcMain.handle(IPC.installRuntime, (_e, backend) => svc.installRuntime(backend));
@@ -186,6 +270,7 @@ function registerIpc(svc: AppService): void {
   );
   ipcMain.handle(IPC.listModels, () => svc.listModels());
   ipcMain.handle(IPC.scanModels, () => svc.scanModels());
+  ipcMain.handle(IPC.getModelRecommendations, () => svc.getModelRecommendations());
   ipcMain.handle(IPC.searchHf, (_e, query) => svc.searchHf(query));
   ipcMain.handle(IPC.listHfFiles, (_e, modelId) => svc.listHfFiles(modelId));
   ipcMain.handle(IPC.downloadHfFile, (_e, modelId, filePath) =>
@@ -209,7 +294,7 @@ function registerIpc(svc: AppService): void {
           params: req.params,
         })
         .catch((err) => {
-          broadcast(IPC.agentEvent, {
+          broadcastMain(IPC.agentEvent, {
             sessionId: req.sessionId,
             event: {
               type: "error",
@@ -227,7 +312,7 @@ function registerIpc(svc: AppService): void {
   ipcMain.handle(IPC.stopGeneration, () => svc.stopGeneration());
   ipcMain.handle(IPC.startAgent, async (_e, req) => {
     void svc.startAgent(req.sessionId, req.content).catch((err) => {
-      broadcast(IPC.agentEvent, {
+      broadcastMain(IPC.agentEvent, {
         sessionId: req.sessionId,
         event: {
           type: "error",
@@ -240,17 +325,22 @@ function registerIpc(svc: AppService): void {
     svc.resolveConfirmation(req.confirmationId, req.approved, req.rememberForSession),
   );
   ipcMain.handle(IPC.cancelAgent, () => svc.cancelAgent());
-  ipcMain.handle(IPC.pickDirectory, async () => {
-    const res = await dialog.showOpenDialog(mainWindow!, {
-      properties: ["openDirectory"],
-    });
+  ipcMain.handle(IPC.pickDirectory, async (e) => {
+    const parent = parentForDialog(e);
+    const res = parent
+      ? await dialog.showOpenDialog(parent, { properties: ["openDirectory"] })
+      : await dialog.showOpenDialog({ properties: ["openDirectory"] });
     return res.canceled ? null : res.filePaths[0] || null;
   });
-  ipcMain.handle(IPC.pickFile, async (_e, filters) => {
-    const res = await dialog.showOpenDialog(mainWindow!, {
-      properties: ["openFile"],
+  ipcMain.handle(IPC.pickFile, async (e, filters) => {
+    const parent = parentForDialog(e);
+    const opts = {
+      properties: ["openFile"] as ("openFile")[],
       filters: filters || [{ name: "All", extensions: ["*"] }],
-    });
+    };
+    const res = parent
+      ? await dialog.showOpenDialog(parent, opts)
+      : await dialog.showOpenDialog(opts);
     return res.canceled ? null : res.filePaths[0] || null;
   });
   ipcMain.handle(IPC.getStatusBar, () => svc.getStatusBar());
@@ -266,16 +356,22 @@ function registerIpc(svc: AppService): void {
   ipcMain.handle(IPC.exportSession, (_e, sessionId: string) => svc.exportSession(sessionId));
   ipcMain.handle(IPC.importSession, (_e, bundle) => svc.importSession(bundle));
   ipcMain.handle(IPC.getErrorLog, () => svc.getErrorLog());
-  ipcMain.handle(IPC.checkMcpHealth, (_e, server) => svc.checkMcpHealth(server));
+  ipcMain.handle(IPC.checkMcpHealth, (_e, server) => svc.checkMcpHealth(assertMcpServer(server)));
   ipcMain.handle(IPC.verifyGguf, (_e, modelId: string) => svc.verifyGguf(modelId));
-  ipcMain.handle(IPC.previewFileDiff, (_e, filePath: string, content: string) =>
-    svc.previewFileDiff(filePath, content),
-  );
+  ipcMain.handle(IPC.previewFileDiff, (_e, filePath: string, content: string) => {
+    if (typeof filePath !== "string" || !filePath.trim()) {
+      throw new Error("filePath обязателен");
+    }
+    if (typeof content !== "string") {
+      throw new Error("content должен быть строкой");
+    }
+    return svc.previewFileDiff(filePath, content);
+  });
 
-  svc.onRuntimeProgress = (p) => broadcast(IPC.runtimeProgress, p);
-  svc.onDownloadProgress = (p) => broadcast(IPC.downloadProgress, p);
-  svc.onChatToken = (p) => broadcast(IPC.chatToken, p);
-  svc.onAgentEvent = (p) => broadcast(IPC.agentEvent, p);
+  svc.onRuntimeProgress = (p) => broadcastAll(IPC.runtimeProgress, p);
+  svc.onDownloadProgress = (p) => broadcastAll(IPC.downloadProgress, p);
+  svc.onChatToken = (p) => broadcastMain(IPC.chatToken, p);
+  svc.onAgentEvent = (p) => broadcastMain(IPC.agentEvent, p);
 }
 
 const gotLock = app.requestSingleInstanceLock();

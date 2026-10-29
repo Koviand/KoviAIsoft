@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import type { AppSettings } from "@kovi/shared";
+import { assertAllowedPath } from "./sandbox.js";
 
 /** Tiny unified-diff style preview (no external deps). */
 export function makeUnifiedDiff(
@@ -51,7 +53,19 @@ export function makeUnifiedDiff(
   return lines.join("\n");
 }
 
-export function previewWriteDiff(filePath: string, newContent: string): string {
+export function previewWriteDiff(
+  filePath: string,
+  newContent: string,
+  settings?: AppSettings,
+): string {
+  if (settings) {
+    assertAllowedPath(
+      filePath,
+      settings.fileAccessMode,
+      settings.projectRoot,
+      settings.modelRoots,
+    );
+  }
   let before = "";
   try {
     if (fs.existsSync(filePath)) before = fs.readFileSync(filePath, "utf8");
@@ -72,7 +86,16 @@ export function previewPatchDiff(
   filePath: string,
   oldText: string,
   newText: string,
+  settings?: AppSettings,
 ): string {
+  if (settings) {
+    assertAllowedPath(
+      filePath,
+      settings.fileAccessMode,
+      settings.projectRoot,
+      settings.modelRoots,
+    );
+  }
   let current = "";
   try {
     current = fs.readFileSync(filePath, "utf8");

@@ -122,6 +122,50 @@ export interface HfFile {
   recommended?: boolean;
 }
 
+/** How a model is expected to run on this PC. */
+export type ModelPerfTier =
+  | "excellent"
+  | "good"
+  | "tight"
+  | "cpu"
+  | "too_heavy";
+
+export interface ModelRecommendation {
+  id: string;
+  name: string;
+  family: string;
+  description: string;
+  /** Approximate parameter count in billions. */
+  paramsB: number;
+  /** Suggested Hugging Face GGUF repo (author/name). */
+  hfRepo: string;
+  /** Suggested quant label, e.g. Q4_K_M. */
+  suggestedQuant: string;
+  /** Approximate GGUF size for suggestedQuant (bytes). */
+  approxSizeBytes: number;
+  tags: string[];
+  tier: ModelPerfTier;
+  /** Short RU explanation for the user. */
+  verdict: string;
+  /** Expected speed / UX note. */
+  expectedSpeed: string;
+  recommendedNgl: number;
+  recommendedContext: number;
+  fitsInVram: boolean;
+  /** Score for sorting (higher = better pick for this PC). */
+  score: number;
+}
+
+export interface ModelRecommendationsReport {
+  generatedAt: string;
+  vramGb: number | null;
+  ramGb: number;
+  backend: RuntimeBackend;
+  gpuName: string | null;
+  summary: string;
+  items: ModelRecommendation[];
+}
+
 export interface ChatMessage {
   id: string;
   role: "system" | "user" | "assistant" | "tool";

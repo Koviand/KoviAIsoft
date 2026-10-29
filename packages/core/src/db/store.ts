@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import fsp from "node:fs/promises";
 import path from "node:path";
 import { v4 as uuid } from "uuid";
 import type {
@@ -9,6 +8,7 @@ import type {
   SessionExportBundle,
 } from "@kovi/shared";
 import { DEFAULT_GENERATION_PARAMS } from "@kovi/shared";
+import { writeFileAtomic, writeFileAtomicSync } from "../fsAtomic.js";
 import { ensureDir } from "../paths.js";
 
 interface DbShape {
@@ -65,7 +65,7 @@ export class Store {
       this.persistTimer = null;
     }
     this.dirty = false;
-    fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), "utf8");
+    writeFileAtomicSync(this.filePath, JSON.stringify(this.data, null, 2));
   }
 
   /** Debounced persist to avoid blocking the agent tool loop on every message. */
@@ -77,7 +77,7 @@ export class Store {
       if (!this.dirty) return;
       this.dirty = false;
       try {
-        fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), "utf8");
+        writeFileAtomicSync(this.filePath, JSON.stringify(this.data, null, 2));
       } catch {
         this.dirty = true;
         // Retry once shortly after I/O failure.
@@ -218,7 +218,11 @@ export class Store {
   }
 
   async flush(): Promise<void> {
-    this.persistSync();
-    await fsp.writeFile(this.filePath, JSON.stringify(this.data, null, 2), "utf8");
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    this.dirty = false;
+    await writeFileAtomic(this.filePath, JSON.stringify(this.data, null, 2));
   }
 }

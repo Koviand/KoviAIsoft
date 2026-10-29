@@ -20,7 +20,11 @@ import {
   writeFileTool,
 } from "../tools/files.js";
 import { previewPatchDiff, previewWriteDiff } from "../tools/diff.js";
-import { riskForTool, shouldConfirmRisk } from "../tools/sandbox.js";
+import {
+  approvalRememberKey,
+  riskForTool,
+  shouldConfirmRisk,
+} from "../tools/sandbox.js";
 import { webSearch } from "../tools/websearch.js";
 import { loadProjectMemory } from "./projectMemory.js";
 import { toolsPromptBlock } from "./toolsCatalog.js";
@@ -60,9 +64,10 @@ export class AgentLoop {
       resolve: (approved: boolean) => void;
       toolName: string;
       sessionId: string;
+      rememberKey: string | null;
     }
   >();
-  /** Remembered tool approvals keyed by chat session (survive multiple agent turns). */
+  /** Remembered approvals keyed by session → approvalRememberKey (path-scoped for writes). */
   private allowBySession = new Map<string, Set<string>>();
   private running = false;
 
@@ -93,8 +98,8 @@ export class AgentLoop {
   resolveConfirmation(id: string, approved: boolean, remember = false): void {
     const pending = this.pendingConfirm.get(id);
     if (!pending) return;
-    if (approved && remember && pending.sessionId) {
-      this.allowFor(pending.sessionId).add(pending.toolName);
+    if (approved && remember && pending.sessionId && pending.rememberKey) {
+      this.allowFor(pending.sessionId).add(pending.rememberKey);
     }
     pending.resolve(approved);
     this.pendingConfirm.delete(id);
@@ -126,7 +131,8 @@ export class AgentLoop {
   ): Promise<boolean> {
     const risk = riskForTool(toolName, args);
     if (risk === "low") return true;
-    if (this.allowFor(sessionId).has(toolName)) return true;
+    const rememberKey = approvalRememberKey(toolName, args);
+    if (rememberKey && this.allowFor(sessionId).has(rememberKey)) return true;
     if (
       !shouldConfirmRisk(risk, settings.agentRiskMode || "ask", args, settings.projectRoot)
     ) {
@@ -134,14 +140,19 @@ export class AgentLoop {
     }
 
     let diff: string | undefined;
-    if (toolName === "write_file") {
-      diff = previewWriteDiff(String(args.path || ""), String(args.content ?? ""));
-    } else if (toolName === "apply_patch") {
-      diff = previewPatchDiff(
-        String(args.path || ""),
-        String(args.oldText ?? ""),
-        String(args.newText ?? ""),
-      );
+    try {
+      if (toolName === "write_file") {
+        diff = previewWriteDiff(String(args.path || ""), String(args.content ?? ""), settings);
+      } else if (toolName === "apply_patch") {
+        diff = previewPatchDiff(
+          String(args.path || ""),
+          String(args.oldText ?? ""),
+          String(args.newText ?? ""),
+          settings,
+        );
+      }
+    } catch {
+      diff = undefined;
     }
 
     const confirmation: AgentConfirmation = {
@@ -155,7 +166,12 @@ export class AgentLoop {
     };
     this.emit(sessionId, { type: "confirmation_required", confirmation });
     return new Promise<boolean>((resolve) => {
-      this.pendingConfirm.set(confirmation.id, { resolve, toolName, sessionId });
+      this.pendingConfirm.set(confirmation.id, {
+        resolve,
+        toolName,
+        sessionId,
+        rememberKey,
+      });
     });
   }
 

@@ -1,9 +1,36 @@
-import { useState } from "react";
-import type { AppSettings, HfFile, HfSearchResult, LocalModel } from "@kovi/shared";
+import { useEffect, useState } from "react";
+import type {
+  AppSettings,
+  HfFile,
+  HfSearchResult,
+  LocalModel,
+  ModelPerfTier,
+  ModelRecommendation,
+  ModelRecommendationsReport,
+} from "@kovi/shared";
 import { api } from "../api";
 
 function fmtGb(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+}
+
+function tierLabel(tier: ModelPerfTier): string {
+  switch (tier) {
+    case "excellent":
+      return "Отлично";
+    case "good":
+      return "Хорошо";
+    case "tight":
+      return "Впритык";
+    case "cpu":
+      return "CPU/RAM";
+    case "too_heavy":
+      return "Тяжело";
+  }
+}
+
+function tierClass(tier: ModelPerfTier): string {
+  return `badge tier-${tier}`;
 }
 
 export function ModelsPage(props: {
@@ -15,13 +42,31 @@ export function ModelsPage(props: {
   setError: (e: string | null) => void;
   refresh: () => Promise<void>;
 }) {
-  const [query, setQuery] = useState("LFM3 GGUF");
+  const [query, setQuery] = useState("LFM2 GGUF");
   const [hf, setHf] = useState<HfSearchResult[]>([]);
   const [files, setFiles] = useState<HfFile[]>([]);
   const [selectedHf, setSelectedHf] = useState<string | null>(null);
   const [progress, setProgress] = useState<{ progress: number; label: string } | null>(null);
   const [working, setWorking] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
+  const [recs, setRecs] = useState<ModelRecommendationsReport | null>(null);
+  const [recsLoading, setRecsLoading] = useState(false);
+
+  async function loadRecommendations(): Promise<void> {
+    setRecsLoading(true);
+    try {
+      setRecs(await api.getModelRecommendations());
+    } catch (e) {
+      props.setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRecsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadRecommendations();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function scan(): Promise<void> {
     setWorking(true);
@@ -29,6 +74,7 @@ export function ModelsPage(props: {
     try {
       props.setModels(await api.scanModels());
       setHint("Список локальных моделей обновлён");
+      await loadRecommendations();
     } catch (e) {
       props.setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -55,11 +101,18 @@ export function ModelsPage(props: {
     setWorking(true);
     try {
       setFiles(await api.listHfFiles(id));
+      setQuery(id);
     } catch (e) {
       props.setError(e instanceof Error ? e.message : String(e));
     } finally {
       setWorking(false);
     }
+  }
+
+  async function openRecommendation(item: ModelRecommendation): Promise<void> {
+    setHint(`Открываю ${item.hfRepo} — ищите файл *${item.suggestedQuant}*`);
+    setQuery(item.hfRepo);
+    await openRepo(item.hfRepo);
   }
 
   async function download(filePath: string): Promise<void> {
@@ -70,6 +123,8 @@ export function ModelsPage(props: {
     try {
       await api.downloadHfFile(selectedHf, filePath);
       props.setModels(await api.scanModels());
+      const s = await api.getSettings();
+      props.setSettings(s);
       setHint("Файл скачан. Можно нажать «Загрузить в память».");
       void api.openMonitorWindow().catch(() => undefined);
     } catch (e) {
@@ -127,6 +182,7 @@ export function ModelsPage(props: {
 
   const profiles = props.settings?.loadProfiles || [];
   const activeProfileId = props.settings?.activeLoadProfileId;
+  const topRecs = (recs?.items || []).filter((i) => i.tier !== "too_heavy").slice(0, 8);
 
   return (
     <div className="stack-page">
@@ -135,7 +191,7 @@ export function ModelsPage(props: {
           <div>
             <h1 className="h1">Модели</h1>
             <p className="muted page-sub">
-              Найдите GGUF на диске или скачайте с Hugging Face, затем загрузите в память
+              Рекомендации под ваше железо, локальные GGUF и загрузка с Hugging Face
             </p>
           </div>
           <button className="btn" type="button" disabled={working} onClick={() => void scan()}>
@@ -143,6 +199,76 @@ export function ModelsPage(props: {
           </button>
         </div>
       </header>
+
+      <section className="card elevated recommend-card">
+        <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <h3 style={{ margin: 0 }}>Что скачать на этот ПК</h3>
+            <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
+              {recsLoading && !recs
+                ? "Считаем рекомендации…"
+                : recs?.summary || "Нажмите «Пересчитать», чтобы оценить модели под VRAM/RAM."}
+            </p>
+          </div>
+          <button
+            className="btn ghost"
+            type="button"
+            disabled={recsLoading || working}
+            onClick={() => void loadRecommendations()}
+          >
+            Пересчитать
+          </button>
+        </div>
+        {recs && (
+          <div className="muted mono" style={{ fontSize: "0.78rem", marginTop: 8 }}>
+            {recs.gpuName ? `GPU: ${recs.gpuName}` : "GPU не обнаружен"}
+            {recs.vramGb != null ? ` · VRAM ${recs.vramGb.toFixed(1)} GB` : ""}
+            {` · RAM ${recs.ramGb.toFixed(0)} GB · backend ${recs.backend}`}
+          </div>
+        )}
+        <div className="recommend-grid" style={{ marginTop: 12 }}>
+          {topRecs.map((item) => (
+            <div key={item.id} className="recommend-item">
+              <div className="row" style={{ justifyContent: "space-between", gap: 8 }}>
+                <strong>{item.name}</strong>
+                <span className={tierClass(item.tier)}>{tierLabel(item.tier)}</span>
+              </div>
+              <div className="muted" style={{ fontSize: "0.8rem", marginTop: 4 }}>
+                {item.description}
+              </div>
+              <div className="mono" style={{ fontSize: "0.78rem", marginTop: 8 }}>
+                {item.suggestedQuant} ≈ {fmtGb(item.approxSizeBytes)} · ctx {item.recommendedContext}
+                {item.fitsInVram ? ` · ngl ${item.recommendedNgl}` : " · offload/CPU"}
+              </div>
+              <div className="muted" style={{ fontSize: "0.78rem", marginTop: 6 }}>
+                {item.verdict}
+              </div>
+              <div className="muted" style={{ fontSize: "0.75rem", marginTop: 4 }}>
+                {item.expectedSpeed}
+              </div>
+              <div className="row" style={{ marginTop: 10, flexWrap: "wrap" }}>
+                {item.tags.slice(0, 3).map((t) => (
+                  <span key={t} className="badge">
+                    {t}
+                  </span>
+                ))}
+              </div>
+              <button
+                className="btn primary"
+                type="button"
+                style={{ marginTop: 10 }}
+                disabled={working}
+                onClick={() => void openRecommendation(item)}
+              >
+                Открыть на HF
+              </button>
+            </div>
+          ))}
+          {!recsLoading && topRecs.length === 0 && (
+            <div className="muted">Нет подходящих вариантов в каталоге.</div>
+          )}
+        </div>
+      </section>
 
       {profiles.length > 0 && (
         <section className="card">
@@ -175,7 +301,7 @@ export function ModelsPage(props: {
         <section className="card elevated">
           <h3>На этом компьютере</h3>
           <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-            ★ / ngl — рекомендация под VRAM. Красный статус — битый GGUF.
+            ngl / ctx — оценка под VRAM. Красный статус — битый GGUF.
           </p>
           <div className="stack" style={{ maxHeight: 420, marginTop: 10 }}>
             {props.models.map((m) => {
@@ -188,13 +314,20 @@ export function ModelsPage(props: {
                       {m.integrityOk === false ? (
                         <span className="badge badge-danger">битый GGUF</span>
                       ) : null}
+                      {m.fitsInVram === true ? (
+                        <span className="badge tier-good">в VRAM</span>
+                      ) : null}
+                      {m.fitsInVram === false ? (
+                        <span className="badge tier-tight">offload</span>
+                      ) : null}
                       {loaded ? <span className="badge">в памяти</span> : null}
                     </span>
                   </div>
                   <div className="muted mono" style={{ fontSize: "0.8rem", marginTop: 4 }}>
-                    {fmtGb(m.sizeBytes)} · {m.quant || "квант ?"} · слои GPU {m.recommendedNgl}
+                    {fmtGb(m.sizeBytes)} · {m.quant || "квант ?"} · ngl {m.recommendedNgl} · ctx{" "}
+                    {m.recommendedContext}
                     {m.mmprojPath ? " · есть vision (mmproj)" : ""}
-                    {m.fitsInVram === false ? " · может не влезть в VRAM" : ""}
+                    {m.fitsInVram === false ? " · может не влезть целиком в VRAM" : ""}
                     {m.integrityOk === false && m.integrityError ? ` · ${m.integrityError}` : ""}
                   </div>
                   <div className="row" style={{ marginTop: 10 }}>
@@ -219,7 +352,9 @@ export function ModelsPage(props: {
               );
             })}
             {props.models.length === 0 && (
-              <div className="muted">Модели не найдены. Добавьте папку в Настройках или скачайте справа.</div>
+              <div className="muted">
+                Модели не найдены. Выберите рекомендацию выше или скачайте справа.
+              </div>
             )}
           </div>
         </section>
@@ -235,7 +370,7 @@ export function ModelsPage(props: {
               onKeyDown={(e) => {
                 if (e.key === "Enter") void search();
               }}
-              placeholder="Поиск, например LFM3 GGUF"
+              placeholder="Поиск или id репозитория"
             />
             <button className="btn primary" type="button" disabled={working} onClick={() => void search()}>
               Найти

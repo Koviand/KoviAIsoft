@@ -108,6 +108,7 @@ export function ChatPage(props: {
     );
   }
 
+  // Stream UI only — busy/confirm/errors/messages live in useAppState.
   useEffect(() => {
     const offToken = api.onChatToken((p) => {
       if (!acceptsStream(p.sessionId)) return;
@@ -121,7 +122,6 @@ export function ChatPage(props: {
       if (ev.type === "thinking") setThinking((t) => t + (t ? "\n" : "") + ev.text);
       if (ev.type === "plan") {
         setPlan(ev.steps);
-        // Coding runs should flip UI into agent mode for visibility.
         setAgentOn(true);
       }
       if (ev.type === "tool_call") {
@@ -142,27 +142,18 @@ export function ChatPage(props: {
               : t,
           ),
         );
-        if (activeIdRef.current) {
-          void api.getMessages(activeIdRef.current).then(props.setMessages);
-        }
       }
       if (ev.type === "done" || ev.type === "cancelled" || ev.type === "error") {
         streamSessionRef.current = null;
         setStreaming("");
         setThinking("");
-        props.setBusy(false);
-        if (activeIdRef.current) {
-          void api.getMessages(activeIdRef.current).then(props.setMessages);
-          void api.listSessions().then(props.setSessions);
-        }
-        if (ev.type === "error") props.setError(ev.message);
       }
     });
     return () => {
       offToken();
       offAgent();
     };
-  }, [props.setBusy, props.setError, props.setMessages, props.setSessions]);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -414,7 +405,12 @@ export function ChatPage(props: {
               type="button"
               className="btn ghost icon-btn"
               title="Удалить"
-              onClick={() => void onDeleteSession(s.id)}
+              aria-label={`Удалить диалог ${s.title}`}
+              onClick={() => {
+                if (window.confirm(`Удалить диалог «${s.title}»?`)) {
+                  void onDeleteSession(s.id);
+                }
+              }}
             >
               ×
             </button>
@@ -431,6 +427,38 @@ export function ChatPage(props: {
             </p>
           </div>
           <div className="row" style={{ flexWrap: "wrap" }}>
+            <label className="session-mobile-picker">
+              <span className="sr-only">Диалог</span>
+              <select
+                className="select"
+                aria-label="Выбрать диалог"
+                value={props.activeSessionId || ""}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "__new__") {
+                    void (async () => {
+                      try {
+                        const s = await api.createSession("chat");
+                        props.setSessions(await api.listSessions());
+                        props.setActiveSessionId(s.id);
+                      } catch (err) {
+                        props.setError(err instanceof Error ? err.message : String(err));
+                      }
+                    })();
+                    return;
+                  }
+                  props.setActiveSessionId(v || null);
+                }}
+              >
+                <option value="">Нет диалога</option>
+                <option value="__new__">+ Новый диалог</option>
+                {filteredSessions.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.title}
+                  </option>
+                ))}
+              </select>
+            </label>
             {activeSession ? (
               <input
                 className="input"

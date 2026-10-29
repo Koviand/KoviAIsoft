@@ -13,6 +13,7 @@ const api: KoviApi = {
     ipcRenderer.invoke(IPC.ensureLatestRuntime, backend, force),
   listModels: () => ipcRenderer.invoke(IPC.listModels),
   scanModels: () => ipcRenderer.invoke(IPC.scanModels),
+  getModelRecommendations: () => ipcRenderer.invoke(IPC.getModelRecommendations),
   searchHf: (query) => ipcRenderer.invoke(IPC.searchHf, query),
   listHfFiles: (modelId) => ipcRenderer.invoke(IPC.listHfFiles, modelId),
   downloadHfFile: (modelId, filePath) =>

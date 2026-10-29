@@ -43,6 +43,15 @@ export const BUILTIN_TOOL_SPECS = [
     },
   },
   {
+    name: "delete_path",
+    description: "Удалить файл или папку (требует подтверждения)",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+    },
+  },
+  {
     name: "search",
     description: "Поиск текста в файлах проекта",
     parameters: {
@@ -120,6 +129,12 @@ export const BUILTIN_TOOL_SPECS = [
     },
   },
 ] as const;
+
+export type BuiltinToolName = (typeof BUILTIN_TOOL_SPECS)[number]["name"];
+
+export const BUILTIN_TOOL_NAMES = new Set<string>(
+  BUILTIN_TOOL_SPECS.map((t) => t.name),
+);
 
 export function toolsPromptBlock(extraTools: Array<{ name: string; description?: string }>): string {
   const all = [

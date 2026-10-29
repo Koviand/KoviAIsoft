@@ -20,5 +20,9 @@ export {
 export * from "./runtime/manager.js";
 export * from "./models/scanner.js";
 export * from "./models/huggingface.js";
+export {
+  MODEL_CATALOG,
+  buildModelRecommendations,
+} from "./models/recommend.js";
 export * from "./tools/sandbox.js";
 export * from "./agent/toolsCatalog.js";

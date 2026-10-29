@@ -8,6 +8,13 @@ import { assertAllowedPath } from "./sandbox.js";
 
 const execFileAsync = promisify(execFile);
 
+/** ripgrep exits with 1 when there are no matches (not a hard failure). */
+export function isRipgrepNoMatch(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { code?: string | number; status?: number };
+  return e.code === 1 || e.status === 1;
+}
+
 export async function listDir(dirPath: string, settings: AppSettings): Promise<string> {
   assertAllowedPath(dirPath, settings.fileAccessMode, settings.projectRoot, settings.modelRoots);
   const entries = await fsp.readdir(dirPath, { withFileTypes: true });
@@ -76,7 +83,7 @@ export async function searchFiles(
   settings: AppSettings,
 ): Promise<string> {
   assertAllowedPath(root, settings.fileAccessMode, settings.projectRoot, settings.modelRoots);
-  // Prefer ripgrep if available
+  // Prefer ripgrep if available (exit code 1 = no matches)
   try {
     const { stdout } = await execFileAsync(
       "rg",
@@ -84,8 +91,12 @@ export async function searchFiles(
       { windowsHide: true, timeout: 15000, maxBuffer: 2 * 1024 * 1024 },
     );
     return stdout || "(нет совпадений)";
-  } catch {
-    // fallback naive walk
+  } catch (err) {
+    if (isRipgrepNoMatch(err)) {
+      const e = err as { stdout?: string };
+      return e.stdout || "(нет совпадений)";
+    }
+    // fallback naive walk (rg missing or other failure)
     const hits: string[] = [];
     const stack = [root];
     while (stack.length && hits.length < 50) {

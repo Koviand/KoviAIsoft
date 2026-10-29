@@ -1123,6 +1123,29 @@ button {
   }
 }
 
+.session-mobile-picker {
+  display: none;
+  min-width: 0;
+  flex: 1 1 180px;
+}
+
+.session-mobile-picker .select {
+  width: 100%;
+  max-width: 280px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 @media (max-width: 820px) {
   .grid-2 {
     grid-template-columns: 1fr;
@@ -1134,6 +1157,10 @@ button {
 
   .panel-list {
     display: none;
+  }
+
+  .session-mobile-picker {
+    display: block;
   }
 
   .top-nav {
@@ -1149,6 +1176,22 @@ button {
     grid-template-columns: auto 1fr auto;
     gap: 10px;
   }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* Splash / onboarding */
@@ -1223,6 +1266,58 @@ button {
 }
 .badge-danger {
   background: color-mix(in srgb, #b91c1c 18%, transparent);
+  color: #b91c1c;
+}
+
+.recommend-card {
+  margin-bottom: 4px;
+}
+
+.recommend-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.recommend-item {
+  border: 1px solid color-mix(in srgb, var(--ink) 10%, transparent);
+  border-radius: calc(var(--radius) + 2px);
+  padding: 12px;
+  background: color-mix(in srgb, var(--surface) 88%, var(--bg));
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.recommend-item .btn {
+  margin-top: auto;
+}
+
+.tier-excellent {
+  background: color-mix(in srgb, #15803d 18%, transparent);
+  color: #15803d;
+  border-color: color-mix(in srgb, #15803d 35%, transparent);
+}
+
+.tier-good {
+  background: color-mix(in srgb, #0369a1 16%, transparent);
+  color: #0369a1;
+  border-color: color-mix(in srgb, #0369a1 30%, transparent);
+}
+
+.tier-tight {
+  background: color-mix(in srgb, #b45309 16%, transparent);
+  color: #b45309;
+  border-color: color-mix(in srgb, #b45309 30%, transparent);
+}
+
+.tier-cpu {
+  background: color-mix(in srgb, #6b7280 16%, transparent);
+  color: #4b5563;
+}
+
+.tier-too_heavy {
+  background: color-mix(in srgb, #b91c1c 14%, transparent);
   color: #b91c1c;
 }
 
