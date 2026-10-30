@@ -21,7 +21,7 @@ import type {
   StatusBarInfo,
   SystemInfo,
 } from "@kovi/shared";
-import { DEFAULT_GENERATION_PARAMS } from "@kovi/shared";
+import { DEFAULT_GENERATION_PARAMS, sessionToolsEnabled } from "@kovi/shared";
 import { AgentLoop } from "./agent/loop.js";
 import { ChatEngine } from "./chat/engine.js";
 import { buildProjectContext } from "./context/packer.js";
@@ -68,6 +68,9 @@ export class AppService {
   private lastTokensPerSecond: number | null = null;
   private agentStepLabel: string | null = null;
   private errorLog: string[] = [];
+  /** Serialize loadModel / startAgent to prevent parallel runs (P1-6). */
+  private loadModelChain: Promise<void> = Promise.resolve();
+  private agentStartLock = false;
 
   onRuntimeProgress?: (p: { progress: number; label: string }) => void;
   onDownloadProgress?: (p: { progress: number; label: string }) => void;
@@ -95,9 +98,16 @@ export class AppService {
         this.genStats.tokenApprox += Math.max(1, Math.round(p.text.length / 4));
       }
       this.onChatToken?.(p);
+      // Unified bus: UI listens to agentEvent for both chat and agent progress.
+      this.onAgentEvent?.({
+        sessionId: p.sessionId,
+        event: p.thinking
+          ? { type: "thinking", text: p.text }
+          : { type: "stream", text: p.text },
+      });
     });
     this.agent.setEventHandler((sessionId, event) => {
-      if (event.type === "token") {
+      if (event.type === "token" || event.type === "stream") {
         if (!this.genStats.startedAt) this.genStats.startedAt = Date.now();
         this.genStats.tokenChars += event.text.length;
         this.genStats.tokenApprox += Math.max(1, Math.round(event.text.length / 4));
@@ -111,6 +121,9 @@ export class AppService {
       if (event.type === "plan" && event.steps.length) {
         this.agentStepLabel = `план · ${event.steps.length}`;
       }
+      if (event.type === "started" && event.mode === "agent") {
+        this.agentStepLabel = "агент";
+      }
       if (event.type === "error") {
         this.pushErrorLog(`agent:${sessionId}`, event.message);
       }
@@ -119,6 +132,13 @@ export class AppService {
       }
       this.onAgentEvent?.({ sessionId, event });
     });
+  }
+
+  private emitGeneration(
+    sessionId: string,
+    event: import("@kovi/shared").AgentEvent,
+  ): void {
+    this.onAgentEvent?.({ sessionId, event });
   }
 
   private pushErrorLog(source: string, message: string): void {
@@ -330,53 +350,59 @@ export class AppService {
   }
 
   async loadModel(modelId: string, params?: Partial<GenerationParams>): Promise<void> {
-    const model = this.modelsCache.find((m) => m.id === modelId);
-    if (!model) throw new Error("Модель не найдена. Выполните сканирование.");
-    if (model.integrityOk === false) {
-      throw new Error(
-        `GGUF повреждён: ${model.integrityError || model.name}. Проверьте файл или скачайте заново.`,
-      );
-    }
-    const settings = this.settings.get();
-    const profile = settings.loadProfiles.find((p) => p.id === settings.activeLoadProfileId);
-    const profileParams: Partial<GenerationParams> = profile
-      ? {
-          gpuLayers: profile.gpuLayers,
-          context: profile.context,
-          flashAttn: profile.flashAttn,
-          maxTokens: profile.maxTokens ?? settings.defaultParams.maxTokens,
-        }
-      : {};
-    const merged: GenerationParams = {
-      ...DEFAULT_GENERATION_PARAMS,
-      ...settings.defaultParams,
-      gpuLayers: model.recommendedNgl,
-      context: model.recommendedContext,
-      ...profileParams,
-      ...params,
+    const run = async (): Promise<void> => {
+      const model = this.modelsCache.find((m) => m.id === modelId);
+      if (!model) throw new Error("Модель не найдена. Выполните сканирование.");
+      if (model.integrityOk === false) {
+        throw new Error(
+          `GGUF повреждён: ${model.integrityError || model.name}. Проверьте файл или скачайте заново.`,
+        );
+      }
+      const settings = this.settings.get();
+      const profile = settings.loadProfiles.find((p) => p.id === settings.activeLoadProfileId);
+      const profileParams: Partial<GenerationParams> = profile
+        ? {
+            gpuLayers: profile.gpuLayers,
+            context: profile.context,
+            flashAttn: profile.flashAttn,
+            maxTokens: profile.maxTokens ?? settings.defaultParams.maxTokens,
+          }
+        : {};
+      const merged: GenerationParams = {
+        ...DEFAULT_GENERATION_PARAMS,
+        ...settings.defaultParams,
+        gpuLayers: model.recommendedNgl,
+        context: model.recommendedContext,
+        ...profileParams,
+        ...params,
+      };
+      if (model.fitsInVram === false && merged.gpuLayers > 32) {
+        this.pushErrorLog(
+          "vram",
+          `Модель ${model.name} может не влезть в VRAM (ngl=${merged.gpuLayers}, ctx=${merged.context}).`,
+        );
+      }
+      await this.runtime.ensureInstalled(settings.runtimeBackendPreference);
+      this.resetGenStats();
+      try {
+        await this.runtime.loadModel(model, merged);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.pushErrorLog("loadModel", msg);
+        throw err;
+      }
+      if (settings.autoUpdateRuntime !== false) {
+        void this.ensureLatestRuntime(settings.runtimeBackendPreference).catch((err) => {
+          console.error("Background runtime update failed:", err);
+        });
+      }
     };
-    if (model.fitsInVram === false && merged.gpuLayers > 32) {
-      this.pushErrorLog(
-        "vram",
-        `Модель ${model.name} может не влезть в VRAM (ngl=${merged.gpuLayers}, ctx=${merged.context}).`,
-      );
-    }
-    // Do not block model load on GitHub updates — only ensure a local binary exists.
-    await this.runtime.ensureInstalled(settings.runtimeBackendPreference);
-    this.resetGenStats();
-    try {
-      await this.runtime.loadModel(model, merged);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.pushErrorLog("loadModel", msg);
-      throw err;
-    }
-    // Quiet update only AFTER model is up — ensureLatest defers while server is running.
-    if (settings.autoUpdateRuntime !== false) {
-      void this.ensureLatestRuntime(settings.runtimeBackendPreference).catch((err) => {
-        console.error("Background runtime update failed:", err);
-      });
-    }
+    const next = this.loadModelChain.then(run, run);
+    this.loadModelChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    await next;
   }
 
   unloadModel(): Promise<void> {
@@ -418,27 +444,42 @@ export class AppService {
   }
 
   /**
-   * Detect explicit agent intent prefixes so users can trigger tools without the toggle.
-   * Returns cleaned content and whether agent mode should be used.
+   * Decide chat vs agent: @agent prefix, coding intent, preferAgent flag, or projectRoot set.
+   * Empty payload after @agent throws via sendMessage (returns useAgent + empty content marker).
    */
   static parseAgentIntent(
     content: string,
     preferAgent: boolean,
-  ): { content: string; useAgent: boolean } {
+    opts?: { projectRoot?: string | null },
+  ): { content: string; useAgent: boolean; emptyAgentPrefix?: boolean } {
     const trimmed = content.trim();
     const prefix = trimmed.match(/^(@agent|\/agent)\b[\s:]*/i);
     if (prefix) {
-      return { content: trimmed.slice(prefix[0].length).trim() || trimmed, useAgent: true };
+      const rest = trimmed.slice(prefix[0].length).trim();
+      if (!rest) {
+        return { content: "", useAgent: true, emptyAgentPrefix: true };
+      }
+      return { content: rest, useAgent: true };
     }
-    // Coding / file-creation asks work poorly in plain chat (truncated, no write_file).
+    // Coding: verb stem + concrete artifact (avoid everyday "напиши мне" / "создай настроение").
+    // Note: JS `\b` is ASCII-only — do not rely on it for Cyrillic stems.
     const codingIntent =
-      /(напис\p{L}*|напиш\p{L}*|созда\p{L}*|сдела\p{L}*|реализ\p{L}*|постро\p{L}*).{0,80}(игр[уыае]|программ|скрипт|файл|проект|приложение|tetris|тетрис)/iu.test(
+      /(напис\p{L}*|напиш\p{L}*|созда\p{L}*|сдела\p{L}*|реализ\p{L}*|постро\p{L}*|исправ\p{L}*|добав\p{L}*|перепиш\p{L}*|рефактор\p{L}*).{0,100}(игр[уыае]|программ\p{L}*|скрипт\p{L}*|файл\p{L}*|проект\p{L}*|приложени\p{L}*|код\p{L}*|модул\p{L}*|функци\p{L}*|класс\p{L}*|auth|tetris|тетрис|\.py|\.ts|\.js|\.tsx)/iu.test(
         trimmed,
       ) ||
-      /\b(write|create|implement|build)\b.{0,80}\b(game|app|file|script|python|tetris)\b/i.test(
+      /\b(write|create|implement|build|fix|edit|refactor|rewrite)\b.{0,80}\b(game|app|file|script|python|module|function|auth|tetris|code|\.py|\.ts|\.js)\b/i.test(
         trimmed,
       );
-    return { content: trimmed, useAgent: preferAgent || codingIntent };
+    const hasProject = Boolean(opts?.projectRoot && String(opts.projectRoot).trim());
+    const projectAction =
+      hasProject &&
+      /(файл|код|проект|папк|каталог|исправ|добав|удал|созда|напиш|перепиш|проверь|запуст|терминал|рефактор|@|\.py|\.ts|\.js|readme|agents\.md|search|list_dir|write_file)/i.test(
+        trimmed,
+      );
+    return {
+      content: trimmed,
+      useAgent: preferAgent || codingIntent || projectAction,
+    };
   }
 
   async sendChat(
@@ -452,6 +493,7 @@ export class AppService {
     const session = this.store.listSessions().find((s) => s.id === sessionId);
     if (!session) throw new Error("Сессия не найдена");
     this.noteGenerationStart();
+    this.emitGeneration(sessionId, { type: "started", mode: "chat" });
     const merged = { ...session.params, ...params };
     const settings = this.settings.get();
     let system = session.systemPrompt;
@@ -463,7 +505,7 @@ export class AppService {
           userQuery: content,
           baseSystem: session.systemPrompt,
           toolBlock:
-            "Инструменты недоступны в обычном чате. Для правок файлов включите режим агента (/agent).",
+            "Инструменты недоступны в этом ответе. Для правок файлов начните с @agent или опишите задачу по коду.",
           contextTokens: merged.context || 8192,
           reserveTokens: Math.min(Math.floor((merged.context || 8192) * 0.5), 4000),
         });
@@ -472,27 +514,54 @@ export class AppService {
         // fall back to bare system prompt
       }
     }
-    const result = await this.chat.send(sessionId, content, merged, system);
-    this.maybeRenameSession(session, content);
-    return result;
+    try {
+      const result = await this.chat.send(sessionId, content, merged, system);
+      this.maybeRenameSession(session, content);
+      this.emitGeneration(sessionId, { type: "done", messageId: result.id });
+      return result;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/отмен|abort/i.test(message)) {
+        this.emitGeneration(sessionId, { type: "cancelled" });
+        // Do not rethrow — avoids duplicate IPC error after cancel (P0-6).
+        return {
+          id: `cancelled-${Date.now()}`,
+          role: "assistant",
+          content: "(отменено)",
+          createdAt: new Date().toISOString(),
+        };
+      }
+      this.pushErrorLog(`chat:${sessionId}`, message);
+      this.emitGeneration(sessionId, { type: "error", message });
+      throw err;
+    }
   }
 
   /**
-   * Unified path: one conversation can do plain completions or the agent/tool loop.
-   * When useAgent is true, returns void (progress via agent events); otherwise returns assistant message.
+   * Unified send: progress always via onAgentEvent (started → … → done/error/cancelled).
+   * Fire-and-forget from IPC — resolves without a ChatMessage when agent path is used.
    */
   async sendMessage(
     sessionId: string,
     content: string,
     opts?: { useAgent?: boolean; params?: Partial<GenerationParams> },
-  ): Promise<ChatMessage | void> {
-    const parsed = AppService.parseAgentIntent(content, Boolean(opts?.useAgent));
+  ): Promise<void> {
+    const settings = this.settings.get();
+    const session = this.store.listSessions().find((s) => s.id === sessionId);
+    const preferAgent =
+      opts?.useAgent ?? (session ? sessionToolsEnabled(session) : false);
+    const parsed = AppService.parseAgentIntent(content, preferAgent, {
+      projectRoot: settings.projectRoot,
+    });
+    if (parsed.emptyAgentPrefix) {
+      throw new Error("После @agent укажите задачу (например: @agent list files)");
+    }
     if (!parsed.content) throw new Error("Пустое сообщение");
     if (parsed.useAgent) {
       await this.startAgent(sessionId, parsed.content);
       return;
     }
-    return this.sendChat(sessionId, parsed.content, opts?.params);
+    await this.sendChat(sessionId, parsed.content, opts?.params);
   }
 
   stopGeneration(): void {
@@ -507,47 +576,52 @@ export class AppService {
   }
 
   async startAgent(sessionId: string, content: string): Promise<void> {
-    if (this.agent.isRunning()) {
+    if (this.agent.isRunning() || this.agentStartLock) {
       throw new Error("Агент уже выполняется");
     }
-    if (this.chat.isBusy()) {
-      this.chat.stop();
-    }
-    const session = this.store.listSessions().find((s) => s.id === sessionId);
-    if (!session) throw new Error("Сессия не найдена");
-    const settings = this.settings.get();
-    if (settings.fileAccessMode === "project") {
-      if (!settings.projectRoot) {
-        throw new Error(
-          "Режим project: выберите папку проекта в Настройках перед запуском агента",
+    this.agentStartLock = true;
+    try {
+      if (this.chat.isBusy()) {
+        this.chat.stop();
+      }
+      const session = this.store.listSessions().find((s) => s.id === sessionId);
+      if (!session) throw new Error("Сессия не найдена");
+      const settings = this.settings.get();
+      if (settings.fileAccessMode === "project") {
+        if (!settings.projectRoot) {
+          throw new Error(
+            "Режим project: выберите папку проекта в Настройках перед запуском агента",
+          );
+        }
+        try {
+          const st = fs.statSync(settings.projectRoot);
+          if (!st.isDirectory()) {
+            throw new Error(`Папка проекта не является каталогом: ${settings.projectRoot}`);
+          }
+        } catch (err) {
+          if (err instanceof Error && /Настройках|каталогом/.test(err.message)) throw err;
+          throw new Error(`Папка проекта недоступна: ${settings.projectRoot}`);
+        }
+      } else if (!settings.projectRoot) {
+        this.pushErrorLog(
+          "agent",
+          "Папка проекта не задана — shell/относительные пути могут не работать. Укажите projectRoot в Настройках.",
         );
       }
-      try {
-        const st = fs.statSync(settings.projectRoot);
-        if (!st.isDirectory()) {
-          throw new Error(`Папка проекта не является каталогом: ${settings.projectRoot}`);
-        }
-      } catch (err) {
-        if (err instanceof Error && /Настройках|каталогом/.test(err.message)) throw err;
-        throw new Error(`Папка проекта недоступна: ${settings.projectRoot}`);
-      }
-    } else if (!settings.projectRoot) {
-      this.pushErrorLog(
-        "agent",
-        "Папка проекта не задана — shell/относительные пути могут не работать. Укажите projectRoot в Настройках.",
+      await this.runtime.assertLlmReady();
+      this.emitGeneration(sessionId, { type: "started", mode: "agent" });
+      this.noteGenerationStart();
+      this.maybeRenameSession(session, content);
+      await this.agent.run(
+        sessionId,
+        content,
+        settings,
+        session.params,
+        session.systemPrompt,
       );
+    } finally {
+      this.agentStartLock = false;
     }
-    // Fail fast with a clear message instead of opaque "fetch failed" mid-loop.
-    await this.runtime.assertLlmReady();
-    this.noteGenerationStart();
-    this.maybeRenameSession(session, content);
-    await this.agent.run(
-      sessionId,
-      content,
-      settings,
-      session.params,
-      session.systemPrompt,
-    );
   }
 
   resolveConfirmation(

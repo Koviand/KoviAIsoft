@@ -16,10 +16,22 @@ export function App() {
   const rejectBtnRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
-    if (state.pendingConfirm?.risk === "high") {
+    if (state.pendingConfirm) {
       rejectBtnRef.current?.focus();
     }
   }, [state.pendingConfirm?.id, state.pendingConfirm?.risk]);
+
+  useEffect(() => {
+    if (!state.pendingConfirm) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !state.confirmBusy) {
+        e.preventDefault();
+        void state.resolvePendingConfirm(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [state.pendingConfirm?.id, state.confirmBusy, state.resolvePendingConfirm, state.pendingConfirm]);
 
   if (state.booting) {
     return (
@@ -62,6 +74,7 @@ export function App() {
             .catch((e) => state.setError(e instanceof Error ? e.message : String(e)));
         }}
         onStop={() => {
+          // ChatPage also listens; Topbar Stop must not leave composer writable mid-flight alone.
           void api
             .stopGeneration()
             .finally(() => {
@@ -72,7 +85,7 @@ export function App() {
             });
         }}
       />
-      <main className="main">
+      <main className="main" aria-hidden={Boolean(state.pendingConfirm)}>
         {!isElectronBridge && (
           <div className="confirm-banner error-banner" role="status">
             <div>
@@ -162,13 +175,18 @@ export function App() {
             </div>
           </div>
         )}
-        {state.view === "chat" && (
+        {/* Keep Chat mounted (hidden) so ProcessTimeline survives Models/Runtime navigation. */}
+        <div
+          style={{ display: state.view === "chat" ? undefined : "none" }}
+          aria-hidden={state.view !== "chat"}
+        >
           <ChatPage
             sessions={state.sessions}
             activeSessionId={state.activeSessionId}
             messages={state.messages}
-            busy={state.generating}
+            busy={state.generating || Boolean(state.pendingConfirm)}
             settings={state.settings}
+            pendingConfirmSummary={state.pendingConfirm?.summary ?? null}
             setSessions={state.setSessions}
             setActiveSessionId={state.setActiveSessionId}
             setMessages={state.setMessages}
@@ -176,7 +194,7 @@ export function App() {
             setError={state.setError}
             setSettings={state.setSettings}
           />
-        )}
+        </div>
         {state.view === "models" && (
           <ModelsPage
             models={state.models}

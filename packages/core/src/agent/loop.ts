@@ -1,3 +1,4 @@
+import path from "node:path";
 import { v4 as uuid } from "uuid";
 import type {
   AgentConfirmation,
@@ -105,6 +106,15 @@ const FILE_MUTATION_TOOLS = new Set(["write_file", "apply_patch"]);
 /** Heuristic: stub/skeleton writes that should not unlock final for coding tasks. */
 const MIN_CODING_WRITE_CHARS = 400;
 
+function minWriteCharsForPath(filePath: string): number {
+  const ext = path.extname(filePath).toLowerCase();
+  if ([".md", ".txt", ".json", ".yml", ".yaml", ".toml", ".ini", ".cfg"].includes(ext)) {
+    return 40;
+  }
+  if ([".css", ".html", ".svg"].includes(ext)) return 80;
+  return MIN_CODING_WRITE_CHARS;
+}
+
 type EventFn = (sessionId: string, event: AgentEvent) => void;
 
 interface ParsedAction {
@@ -114,17 +124,54 @@ interface ParsedAction {
   final?: string | null;
 }
 
+function extractBalancedObject(raw: string): string | null {
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (inStr) {
+      if (esc) {
+        esc = false;
+      } else if (ch === "\\") {
+        esc = true;
+      } else if (ch === '"') {
+        inStr = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return raw.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
 function extractJson(text: string): ParsedAction | null {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const raw = fence?.[1] || text;
-  const start = raw.indexOf("{");
-  const end = raw.lastIndexOf("}");
-  if (start < 0 || end <= start) return null;
-  try {
-    return JSON.parse(raw.slice(start, end + 1)) as ParsedAction;
-  } catch {
-    return null;
+  const candidates = [extractBalancedObject(raw), (() => {
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start < 0 || end <= start) return null;
+    return raw.slice(start, end + 1);
+  })()].filter(Boolean) as string[];
+  for (const piece of candidates) {
+    try {
+      return JSON.parse(piece) as ParsedAction;
+    } catch {
+      // try next
+    }
   }
+  return null;
 }
 
 export class AgentLoop {
@@ -331,8 +378,10 @@ export class AgentLoop {
     try {
       this.store.addMessage(sessionId, { role: "user", content: userContent });
       const ctxWindow = params.context || 8192;
+      const compactTools = ctxWindow < 8192;
       const toolBlock = toolsPromptBlock(
         this.mcp.listTools().map((t) => ({ name: t.name, description: t.description })),
+        { compact: compactTools },
       );
 
       // Cursor-like layered context: tools + rules + retrieval + project map (budgeted).
@@ -342,7 +391,11 @@ export class AgentLoop {
         baseSystem: systemPrompt,
         toolBlock,
         contextTokens: ctxWindow,
-        reserveTokens: Math.min(Math.floor(ctxWindow * 0.42), 3500),
+        // Smaller reserve for tiny ctx so tools+map fit (P1-15).
+        reserveTokens: Math.min(
+          Math.floor(ctxWindow * (ctxWindow < 8192 ? 0.28 : 0.42)),
+          ctxWindow < 8192 ? 1800 : 3500,
+        ),
       });
       this.emit(sessionId, {
         type: "thinking",
@@ -506,7 +559,7 @@ export class AgentLoop {
             content: parsed.final,
             thinking: parsed.thought,
           });
-          this.emit(sessionId, { type: "token", text: parsed.final });
+          this.emit(sessionId, { type: "stream", text: parsed.final });
           this.emit(sessionId, { type: "done", messageId: msg.id });
           return;
         }
@@ -558,6 +611,7 @@ export class AgentLoop {
             callId,
             result: summary,
           });
+          this.emit(sessionId, { type: "stream", text: summary });
           this.emit(sessionId, { type: "done", messageId: msg.id });
           return;
         }
@@ -586,7 +640,8 @@ export class AgentLoop {
               toolName === "write_file"
                 ? String(normalizedArgs.content ?? "").length
                 : String(normalizedArgs.newText ?? "").length;
-            if (contentLen >= MIN_CODING_WRITE_CHARS) {
+            const targetPath = String(normalizedArgs.path ?? args.path ?? "");
+            if (contentLen >= minWriteCharsForPath(targetPath)) {
               substantialWrite = true;
             }
           }
@@ -615,7 +670,8 @@ export class AgentLoop {
           if (
             wantsFiles &&
             toolName === "write_file" &&
-            String(normalizedArgs.content ?? "").length < MIN_CODING_WRITE_CHARS
+            String(normalizedArgs.content ?? "").length <
+              minWriteCharsForPath(String(normalizedArgs.path ?? args.path ?? ""))
           ) {
             followUp += `\n\nЗамечание: файл получился коротким (stub). Продолжи: допиши полную реализацию через write_file/apply_patch. Не вызывай final, пока программа не работает.`;
           }

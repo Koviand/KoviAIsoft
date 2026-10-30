@@ -12,7 +12,7 @@ describe("unified send / session tools", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("parses @agent / /agent prefixes", () => {
+  it("parses @agent / /agent prefixes and project actions", () => {
     expect(AppService.parseAgentIntent("hello", false)).toEqual({
       content: "hello",
       useAgent: false,
@@ -29,12 +29,50 @@ describe("unified send / session tools", () => {
       content: "do stuff",
       useAgent: true,
     });
+    expect(AppService.parseAgentIntent("@agent", false).emptyAgentPrefix).toBe(true);
     expect(
       AppService.parseAgentIntent(
         "Я хочу чтобы ты написал игру Tetris на Python",
         false,
       ).useAgent,
     ).toBe(true);
+    expect(
+      AppService.parseAgentIntent("перепиши auth модуль", false, {
+        projectRoot: "C:\\proj",
+      }).useAgent,
+    ).toBe(true);
+    expect(
+      AppService.parseAgentIntent("привет", false, {
+        projectRoot: "C:\\proj",
+      }).useAgent,
+    ).toBe(false);
+    expect(
+      AppService.parseAgentIntent("исправь файл main.py", false, {
+        projectRoot: "C:\\proj",
+      }).useAgent,
+    ).toBe(true);
+  });
+
+  it("sendMessage respects session toolsEnabled and rejects empty @agent", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kovi-tools-"));
+    const svc = new AppService(dir);
+    await svc.init();
+    try {
+      await expect(svc.sendMessage("missing", "@agent")).rejects.toThrow();
+      const chat = svc.createSession("chat", "tools-on");
+      await expect(svc.sendMessage(chat.id, "@agent")).rejects.toThrow(/@agent/);
+
+      svc.setSessionToolsEnabled(chat.id, true);
+      let agentStarted = false;
+      svc.startAgent = async () => {
+        agentStarted = true;
+      };
+      await svc.sendMessage(chat.id, "просто вопрос без coding");
+      expect(agentStarted).toBe(true);
+    } finally {
+      await svc.dispose();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("normalizes legacy agent sessions and toolsEnabled", async () => {

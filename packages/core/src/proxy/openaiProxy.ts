@@ -20,6 +20,17 @@ export class OpenAiProxy {
         res.end(JSON.stringify({ error: "Model not loaded" }));
         return;
       }
+      // Optional bearer for local proxy (P2-9): KOVI_PROXY_TOKEN
+      const required = process.env.KOVI_PROXY_TOKEN?.trim();
+      if (required) {
+        const auth = String(req.headers.authorization || "");
+        const got = auth.replace(/^Bearer\s+/i, "").trim();
+        if (got !== required) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unauthorized" }));
+          return;
+        }
+      }
       try {
         const url = new URL(req.url || "/", `http://127.0.0.1:${port}`);
         const target = `${base}${url.pathname}${url.search}`.replace(/\/v1\/v1/, "/v1");

@@ -225,8 +225,8 @@ export class ChatEngine {
         }
       }
     } catch (err) {
-      if ((err as Error).name === "AbortError") {
-        // partial save
+      if ((err as Error).name === "AbortError" || signal.aborted) {
+        // fall through to cancel path below
       } else {
         this.abort = null;
         this.activeSessionId = null;
@@ -234,7 +234,21 @@ export class ChatEngine {
       }
     }
 
-    let finalContent = content || (signal.aborted ? "(остановлено)" : "(пусто)");
+    if (signal.aborted) {
+      if (content.trim()) {
+        this.store.addMessage(sessionId, {
+          id: uuid(),
+          role: "assistant",
+          content: content + "\n\n(остановлено)",
+          thinking: thinking || undefined,
+        });
+      }
+      this.abort = null;
+      this.activeSessionId = null;
+      throw new Error("Отменено");
+    }
+
+    let finalContent = content || "(пусто)";
     if (truncated) {
       finalContent +=
         "\n\n⚠️ Ответ обрезан по лимиту max tokens. Увеличьте параметр «Макс. токены» в параметрах диалога или попросите продолжить.";

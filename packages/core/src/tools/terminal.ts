@@ -242,7 +242,12 @@ export async function runTerminal(
   if (!rawCmd) throw new Error("Пустая команда run_terminal");
 
   const resolvedCwd = resolveTerminalCwd(cwd, settings.projectRoot);
-  assertTerminalCwd(resolvedCwd, settings.fileAccessMode, settings.projectRoot);
+  assertTerminalCwd(
+    resolvedCwd,
+    settings.fileAccessMode,
+    settings.projectRoot,
+    settings.modelRoots || [],
+  );
 
   let st: fs.Stats;
   try {

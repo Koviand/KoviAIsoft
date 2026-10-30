@@ -105,6 +105,15 @@ export function resolveAgentPath(
 
   input = input.replace(/\//g, path.sep);
 
+  // Reject NTFS ADS-looking paths: file.txt:stream (drive letter colon is ok).
+  if (/^[a-zA-Z]:/.test(input)) {
+    if (input.slice(2).includes(":")) {
+      throw new Error(`Подозрительный путь (ADS/stream): ${input}`);
+    }
+  } else if (input.includes(":")) {
+    throw new Error(`Подозрительный путь (ADS/stream): ${input}`);
+  }
+
   if (!path.isAbsolute(input)) {
     if (!projectRoot) {
       throw new Error(`Относительный путь «${input}» требует папку проекта`);
@@ -245,18 +254,20 @@ export function assertAllowedPath(
 }
 
 export function isDangerousSystemDir(target: string): boolean {
-  const p = normalizePath(target).toLowerCase().replace(/\\+$/, "");
-  const blocked = [
-    "c:\\windows",
-    "c:\\program files",
-    "c:\\program files (x86)",
-    "c:\\programdata",
-    "c:\\$recycle.bin",
-    "c:\\system volume information",
-  ];
-  if (blocked.some((b) => p === b || p.startsWith(b + "\\"))) return true;
-  const bare = p.replace(/\\+$/, "");
-  if (/^[a-z]:$/.test(bare)) return true;
+  let p = normalizePath(target).toLowerCase().replace(/\\+$/, "");
+  // Strip \\?\ / \\.\ prefixes
+  p = p.replace(/^\\\\\?\\/, "").replace(/^\\\\\.\\/, "");
+  if (/^[a-z]:$/.test(p)) return true;
+  // Any drive's Windows / Program Files / sensitive roots
+  if (/^[a-z]:\\windows(\\|$)/.test(p)) return true;
+  if (/^[a-z]:\\program files( \(x86\))?(\\|$)/.test(p)) return true;
+  if (/^[a-z]:\\programdata(\\|$)/.test(p)) return true;
+  if (/^[a-z]:\\\$recycle\.bin(\\|$)/.test(p)) return true;
+  if (/^[a-z]:\\system volume information(\\|$)/.test(p)) return true;
+  // User secrets
+  if (/\\users\\[^\\]+\\\.ssh(\\|$)/.test(p)) return true;
+  if (/\\users\\[^\\]+\\\.gnupg(\\|$)/.test(p)) return true;
+  if (/\\users\\[^\\]+\\appdata\\roaming\\gnupg(\\|$)/.test(p)) return true;
   return false;
 }
 
@@ -268,12 +279,13 @@ export function isDangerousWrite(target: string): boolean {
 /**
  * Working directory policy for run_terminal (Windows agent).
  * - project mode: must stay inside projectRoot
- * - disk mode: any existing folder except critical system paths
+ * - disk mode: must stay inside projectRoot ∪ modelRoots (same as file tools)
  */
 export function assertTerminalCwd(
   cwd: string,
   mode: FileAccessMode,
   projectRoot: string | null,
+  roots: string[] = [],
 ): void {
   const resolved = normalizePath(cwd);
   if (isDangerousSystemDir(resolved)) {
@@ -288,6 +300,23 @@ export function assertTerminalCwd(
     if (!isPathInside(resolved, projectRoot) && !isPathInside(cwdReal, rootReal)) {
       throw new Error(`cwd вне папки проекта: ${resolved}`);
     }
+    return;
+  }
+  // disk: same roots policy as assertAllowedPath
+  const allowed = [...roots];
+  if (projectRoot) allowed.push(projectRoot);
+  if (allowed.length === 0) {
+    throw new Error(
+      "Режим disk: задайте папки моделей или папку проекта для shell cwd",
+    );
+  }
+  const cwdReal = realPathSafe(resolved);
+  const ok = allowed.some((root) => {
+    const rootReal = realPathSafe(root);
+    return isPathInside(resolved, root) || isPathInside(cwdReal, rootReal);
+  });
+  if (!ok) {
+    throw new Error(`cwd вне разрешённых папок: ${resolved}`);
   }
 }
 
@@ -295,6 +324,7 @@ export const NEVER_REMEMBER_TOOLS = new Set([
   "run_terminal",
   "browser_click",
   "browser_type",
+  "browser_navigate",
 ]);
 
 export function approvalRememberKey(
@@ -320,7 +350,11 @@ export function riskForTool(
   args: Record<string, unknown>,
   projectRoot: string | null = null,
 ): "low" | "medium" | "high" {
-  if (["run_terminal", "browser_click", "browser_type"].includes(name)) return "high";
+  if (["run_terminal", "browser_click", "browser_type", "browser_navigate"].includes(name)) {
+    return "high";
+  }
+  if (name === "browser_snapshot") return "medium";
+  if (name.startsWith("mcp_")) return "medium";
   if (name === "delete_path") {
     const p = String(args.path || args.file || "");
     if (p && isDangerousSystemDir(p)) return "high";

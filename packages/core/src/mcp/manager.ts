@@ -60,10 +60,32 @@ export class McpManager {
         const client = new sdk.Client({ name: "KoviAIsoft", version: "0.1.0" });
         if (cfg.transport === "stdio") {
           if (!cfg.command) continue;
+          // Allowlist env — never pass full process.env (tokens/secrets) (P1-17).
+          const allowKeys = [
+            "PATH",
+            "PATHEXT",
+            "SystemRoot",
+            "TEMP",
+            "TMP",
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "LANG",
+            "ComSpec",
+          ];
+          const safeEnv: Record<string, string> = {};
+          for (const k of allowKeys) {
+            const v = process.env[k];
+            if (typeof v === "string") safeEnv[k] = v;
+          }
+          for (const [k, v] of Object.entries(cfg.env || {})) {
+            if (typeof v === "string") safeEnv[k] = v;
+          }
           const transport = new sdk.StdioClientTransport({
             command: cfg.command,
             args: cfg.args || [],
-            env: { ...process.env, ...(cfg.env || {}) } as Record<string, string>,
+            env: safeEnv,
           });
           await client.connect(transport);
         } else {

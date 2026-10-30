@@ -251,18 +251,29 @@ export interface AgentConfirmation {
   diff?: string;
 }
 
+/** Unified generation progress for chat streaming and agent/tool loops. */
 export type AgentEvent =
+  | { type: "started"; mode: "chat" | "agent" }
   | { type: "plan"; steps: AgentPlanStep[] }
   | { type: "step_start"; stepId: string }
   | { type: "step_done"; stepId: string; detail?: string }
   | { type: "tool_call"; name: string; args: Record<string, unknown>; callId: string }
   | { type: "tool_result"; callId: string; result: string; isError?: boolean }
   | { type: "confirmation_required"; confirmation: AgentConfirmation }
+  /**
+   * @deprecated Prefer `stream`. Agent no longer emits `token` (P0-4 / P2-11).
+   * Kept for older UI builds.
+   */
   | { type: "token"; text: string }
+  /** Live assistant text chunks (chat SSE + agent finals). */
+  | { type: "stream"; text: string }
   | { type: "thinking"; text: string }
   | { type: "done"; messageId: string }
   | { type: "error"; message: string }
   | { type: "cancelled" };
+
+/** @deprecated Alias — use AgentEvent (covers chat + agent). */
+export type GenerationEvent = AgentEvent;
 
 export interface McpServerConfig {
   id: string;

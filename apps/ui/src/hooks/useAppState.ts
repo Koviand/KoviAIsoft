@@ -103,6 +103,13 @@ export function useAppState() {
   useEffect(() => {
     const off = api.onAgentEvent((p) => {
       const ev = p.event;
+      if (ev.type === "started") {
+        setGenerating(true);
+        void api
+          .getStatusBar()
+          .then((bar) => setStatus({ ...bar, view: viewRef.current }))
+          .catch(() => undefined);
+      }
       if (ev.type === "confirmation_required") {
         setPendingConfirm({
           id: ev.confirmation.id,

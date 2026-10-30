@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { AppSettings, ChatMessage, ChatSession } from "@kovi/shared";
-import { sessionToolsEnabled } from "@kovi/shared";
+import type { AgentPlanStep, AppSettings, ChatMessage, ChatSession } from "@kovi/shared";
 import { api } from "../api";
-import { paramLabel, statusRu } from "../lib/labels";
+import {
+  ProcessTimeline,
+  type ProcessMode,
+  type ProcessToolItem,
+} from "../components/ProcessTimeline";
+import { paramLabel } from "../lib/labels";
 
 const PROMPT_CHIPS = [
   "Кратко объясни, что умеет этот чат",
@@ -18,14 +22,27 @@ function roleLabel(m: ChatMessage): string {
   return m.role;
 }
 
-function looksLikeAgentPrefix(text: string): boolean {
-  return /^(@agent|\/agent)\b/i.test(text.trim());
-}
-
 function sessionInitial(title: string): string {
   const t = title.trim();
   if (!t) return "Д";
   return t.slice(0, 1).toUpperCase();
+}
+
+function shortArgs(args: Record<string, unknown>): string {
+  try {
+    const keys = Object.keys(args);
+    if (!keys.length) return "";
+    const pick: Record<string, unknown> = {};
+    for (const k of keys.slice(0, 4)) {
+      const v = args[k];
+      if (typeof v === "string" && v.length > 80) pick[k] = `${v.slice(0, 80)}…`;
+      else pick[k] = v;
+    }
+    const s = JSON.stringify(pick);
+    return s.length > 160 ? `${s.slice(0, 160)}…` : s;
+  } catch {
+    return "";
+  }
 }
 
 export function ChatPage(props: {
@@ -34,6 +51,7 @@ export function ChatPage(props: {
   messages: ChatMessage[];
   busy: boolean;
   settings: AppSettings | null;
+  pendingConfirmSummary?: string | null;
   setSessions: (s: ChatSession[]) => void;
   setActiveSessionId: (id: string | null) => void;
   setMessages: (m: ChatMessage[]) => void;
@@ -44,19 +62,20 @@ export function ChatPage(props: {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState("");
   const [thinking, setThinking] = useState("");
-  const [plan, setPlan] = useState<Array<{ id: string; title: string; status: string }>>([]);
-  const [toolTrail, setToolTrail] = useState<
-    Array<{ callId: string; name: string; status: "running" | "done" | "error"; detail?: string }>
-  >([]);
-  const [agentOn, setAgentOn] = useState(false);
+  const [plan, setPlan] = useState<AgentPlanStep[]>([]);
+  const [toolTrail, setToolTrail] = useState<ProcessToolItem[]>([]);
+  const [genMode, setGenMode] = useState<ProcessMode>(null);
   const [showParams, setShowParams] = useState(false);
   const [sessionQuery, setSessionQuery] = useState("");
   const [folderFilter, setFolderFilter] = useState<string>("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const activeIdRef = useRef(props.activeSessionId);
-  /** Session currently receiving a stream — survives activeSessionId race on first send. */
+  /** Session that owns the in-flight generation (null after terminal event). */
   const streamSessionRef = useRef<string | null>(null);
+  /** Bumped on each send/stop so stale timers and late tokens are ignored. */
+  const generationEpochRef = useRef(0);
   const paramTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const folderTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   activeIdRef.current = props.activeSessionId;
 
   const activeSession = useMemo(
@@ -82,12 +101,7 @@ export function ChatPage(props: {
   }, [props.sessions, sessionQuery, folderFilter]);
 
   useEffect(() => {
-    if (!activeSession) {
-      setAgentOn(false);
-      return;
-    }
-    setAgentOn(sessionToolsEnabled(activeSession));
-    // Never wipe an in-flight stream when setActiveSessionId fires mid-send.
+    if (!activeSession) return;
     if (streamSessionRef.current && streamSessionRef.current === activeSession.id) {
       return;
     }
@@ -95,39 +109,106 @@ export function ChatPage(props: {
     setToolTrail([]);
     setStreaming("");
     setThinking("");
+    setGenMode(null);
   }, [activeSession?.id]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [props.messages, streaming, thinking, plan, toolTrail, props.busy]);
 
-  function acceptsStream(sessionId: string): boolean {
-    return (
-      sessionId === activeIdRef.current ||
-      sessionId === streamSessionRef.current
-    );
+  /** UI content updates only for the viewed session + current generation. */
+  function acceptsUiUpdate(sessionId: string, epoch: number): boolean {
+    if (epoch !== generationEpochRef.current) return false;
+    if (sessionId !== activeIdRef.current) return false;
+    if (streamSessionRef.current && sessionId !== streamSessionRef.current) return false;
+    return true;
   }
 
-  // Stream UI only — busy/confirm/errors/messages live in useAppState.
+  // Unified generation bus (chat stream + agent tools).
   useEffect(() => {
-    const offToken = api.onChatToken((p) => {
-      if (!acceptsStream(p.sessionId)) return;
-      if (p.thinking) setThinking((t) => t + p.text);
-      else setStreaming((t) => t + p.text);
-    });
     const offAgent = api.onAgentEvent((p) => {
-      if (!acceptsStream(p.sessionId)) return;
+      const epochAtEvent = generationEpochRef.current;
       const ev = p.event;
-      if (ev.type === "token") setStreaming((t) => t + ev.text);
-      if (ev.type === "thinking") setThinking((t) => t + (t ? "\n" : "") + ev.text);
+      const isTerminal =
+        ev.type === "done" || ev.type === "cancelled" || ev.type === "error";
+
+      // Always release busy for our in-flight generation even if user switched sessions.
+      if (isTerminal) {
+        const owns =
+          p.sessionId === streamSessionRef.current ||
+          (streamSessionRef.current == null && p.sessionId === activeIdRef.current);
+        if (owns || epochAtEvent === generationEpochRef.current) {
+          if (p.sessionId === streamSessionRef.current) {
+            streamSessionRef.current = null;
+          }
+          props.setBusy(false);
+          if (ev.type === "error" && acceptsUiUpdate(p.sessionId, epochAtEvent)) {
+            props.setError(ev.message);
+          }
+          const clearEpoch = epochAtEvent;
+          setTimeout(() => {
+            if (generationEpochRef.current !== clearEpoch) return;
+            if (activeIdRef.current !== p.sessionId) return;
+            setStreaming("");
+            setThinking("");
+            setGenMode(null);
+            setPlan([]);
+            setToolTrail([]);
+          }, 400);
+          if (p.sessionId === activeIdRef.current) {
+            void api.getMessages(p.sessionId).then((msgs) => {
+              if (generationEpochRef.current !== clearEpoch) return;
+              if (activeIdRef.current !== p.sessionId) return;
+              props.setMessages(msgs);
+            });
+          }
+        }
+        return;
+      }
+
+      if (!acceptsUiUpdate(p.sessionId, epochAtEvent)) return;
+
+      if (ev.type === "started") {
+        setPlan([]);
+        setToolTrail([]);
+        setStreaming("");
+        setThinking("");
+        setGenMode(ev.mode);
+        props.setBusy(true);
+      }
+      // Prefer stream only; ignore legacy token duplicates (P0-4).
+      if (ev.type === "stream") {
+        setStreaming((t) => t + ev.text);
+      }
+      if (ev.type === "thinking") {
+        setThinking((t) => t + (t ? "\n" : "") + ev.text);
+      }
       if (ev.type === "plan") {
         setPlan(ev.steps);
-        setAgentOn(true);
+      }
+      if (ev.type === "step_start") {
+        setPlan((prev) =>
+          prev.map((s) => (s.id === ev.stepId ? { ...s, status: "running" as const } : s)),
+        );
+      }
+      if (ev.type === "step_done") {
+        setPlan((prev) =>
+          prev.map((s) =>
+            s.id === ev.stepId
+              ? { ...s, status: "done" as const, detail: ev.detail }
+              : s,
+          ),
+        );
       }
       if (ev.type === "tool_call") {
         setToolTrail((prev) => [
           ...prev.filter((t) => t.callId !== ev.callId),
-          { callId: ev.callId, name: ev.name, status: "running" },
+          {
+            callId: ev.callId,
+            name: ev.name,
+            status: "running",
+            argsPreview: shortArgs(ev.args),
+          },
         ]);
       }
       if (ev.type === "tool_result") {
@@ -137,20 +218,14 @@ export function ChatPage(props: {
               ? {
                   ...t,
                   status: ev.isError ? "error" : "done",
-                  detail: ev.result.slice(0, 180),
+                  detail: ev.result.slice(0, 1200),
                 }
               : t,
           ),
         );
       }
-      if (ev.type === "done" || ev.type === "cancelled" || ev.type === "error") {
-        streamSessionRef.current = null;
-        setStreaming("");
-        setThinking("");
-      }
     });
     return () => {
-      offToken();
       offAgent();
     };
   }, []);
@@ -158,32 +233,15 @@ export function ChatPage(props: {
   useEffect(() => {
     return () => {
       if (paramTimer.current) clearTimeout(paramTimer.current);
+      if (folderTimer.current) clearTimeout(folderTimer.current);
     };
   }, []);
 
-  /** Create session without activating until we have content (avoids wiping optimistic UI). */
   async function ensureSessionId(): Promise<{ id: string; existed: boolean }> {
     if (props.activeSessionId) return { id: props.activeSessionId, existed: true };
     const session = await api.createSession("chat");
     props.setSessions(await api.listSessions());
     return { id: session.id, existed: false };
-  }
-
-  async function persistAgentPref(enabled: boolean): Promise<void> {
-    setAgentOn(enabled);
-    if (!activeSession) return;
-    try {
-      const next: ChatSession = {
-        ...activeSession,
-        toolsEnabled: enabled,
-        mode: enabled ? "agent" : "chat",
-      };
-      await api.updateSession(next);
-      props.setSessions(await api.listSessions());
-    } catch (e) {
-      setAgentOn(!enabled);
-      props.setError(e instanceof Error ? e.message : String(e));
-    }
   }
 
   function scheduleSessionPatch(next: ChatSession): void {
@@ -199,17 +257,19 @@ export function ChatPage(props: {
   async function onSend(overrideText?: string): Promise<void> {
     const text = (overrideText ?? input).trim();
     if (!text || props.busy) return;
-    const useAgent = agentOn || looksLikeAgentPrefix(text);
     setInput("");
     setStreaming("");
     setThinking("");
     setPlan([]);
     setToolTrail([]);
+    setGenMode(null);
+    generationEpochRef.current += 1;
+    const epoch = generationEpochRef.current;
     props.setBusy(true);
     props.setError(null);
     try {
       const { id: sessionId, existed } = await ensureSessionId();
-      // Pin stream target before React re-renders so early tokens are not dropped.
+      if (generationEpochRef.current !== epoch) return;
       streamSessionRef.current = sessionId;
       activeIdRef.current = sessionId;
       const baseMsgs = existed ? props.messages : [];
@@ -222,22 +282,15 @@ export function ChatPage(props: {
       props.setActiveSessionId(sessionId);
       props.setMessages([...baseMsgs, optimistic]);
 
-      const result = await api.sendMessage({
+      const session = props.sessions.find((s) => s.id === sessionId);
+      // Fire-and-forget: lifecycle via generation events (started/done/error).
+      await api.sendMessage({
         sessionId,
         content: text,
-        useAgent,
+        useAgent: session?.toolsEnabled === true ? true : undefined,
       });
-      if (!useAgent) {
-        const msgs = await api.getMessages(sessionId);
-        props.setMessages(msgs);
-        setStreaming("");
-        setThinking("");
-        streamSessionRef.current = null;
-        props.setBusy(false);
-        props.setSessions(await api.listSessions());
-        void result;
-      }
     } catch (e) {
+      if (generationEpochRef.current !== epoch) return;
       streamSessionRef.current = null;
       props.setError(e instanceof Error ? e.message : String(e));
       props.setBusy(false);
@@ -245,13 +298,18 @@ export function ChatPage(props: {
   }
 
   async function onStop(): Promise<void> {
+    // Invalidate late tokens immediately; stay busy until cancelled/done if possible.
+    generationEpochRef.current += 1;
+    streamSessionRef.current = null;
+    setStreaming("");
+    setThinking("");
     try {
       await api.stopGeneration();
     } finally {
-      streamSessionRef.current = null;
       props.setBusy(false);
-      setStreaming("");
-      setThinking("");
+      setGenMode(null);
+      setPlan([]);
+      setToolTrail([]);
       if (props.activeSessionId) {
         props.setMessages(await api.getMessages(props.activeSessionId));
       }
@@ -260,6 +318,12 @@ export function ChatPage(props: {
 
   async function onDeleteSession(id: string): Promise<void> {
     try {
+      if (props.busy && (streamSessionRef.current === id || props.activeSessionId === id)) {
+        generationEpochRef.current += 1;
+        streamSessionRef.current = null;
+        await api.stopGeneration();
+        props.setBusy(false);
+      }
       await api.deleteSession(id);
       const all = await api.listSessions();
       props.setSessions(all);
@@ -271,7 +335,10 @@ export function ChatPage(props: {
     }
   }
 
-  const isEmpty = props.messages.length === 0 && !streaming && !thinking;
+  const showProcess =
+    props.busy ||
+    Boolean(streaming || thinking || plan.length || toolTrail.length || props.pendingConfirmSummary);
+  const isEmpty = props.messages.length === 0 && !showProcess;
 
   async function exportActive(): Promise<void> {
     if (!props.activeSessionId) return;
@@ -358,9 +425,10 @@ export function ChatPage(props: {
         />
         {folders.length > 0 && (
           <select
-            className="select session-folder-filter"
+            className="input"
             value={folderFilter}
             onChange={(e) => setFolderFilter(e.target.value)}
+            aria-label="Фильтр папки"
           >
             <option value="">Все папки</option>
             {folders.map((f) => (
@@ -370,133 +438,86 @@ export function ChatPage(props: {
             ))}
           </select>
         )}
-        {filteredSessions.length === 0 && (
-          <div className="empty-hint">
-            {props.sessions.length === 0
-              ? "Пока нет диалогов — создайте первый."
-              : "Ничего не найдено."}
-          </div>
-        )}
-        {filteredSessions.map((s) => (
-          <div
-            key={s.id}
-            className={`list-item session-item ${props.activeSessionId === s.id ? "active" : ""}`}
-          >
-            <button
-              type="button"
-              className="session-select"
+        <div className="session-scroll">
+          {filteredSessions.map((s) => (
+            <div
+              key={s.id}
+              className={`session-item ${s.id === props.activeSessionId ? "active" : ""}`}
               onClick={() => props.setActiveSessionId(s.id)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  props.setActiveSessionId(s.id);
+                }
+              }}
+              role="button"
+              tabIndex={0}
             >
-              <span className="session-avatar" aria-hidden="true">
+              <div className="session-avatar" aria-hidden="true">
                 {sessionInitial(s.title)}
-              </span>
-              <span>
-                <div className="session-title">
-                  {s.title}
-                  {sessionToolsEnabled(s) ? <span className="badge">агент</span> : null}
-                </div>
-                <div className="muted session-meta">
+              </div>
+              <div className="session-meta">
+                <div className="session-title">{s.title}</div>
+                <div className="muted session-sub">
                   {s.folder ? `${s.folder} · ` : ""}
                   {new Date(s.updatedAt).toLocaleString()}
                 </div>
-              </span>
-            </button>
-            <button
-              type="button"
-              className="btn ghost icon-btn"
-              title="Удалить"
-              aria-label={`Удалить диалог ${s.title}`}
-              onClick={() => {
-                if (window.confirm(`Удалить диалог «${s.title}»?`)) {
+              </div>
+              <button
+                type="button"
+                className="btn ghost session-del"
+                title="Удалить"
+                aria-label={`Удалить диалог ${s.title}`}
+                onClick={(e) => {
+                  e.stopPropagation();
                   void onDeleteSession(s.id);
-                }
-              }}
-            >
-              ×
-            </button>
-          </div>
-        ))}
+                }}
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
       </div>
 
       <div className="panel-main chat-main">
-        <header className="chat-header">
-          <div>
-            <h1 className="h1">{activeSession?.title || "Диалог"}</h1>
-            <p className="muted chat-sub">
-              Обычный ответ или режим «Агент» (файлы, терминал, web). Enter — отправить
-            </p>
-          </div>
-          <div className="row" style={{ flexWrap: "wrap" }}>
-            <label className="session-mobile-picker">
-              <span className="sr-only">Диалог</span>
-              <select
-                className="select"
-                aria-label="Выбрать диалог"
-                value={props.activeSessionId || ""}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  if (v === "__new__") {
-                    void (async () => {
-                      try {
-                        const s = await api.createSession("chat");
-                        props.setSessions(await api.listSessions());
-                        props.setActiveSessionId(s.id);
-                      } catch (err) {
-                        props.setError(err instanceof Error ? err.message : String(err));
-                      }
-                    })();
-                    return;
-                  }
-                  props.setActiveSessionId(v || null);
-                }}
-              >
-                <option value="">Нет диалога</option>
-                <option value="__new__">+ Новый диалог</option>
-                {filteredSessions.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.title}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {activeSession ? (
-              <input
-                className="input"
-                style={{ width: 140 }}
-                placeholder="Папка"
-                defaultValue={activeSession.folder || ""}
-                key={`folder-${activeSession.id}-${activeSession.folder || ""}`}
-                onBlur={(e) => void setSessionFolder(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.currentTarget.blur();
-                  }
-                }}
-              />
-            ) : null}
-            <button className="btn ghost" type="button" disabled={!activeSession} onClick={() => void exportActive()}>
-              Экспорт
-            </button>
-            <button
-              className="btn ghost"
-              type="button"
-              onClick={() => setShowParams((v) => !v)}
-            >
-              {showParams ? "Скрыть параметры" : "Параметры"}
-            </button>
-            <button className="btn" type="button" disabled={!props.busy} onClick={() => void onStop()}>
-              Стоп
-            </button>
-          </div>
-        </header>
-
         <div className="chat-scroll">
-          <div className="chat-column">
-            {activeSession && showParams && (
-              <div className="card params-card">
-                <div className="muted" style={{ fontSize: "0.8rem", marginBottom: 8 }}>
-                  Параметры только для этого диалога (сохраняются автоматически)
-                </div>
+          <div className="chat-inner">
+            {activeSession && (
+              <div className="chat-session-bar row">
+                <button
+                  type="button"
+                  className="btn ghost"
+                  onClick={() => setShowParams((v) => !v)}
+                >
+                  Параметры
+                </button>
+                <input
+                  className="input"
+                  style={{ maxWidth: 180 }}
+                  placeholder="Папка…"
+                  value={activeSession.folder || ""}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    if (folderTimer.current) clearTimeout(folderTimer.current);
+                    folderTimer.current = setTimeout(() => {
+                      void setSessionFolder(value);
+                    }, 350);
+                  }}
+                />
+                <button type="button" className="btn ghost" onClick={() => void exportActive()}>
+                  Экспорт
+                </button>
+                {props.busy ? (
+                  <button type="button" className="btn danger" onClick={() => void onStop()}>
+                    Стоп
+                  </button>
+                ) : null}
+              </div>
+            )}
+
+            {showParams && activeSession && (
+              <div className="card">
                 <div className="row">
                   {(
                     [
@@ -546,29 +567,6 @@ export function ChatPage(props: {
               </div>
             )}
 
-            {plan.length > 0 && (
-              <div className="card plan-list">
-                <strong>План агента</strong>
-                {plan.map((p) => (
-                  <div key={p.id} className={`plan-item status-${p.status}`}>
-                    <span className="plan-status">{statusRu(p.status)}</span>
-                    <span>{p.title}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {toolTrail.length > 0 && (
-              <div className="tool-trail" style={{ width: "100%", padding: 0, margin: 0 }}>
-                {toolTrail.map((t) => (
-                  <div key={t.callId} className={`tool-chip status-${t.status}`}>
-                    <span className="mono">{t.name}</span>
-                    <span className="muted">{statusRu(t.status)}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-
             <div className="messages">
               {isEmpty && (
                 <div className="empty-chat">
@@ -576,8 +574,8 @@ export function ChatPage(props: {
                     Kovi<span>AI</span>soft
                   </div>
                   <p className="muted">
-                    Загрузите модель во вкладке «Модели», затем напишите сюда. Режим «Агент» —
-                    для файлов, терминала и инструментов.
+                    Загрузите модель во вкладке «Модели», затем спросите что угодно или попросите
+                    сделать задачу с файлами. Процесс ответа будет виден здесь.
                   </p>
                   <div className="prompt-chips">
                     {PROMPT_CHIPS.map((chip) => (
@@ -601,33 +599,17 @@ export function ChatPage(props: {
                   <div className="msg-body">{m.content}</div>
                 </div>
               ))}
-              {props.busy && !streaming && !thinking && (
-                <div className="msg assistant msg-enter streaming" aria-live="polite">
-                  <div className="role">Ассистент</div>
-                  <div className="msg-body gen-pending">
-                    <span className="gen-dots" aria-hidden="true" />
-                    {agentOn
-                      ? "Агент думает и готовит шаги…"
-                      : "Модель обрабатывает запрос (prefill)…"}
-                  </div>
-                </div>
-              )}
-              {(streaming || thinking) && (
-                <div className="msg assistant msg-enter streaming" aria-live="polite">
-                  <div className="role">Ассистент</div>
-                  {thinking ? (
-                    <div className="thinking">
-                      <div className="thinking-label">Размышление</div>
-                      {thinking}
-                      {!streaming ? <span className="caret" aria-hidden="true" /> : null}
-                    </div>
-                  ) : null}
-                  <div className="msg-body">
-                    {streaming}
-                    {streaming ? <span className="caret" aria-hidden="true" /> : null}
-                  </div>
-                </div>
-              )}
+              {showProcess ? (
+                <ProcessTimeline
+                  active={props.busy}
+                  mode={genMode}
+                  thinking={thinking}
+                  streaming={streaming}
+                  plan={plan}
+                  tools={toolTrail}
+                  confirmSummary={props.pendingConfirmSummary}
+                />
+              ) : null}
               <div ref={messagesEndRef} />
             </div>
           </div>
@@ -636,36 +618,15 @@ export function ChatPage(props: {
         <div className="composer-dock">
           <div className="composer">
             <div className="composer-toolbar">
-              <div className="segmented" role="group" aria-label="Режим">
-                <button
-                  type="button"
-                  className={!agentOn ? "on" : ""}
-                  onClick={() => void persistAgentPref(false)}
-                >
-                  Чат
-                </button>
-                <button
-                  type="button"
-                  className={agentOn ? "on" : ""}
-                  onClick={() => void persistAgentPref(true)}
-                >
-                  Агент
-                </button>
-              </div>
               <span className="muted composer-hint">
-                {agentOn
-                  ? "Агент пишет файлы и выполняет план — подтвердите опасные шаги"
-                  : "Чат отвечает текстом. Запросы вроде «напиши игру/код» сами включают агента"}
+                Один чат: ответы и действия с инструментами. Для явного запуска tools — префикс
+                @agent. Enter — отправить, Shift+Enter — новая строка.
               </span>
             </div>
             <textarea
               className="textarea composer-input"
               value={input}
-              placeholder={
-                agentOn
-                  ? "Опишите задачу агенту…"
-                  : "Сообщение… Enter — отправить, Shift+Enter — новая строка"
-              }
+              placeholder="Спросите или попросите сделать…"
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
@@ -681,7 +642,7 @@ export function ChatPage(props: {
                 disabled={props.busy || !input.trim()}
                 onClick={() => void onSend()}
               >
-                {agentOn ? "Запустить агента" : "Отправить"}
+                Отправить
               </button>
             </div>
           </div>

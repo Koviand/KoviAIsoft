@@ -1,6 +1,16 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
+
+const writeLocks = new Map<string, Promise<void>>();
+
+function tmpName(filePath: string): string {
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath);
+  const id = randomBytes(6).toString("hex");
+  return path.join(dir, `.${base}.${process.pid}.${id}.tmp`);
+}
 
 function replaceSync(tmp: string, filePath: string): void {
   try {
@@ -9,24 +19,13 @@ function replaceSync(tmp: string, filePath: string): void {
   } catch {
     // Windows often cannot rename over an existing target.
   }
+  // Prefer copy so a failed replace never deletes the target first.
+  fs.copyFileSync(tmp, filePath);
   try {
-    // Prefer copy over unlink+rename so a failed replace never deletes the target.
-    fs.copyFileSync(tmp, filePath);
-    try {
-      fs.unlinkSync(tmp);
-    } catch {
-      // ignore leftover tmp
-    }
-    return;
+    fs.unlinkSync(tmp);
   } catch {
-    // fall through
+    // ignore leftover tmp
   }
-  try {
-    fs.unlinkSync(filePath);
-  } catch {
-    // ignore missing target
-  }
-  fs.renameSync(tmp, filePath);
 }
 
 async function replaceAsync(tmp: string, filePath: string): Promise<void> {
@@ -36,30 +35,37 @@ async function replaceAsync(tmp: string, filePath: string): Promise<void> {
   } catch {
     // Windows often cannot rename over an existing target.
   }
+  await fsp.copyFile(tmp, filePath);
   try {
-    await fsp.copyFile(tmp, filePath);
-    try {
-      await fsp.unlink(tmp);
-    } catch {
-      // ignore leftover tmp
-    }
-    return;
+    await fsp.unlink(tmp);
   } catch {
-    // fall through
+    // ignore leftover tmp
   }
-  try {
-    await fsp.unlink(filePath);
-  } catch {
-    // ignore missing target
-  }
-  await fsp.rename(tmp, filePath);
 }
 
-/** Write file via temp + replace to avoid torn content on crash. */
+async function withPathLock(filePath: string, fn: () => Promise<void>): Promise<void> {
+  const key = path.resolve(filePath).toLowerCase();
+  const prev = writeLocks.get(key) || Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const tail = prev.then(() => gate);
+  writeLocks.set(key, tail);
+  await prev.catch(() => undefined);
+  try {
+    await fn();
+  } finally {
+    release();
+    if (writeLocks.get(key) === tail) writeLocks.delete(key);
+  }
+}
+
+/** Write file via unique temp + replace to avoid torn content on crash. */
 export function writeFileAtomicSync(filePath: string, content: string): void {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
-  const tmp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.tmp`);
+  const tmp = tmpName(filePath);
   try {
     fs.writeFileSync(tmp, content, "utf8");
     replaceSync(tmp, filePath);
@@ -74,18 +80,20 @@ export function writeFileAtomicSync(filePath: string, content: string): void {
 }
 
 export async function writeFileAtomic(filePath: string, content: string): Promise<void> {
-  const dir = path.dirname(filePath);
-  await fsp.mkdir(dir, { recursive: true });
-  const tmp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.tmp`);
-  try {
-    await fsp.writeFile(tmp, content, "utf8");
-    await replaceAsync(tmp, filePath);
-  } catch (err) {
+  await withPathLock(filePath, async () => {
+    const dir = path.dirname(filePath);
+    await fsp.mkdir(dir, { recursive: true });
+    const tmp = tmpName(filePath);
     try {
-      await fsp.unlink(tmp);
-    } catch {
-      // ignore
+      await fsp.writeFile(tmp, content, "utf8");
+      await replaceAsync(tmp, filePath);
+    } catch (err) {
+      try {
+        await fsp.unlink(tmp);
+      } catch {
+        // ignore
+      }
+      throw err;
     }
-    throw err;
-  }
+  });
 }

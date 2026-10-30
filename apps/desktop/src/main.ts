@@ -55,7 +55,50 @@ function isAllowedUiNavigation(url: string): boolean {
       return false;
     }
   }
-  return url.startsWith("file:");
+  // Packaged: only UI index.html (+ hash/query) — not arbitrary file: (P1-10).
+  if (!url.startsWith("file:")) return false;
+  try {
+    const u = new URL(url);
+    let filePath = decodeURIComponent(u.pathname);
+    // Windows file:///C:/path → /C:/path
+    if (process.platform === "win32" && /^\/[a-zA-Z]:\//.test(filePath)) {
+      filePath = filePath.slice(1);
+    }
+    const normalized = path.normalize(filePath).toLowerCase();
+    const allowedHtml = path.normalize(target).toLowerCase();
+    const allowedDir = path.normalize(path.dirname(target)).toLowerCase();
+    if (normalized === allowedHtml) return true;
+    // Allow hash-only navigations that resolve to the same index.html
+    return normalized.startsWith(allowedDir + path.sep) && normalized.endsWith("index.html");
+  } catch {
+    return false;
+  }
+}
+
+function isCancelErrorMessage(message: string): boolean {
+  return /отмен|abort/i.test(message);
+}
+
+function assertSendRequest(req: unknown): {
+  sessionId: string;
+  content: string;
+  useAgent?: boolean;
+  params?: unknown;
+} {
+  if (!req || typeof req !== "object") throw new Error("Некорректный запрос");
+  const r = req as Record<string, unknown>;
+  if (typeof r.sessionId !== "string" || !r.sessionId.trim()) {
+    throw new Error("sessionId обязателен");
+  }
+  if (typeof r.content !== "string") {
+    throw new Error("content должен быть строкой");
+  }
+  return {
+    sessionId: r.sessionId,
+    content: r.content,
+    useAgent: typeof r.useAgent === "boolean" ? r.useAgent : undefined,
+    params: r.params,
+  };
 }
 
 function hardenWindow(win: BrowserWindow): void {
@@ -205,7 +248,7 @@ async function createMonitorWindow(): Promise<void> {
     show: false,
     ...(icon ? { icon } : {}),
     webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
+      preload: path.join(__dirname, "monitorPreload.js"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -283,48 +326,44 @@ function registerIpc(svc: AppService): void {
   ipcMain.handle(IPC.updateSession, (_e, session) => svc.updateSession(session));
   ipcMain.handle(IPC.deleteSession, (_e, sessionId) => svc.deleteSession(sessionId));
   ipcMain.handle(IPC.getMessages, (_e, sessionId) => svc.getMessages(sessionId));
-  ipcMain.handle(IPC.sendChat, (_e, req) =>
-    svc.sendChat(req.sessionId, req.content, req.params),
-  );
+  // Deprecated thin wrappers — UI uses sendMessage / stopGeneration.
+  ipcMain.handle(IPC.sendChat, (_e, req) => {
+    const r = assertSendRequest(req);
+    return svc.sendChat(r.sessionId, r.content, r.params as never);
+  });
+  // Always fire-and-forget: completion is signaled via agentEvent (started/done/error).
   ipcMain.handle(IPC.sendMessage, async (_e, req) => {
-    if (req.useAgent) {
-      void svc
-        .sendMessage(req.sessionId, req.content, {
-          useAgent: true,
-          params: req.params,
-        })
-        .catch((err) => {
-          broadcastMain(IPC.agentEvent, {
-            sessionId: req.sessionId,
-            event: {
-              type: "error",
-              message: err instanceof Error ? err.message : String(err),
-            },
-          });
+    const r = assertSendRequest(req);
+    void svc
+      .sendMessage(r.sessionId, r.content, {
+        useAgent: r.useAgent,
+        params: r.params as never,
+      })
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        if (isCancelErrorMessage(message)) return;
+        broadcastMain(IPC.agentEvent, {
+          sessionId: r.sessionId,
+          event: { type: "error", message },
         });
-      return;
-    }
-    return svc.sendMessage(req.sessionId, req.content, {
-      useAgent: false,
-      params: req.params,
-    });
+      });
   });
   ipcMain.handle(IPC.stopGeneration, () => svc.stopGeneration());
   ipcMain.handle(IPC.startAgent, async (_e, req) => {
-    void svc.startAgent(req.sessionId, req.content).catch((err) => {
+    const r = assertSendRequest(req);
+    void svc.startAgent(r.sessionId, r.content).catch((err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      if (isCancelErrorMessage(message)) return;
       broadcastMain(IPC.agentEvent, {
-        sessionId: req.sessionId,
-        event: {
-          type: "error",
-          message: err instanceof Error ? err.message : String(err),
-        },
+        sessionId: r.sessionId,
+        event: { type: "error", message },
       });
     });
   });
   ipcMain.handle(IPC.resolveConfirmation, (_e, req) =>
     svc.resolveConfirmation(req.confirmationId, req.approved, req.rememberForSession),
   );
-  ipcMain.handle(IPC.cancelAgent, () => svc.cancelAgent());
+  ipcMain.handle(IPC.cancelAgent, () => svc.stopGeneration());
   ipcMain.handle(IPC.pickDirectory, async (e) => {
     const parent = parentForDialog(e);
     const res = parent

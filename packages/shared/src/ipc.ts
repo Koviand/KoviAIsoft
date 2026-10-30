@@ -118,14 +118,13 @@ export interface StatusBarInfo {
 export interface SendChatRequest {
   sessionId: string;
   content: string;
-  attachmentPaths?: string[];
   params?: Partial<GenerationParams>;
 }
 
+/** @deprecated Prefer sendMessage + stopGeneration. */
 export interface StartAgentRequest {
   sessionId: string;
   content: string;
-  attachmentPaths?: string[];
 }
 
 /** Unified send: plain chat or agent/tool loop in one session. */
@@ -133,7 +132,6 @@ export interface SendMessageRequest {
   sessionId: string;
   content: string;
   useAgent?: boolean;
-  attachmentPaths?: string[];
   params?: Partial<GenerationParams>;
 }
 
@@ -172,11 +170,15 @@ export interface KoviApi {
   updateSession(session: ChatSession): Promise<ChatSession>;
   deleteSession(sessionId: string): Promise<void>;
   getMessages(sessionId: string): Promise<ChatMessage[]>;
+  /** @deprecated Prefer sendMessage. */
   sendChat(req: SendChatRequest): Promise<ChatMessage>;
-  sendMessage(req: SendMessageRequest): Promise<ChatMessage | void>;
+  /** Fire-and-forget; progress via onAgentEvent. */
+  sendMessage(req: SendMessageRequest): Promise<void>;
   stopGeneration(): Promise<void>;
+  /** @deprecated Prefer sendMessage({ useAgent: true }). */
   startAgent(req: StartAgentRequest): Promise<void>;
   resolveConfirmation(req: ResolveConfirmationRequest): Promise<void>;
+  /** @deprecated Alias of stopGeneration. */
   cancelAgent(): Promise<void>;
   pickDirectory(): Promise<string | null>;
   pickFile(filters?: { name: string; extensions: string[] }[]): Promise<string | null>;

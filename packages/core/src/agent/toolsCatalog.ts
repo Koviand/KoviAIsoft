@@ -145,14 +145,31 @@ export const BUILTIN_TOOL_NAMES = new Set<string>(
   BUILTIN_TOOL_SPECS.map((t) => t.name),
 );
 
-export function toolsPromptBlock(extraTools: Array<{ name: string; description?: string }>): string {
-  const all = [
-    ...BUILTIN_TOOL_SPECS.map((t) => `- ${t.name}: ${t.description}`),
-    ...extraTools.map((t) => `- ${t.name}: ${t.description || "MCP tool"}`),
-  ];
-  return `Доступные инструменты:\n${all.join("\n")}
+const CORE_TOOL_NAMES = new Set([
+  "list_dir",
+  "read_file",
+  "write_file",
+  "apply_patch",
+  "search",
+  "run_terminal",
+  "finish",
+]);
 
-Формат ответа на каждом шаге — строго JSON в обычном тексте ответа (не в reasoning/thinking):
+export function toolsPromptBlock(
+  extraTools: Array<{ name: string; description?: string }>,
+  opts?: { compact?: boolean },
+): string {
+  const specs = opts?.compact
+    ? BUILTIN_TOOL_SPECS.filter((t) => CORE_TOOL_NAMES.has(t.name))
+    : BUILTIN_TOOL_SPECS;
+  const extras = opts?.compact ? [] : extraTools;
+  const all = [
+    ...specs.map((t) => `- ${t.name}: ${t.description}`),
+    ...extras.map((t) => `- ${t.name}: ${t.description || "MCP tool"}`),
+  ];
+  const rules = opts?.compact
+    ? `Формат: JSON {"thought","tool":{"name","args"}|null,"final"|null}. Пиши код через write_file. Windows paths.`
+    : `Формат ответа на каждом шаге — строго JSON в обычном тексте ответа (не в reasoning/thinking):
 {
   "thought": "краткие рассуждения",
   "plan": [{"id":"1","title":"..."}],
@@ -173,4 +190,5 @@ export function toolsPromptBlock(extraTools: Array<{ name: string; description?:
 - Пустой cwd = папка проекта. Не удаляй корень проекта.
 - Код пиши только через write_file/apply_patch, не через echo/cat/heredoc в shell.
 - В system уже есть карта проекта и автоподобранные фрагменты (как @codebase в Cursor). Уточняй через search/read_file; можно опираться на пути из карты.`;
+  return `Доступные инструменты:\n${all.join("\n")}\n\n${rules}`;
 }

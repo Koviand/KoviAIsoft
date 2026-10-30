@@ -26,7 +26,7 @@ export function Topbar(props: {
     ? "загрузка…"
     : props.generating
       ? agentStep
-        ? `агент · ${agentStep}`
+        ? `процесс · ${agentStep}`
         : "генерация…"
       : online
         ? tps != null && tps > 0

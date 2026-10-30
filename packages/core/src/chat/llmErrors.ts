@@ -45,7 +45,15 @@ export function formatLlmFetchError(err: unknown, baseUrl: string | null): Error
       "Промпт не влезает в context окна модели. Создайте новый диалог или увеличьте context в профиле загрузки / параметрах сессии. История агента обрезается автоматически — повторите запрос.",
     );
   }
-  if (blob.includes("timeout") || blob.includes("aborted") || blob.includes("timed out")) {
+  // User cancel / AbortController — never mislabel as timeout (P1-22).
+  if (
+    blob.includes("отмен") ||
+    /\babort(ed|error)?\b/.test(blob) ||
+    (err instanceof Error && err.name === "AbortError")
+  ) {
+    return new Error("Отменено");
+  }
+  if (blob.includes("timeout") || blob.includes("timed out") || blob.includes("etimedout")) {
     return new Error(
       "Таймаут ответа модели. Уменьшите max tokens / context или проверьте, что GPU не перегружен.",
     );

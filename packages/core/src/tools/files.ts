@@ -7,7 +7,6 @@ import type { AppSettings } from "@kovi/shared";
 import { writeFileAtomic } from "../fsAtomic.js";
 import {
   assertAllowedPath,
-  isPathInside,
   normalizePath,
   realPathSafe,
   resolveAgentPath,
@@ -115,6 +114,53 @@ export async function applyPatchTool(
   return `Patched ${resolved} (${current.length} → ${next.length} chars)`;
 }
 
+/** Symlink or Windows junction / mount-point (reparse) — do not recurse into target. */
+function hasReparsePoint(st: fs.Stats): boolean {
+  if (st.isSymbolicLink()) return true;
+  // Node.js Stats on Windows may expose FILE_ATTRIBUTE_REPARSE_POINT.
+  const attrs = (st as unknown as { fileAttributes?: number }).fileAttributes;
+  if (typeof attrs === "number" && (attrs & 0x400) !== 0) return true;
+  return false;
+}
+
+/**
+ * Recursively delete without following junctions/symlinks into foreign trees.
+ * Reparse points are unlinked as a single node.
+ */
+async function safeRmRecursive(dirPath: string): Promise<void> {
+  let entries: fs.Dirent[];
+  try {
+    entries = await fsp.readdir(dirPath, { withFileTypes: true });
+  } catch (err) {
+    // If readdir fails because dirPath itself is a junction, unlink the node.
+    try {
+      await fsp.unlink(dirPath);
+      return;
+    } catch {
+      throw err;
+    }
+  }
+  for (const e of entries) {
+    const full = path.join(dirPath, e.name);
+    let lst: fs.Stats;
+    try {
+      lst = await fsp.lstat(full);
+    } catch {
+      continue;
+    }
+    if (hasReparsePoint(lst) || e.isSymbolicLink()) {
+      await fsp.unlink(full);
+      continue;
+    }
+    if (lst.isDirectory()) {
+      await safeRmRecursive(full);
+    } else {
+      await fsp.unlink(full);
+    }
+  }
+  await fsp.rmdir(dirPath);
+}
+
 export async function deletePathTool(target: string, settings: AppSettings): Promise<string> {
   const resolved = resolveToolPath(target, settings);
   if (settings.projectRoot) {
@@ -136,12 +182,12 @@ export async function deletePathTool(target: string, settings: AppSettings): Pro
     throw new Error(`Путь не найден: ${resolved}`);
   }
 
-  if (lst.isSymbolicLink()) {
+  if (hasReparsePoint(lst)) {
     await fsp.unlink(resolved);
-    return `Deleted symlink ${resolved}`;
+    return `Deleted reparse/symlink ${resolved}`;
   }
   if (lst.isDirectory()) {
-    // Avoid following junctions into outside trees: only allow if realpath stays inside policy.
+    // Root realpath must still be inside policy (disk/project).
     const real = realPathSafe(resolved);
     assertAllowedPath(
       real,
@@ -149,10 +195,7 @@ export async function deletePathTool(target: string, settings: AppSettings): Pro
       settings.projectRoot,
       settings.modelRoots,
     );
-    if (settings.projectRoot && !isPathInside(real, settings.projectRoot)) {
-      // disk mode may allow; project mode already enforced by assert
-    }
-    await fsp.rm(resolved, { recursive: true, force: true });
+    await safeRmRecursive(resolved);
   } else {
     await fsp.unlink(resolved);
   }
@@ -189,10 +232,15 @@ export async function searchFiles(
       return e.stdout || "(нет совпадений)";
     }
     const hits: string[] = [];
-    const stack = [resolvedRoot];
+    const stack: Array<{ dir: string; depth: number }> = [{ dir: resolvedRoot, depth: 0 }];
     const visited = new Set<string>();
+    const maxDepth = 12;
+    const maxFiles = 4000;
+    let filesSeen = 0;
+    const deadline = Date.now() + 12_000;
     while (stack.length && hits.length < 50) {
-      const dir = stack.pop()!;
+      if (Date.now() > deadline) break;
+      const { dir, depth } = stack.pop()!;
       let realDir: string;
       try {
         realDir = realPathSafe(dir).toLowerCase();
@@ -211,8 +259,11 @@ export async function searchFiles(
         if (e.name === "node_modules" || e.name === ".git") continue;
         const full = path.join(dir, e.name);
         if (e.isSymbolicLink()) continue;
-        if (e.isDirectory()) stack.push(full);
-        else if (e.isFile()) {
+        if (e.isDirectory()) {
+          if (depth < maxDepth) stack.push({ dir: full, depth: depth + 1 });
+        } else if (e.isFile()) {
+          filesSeen += 1;
+          if (filesSeen > maxFiles) break;
           try {
             const text = fs.readFileSync(full, "utf8");
             const idx = text.indexOf(query);
@@ -225,6 +276,7 @@ export async function searchFiles(
           }
         }
       }
+      if (filesSeen > maxFiles) break;
     }
     return hits.join("\n") || "(нет совпадений)";
   }

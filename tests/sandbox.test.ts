@@ -64,11 +64,23 @@ describe("sandbox", () => {
     expect(riskForTool("run_terminal", { command: "dir" })).toBe("high");
   });
 
-  it("allows disk-mode terminal outside modelRoots but not System32", () => {
+  it("scopes disk-mode terminal cwd to modelRoots/project", () => {
     expect(() =>
-      assertTerminalCwd("C:\\Users\\Kovi\\Documents\\App", "disk", null),
+      assertTerminalCwd(path.join(models, "work"), "disk", root, [models]),
     ).not.toThrow();
-    expect(() => assertTerminalCwd("C:\\Windows\\System32", "disk", root)).toThrow();
+    expect(() =>
+      assertTerminalCwd(path.join(root, "src"), "disk", root, [models]),
+    ).not.toThrow();
+    expect(() =>
+      assertTerminalCwd("C:\\Users\\Kovi\\Documents\\App", "disk", null, [models]),
+    ).toThrow(/вне разрешённых/);
+    expect(() => assertTerminalCwd("C:\\Windows\\System32", "disk", root, [models])).toThrow();
+    expect(() => assertTerminalCwd("C:\\Temp", "disk", null, [])).toThrow(/задайте папки/);
+  });
+
+  it("marks browser navigate as high risk", () => {
+    expect(riskForTool("browser_navigate", { url: "http://x" })).toBe("high");
+    expect(riskForTool("browser_snapshot", {})).toBe("medium");
   });
 });
 

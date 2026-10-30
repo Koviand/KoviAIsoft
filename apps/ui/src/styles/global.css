@@ -854,18 +854,17 @@ button {
 
 .tool-trail {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 6px;
-  width: min(var(--chat-max), 100%);
-  margin: 0 auto;
-  padding: 0 22px;
+  width: 100%;
 }
 
 .tool-chip {
-  display: inline-flex;
-  gap: 8px;
-  align-items: center;
-  padding: 5px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: stretch;
+  padding: 8px 10px;
   border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--surface);
@@ -878,6 +877,88 @@ button {
 
 .tool-chip.status-error {
   border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
+}
+
+.process-timeline {
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+}
+
+.process-timeline-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.process-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+}
+
+.process-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.process-toggle {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+
+.process-thinking-text {
+  white-space: pre-wrap;
+  font-size: 0.85rem;
+  opacity: 0.9;
+}
+
+.process-tool-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+
+.process-args,
+.process-detail {
+  font-size: 0.72rem;
+  word-break: break-word;
+}
+
+.process-tool-detail {
+  margin: 0;
+  max-height: 160px;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--surface-2, var(--surface));
+  font-size: 0.72rem;
+  white-space: pre-wrap;
+}
+
+.process-confirm {
+  border-left: 3px solid var(--danger);
+  padding-left: 8px;
+}
+
+.process-stream .msg-body {
+  white-space: pre-wrap;
 }
 
 .progress {

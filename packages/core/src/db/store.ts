@@ -38,6 +38,8 @@ export class Store {
   private data: DbShape;
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
   private dirty = false;
+  /** When true, refuse to overwrite disk with empty/new state (I/O failure on load). */
+  private blockPersist = false;
 
   constructor(appData: string) {
     ensureDir(appData);
@@ -45,21 +47,44 @@ export class Store {
     this.data = this.load();
   }
 
+  private emptyDb(): DbShape {
+    return { sessions: [], messages: {} };
+  }
+
   private load(): DbShape {
+    if (!fs.existsSync(this.filePath)) {
+      return this.emptyDb();
+    }
+    let raw: string;
     try {
-      const raw = fs.readFileSync(this.filePath, "utf8");
+      raw = fs.readFileSync(this.filePath, "utf8");
+    } catch (err) {
+      // I/O failure: keep empty in-memory but never wipe the on-disk file.
+      this.blockPersist = true;
+      console.error("[store] failed to read store.json — persist disabled", err);
+      return this.emptyDb();
+    }
+    try {
       const parsed = JSON.parse(raw) as DbShape;
       return {
         sessions: (parsed.sessions || []).map(normalizeSession),
         messages: parsed.messages || {},
       };
     } catch {
-      return { sessions: [], messages: {} };
+      // Corrupt JSON: backup then start fresh (safe to persist).
+      try {
+        const bak = `${this.filePath}.bak`;
+        fs.copyFileSync(this.filePath, bak);
+      } catch {
+        // ignore backup failure
+      }
+      return this.emptyDb();
     }
   }
 
   /** Sync write — used by close/flush. */
   private persistSync(): void {
+    if (this.blockPersist) return;
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
@@ -70,11 +95,12 @@ export class Store {
 
   /** Debounced persist to avoid blocking the agent tool loop on every message. */
   private persist(): void {
+    if (this.blockPersist) return;
     this.dirty = true;
     if (this.persistTimer) return;
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
-      if (!this.dirty) return;
+      if (!this.dirty || this.blockPersist) return;
       this.dirty = false;
       try {
         writeFileAtomicSync(this.filePath, JSON.stringify(this.data, null, 2));
@@ -83,7 +109,7 @@ export class Store {
         // Retry once shortly after I/O failure.
         setTimeout(() => this.persist(), 250);
       }
-    }, 80);
+    }, 40);
   }
 
   listSessions(): ChatSession[] {

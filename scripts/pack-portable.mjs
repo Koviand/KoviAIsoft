@@ -84,26 +84,71 @@ async function bundleMain() {
     sourcemap: false,
     logLevel: "info",
   });
+
+  await esbuild.build({
+    entryPoints: [path.join(desktop, "src", "monitorPreload.ts")],
+    bundle: true,
+    platform: "node",
+    target: "node20",
+    format: "cjs",
+    outfile: path.join(dist, "monitorPreload.js"),
+    external: ["electron"],
+    sourcemap: false,
+    logLevel: "info",
+  });
+}
+
+function resolveLockedVersion(pkgName) {
+  try {
+    const lock = JSON.parse(fs.readFileSync(path.join(root, "pnpm-lock.yaml"), "utf8"));
+    // pnpm lock v9: packages["/@scope/name@version"] — fall back to desktop package.json
+    void lock;
+  } catch {
+    // ignore
+  }
+  try {
+    const desktopPkg = JSON.parse(
+      fs.readFileSync(path.join(desktop, "package.json"), "utf8"),
+    );
+    const fromDev = desktopPkg.devDependencies?.[pkgName];
+    const fromDep = desktopPkg.dependencies?.[pkgName];
+    const raw = fromDev || fromDep;
+    if (typeof raw === "string") return raw.replace(/^\^/, "");
+  } catch {
+    // ignore
+  }
+  const fallback = {
+    electron: "34.0.1",
+    "electron-builder": "25.1.8",
+    playwright: "1.50.1",
+    "@modelcontextprotocol/sdk": "1.6.1",
+  };
+  return fallback[pkgName] || "0.0.0";
 }
 
 function stagePackageJson() {
+  const electronVer = resolveLockedVersion("electron");
+  const builderVer = resolveLockedVersion("electron-builder");
+  const playwrightVer = resolveLockedVersion("playwright");
+  const mcpVer = resolveLockedVersion("@modelcontextprotocol/sdk");
+  const rootPkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
   writeJson(path.join(stage, "package.json"), {
     name: "kovi-ai-soft",
-    version: "0.1.0",
+    version: rootPkg.version || "0.1.0",
     private: true,
     main: "dist/main.js",
     description: "KoviAIsoft portable",
     author: "Kovi",
     dependencies: {
-      "@modelcontextprotocol/sdk": "^1.6.1",
-      "extract-zip": "^2.0.1",
-      playwright: "^1.50.1",
-      uuid: "^11.0.5",
-      zod: "^3.24.1",
+      "@modelcontextprotocol/sdk": mcpVer,
+      "extract-zip": "2.0.1",
+      playwright: playwrightVer,
+      uuid: "11.0.5",
+      zod: "3.24.1",
     },
     devDependencies: {
-      electron: "^34.0.1",
-      "electron-builder": "^25.1.8",
+      electron: electronVer,
+      "electron-builder": builderVer,
     },
     build: {
       appId: "com.kovi.aisoft",
@@ -154,9 +199,11 @@ function stagePackageJson() {
 }
 
 function installStageDeps() {
+  const electronVer = resolveLockedVersion("electron");
+  const builderVer = resolveLockedVersion("electron-builder");
   // Use npm in stage for a classic flat node_modules electron-builder understands.
   run("npm", ["install", "--omit=dev", "--no-audit", "--no-fund"], stage);
-  // electron + electron-builder as local tools for packaging
+  // electron + electron-builder as local tools for packaging (versions from workspace)
   run(
     "npm",
     [
@@ -165,8 +212,8 @@ function installStageDeps() {
       "--no-audit",
       "--no-fund",
       "--ignore-scripts=false",
-      "electron@34.0.1",
-      "electron-builder@25.1.8",
+      `electron@${electronVer}`,
+      `electron-builder@${builderVer}`,
     ],
     stage,
   );
@@ -185,6 +232,8 @@ function assemblePortableFolder() {
     throw new Error(`Unpacked app not found: ${unpacked}`);
   }
   // Best-effort: stop a running portable instance that locks the folder on Windows.
+  // WARNING: kills KoviAIsoft.exe globally — close the app before pack if you need its locks.
+  console.warn("[pack] taskkill KoviAIsoft.exe (if running) to unlock release folder…");
   spawnSync("taskkill", ["/IM", "KoviAIsoft.exe", "/F"], {
     stdio: "ignore",
     shell: true,
