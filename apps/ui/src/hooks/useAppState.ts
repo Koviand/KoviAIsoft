@@ -123,6 +123,13 @@ export function useAppState() {
         setViewRaw("chat");
         setGenerating(true);
       }
+      if (ev.type === "confirmation_timeout") {
+        setPendingConfirm((cur) => (cur?.id === ev.confirmationId ? null : cur));
+        setConfirmBusy(false);
+        setError(
+          `Подтверждение «${ev.toolName}» истекло (120 с) — действие отклонено`,
+        );
+      }
       if (ev.type === "step_start" || ev.type === "tool_call" || ev.type === "plan") {
         setGenerating(true);
         void api

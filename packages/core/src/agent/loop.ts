@@ -33,12 +33,11 @@ import {
   fitMessagesToContext,
   isContextOverflowError,
 } from "../chat/contextBudget.js";
+import { projectContextCache } from "../context/projectCache.js";
 import { buildProjectContext } from "../context/packer.js";
-import {
-  formatRetrievedSnippets,
-  retrieveProjectContext,
-} from "../context/retrieve.js";
+import { formatRetrievedSnippets } from "../context/retrieve.js";
 import { condenseTranscript, summarizeTranscript } from "../context/summarize.js";
+import { detectCodingTask } from "./intent.js";
 import { toolsPromptBlock } from "./toolsCatalog.js";
 import {
   applyWorkingMemoryToSystem,
@@ -63,14 +62,23 @@ function coerceToolArgs(
   if ((next.path == null || String(next.path).trim() === "") && next.file != null) {
     next.path = next.file;
   }
+  if ((next.path == null || String(next.path).trim() === "") && next.filename != null) {
+    next.path = next.filename;
+  }
+  if ((next.path == null || String(next.path).trim() === "") && next.filepath != null) {
+    next.path = next.filepath;
+  }
   if (toolName === "write_file" && (next.content == null || next.content === "")) {
     if (typeof next.text === "string") next.content = next.text;
     else if (typeof next.code === "string") next.content = next.code;
     else if (typeof next.body === "string") next.content = next.body;
+    else if (typeof next.source === "string") next.content = next.source;
   }
   if (toolName === "apply_patch") {
     if (next.oldText == null && typeof next.old === "string") next.oldText = next.old;
     if (next.newText == null && typeof next.new === "string") next.newText = next.new;
+    if (next.oldText == null && typeof next.before === "string") next.oldText = next.before;
+    if (next.newText == null && typeof next.after === "string") next.newText = next.after;
   }
   if (toolName === "run_terminal") {
     if ((next.cwd == null || String(next.cwd).trim() === "") && next.dir != null) {
@@ -203,11 +211,14 @@ export class AgentLoop {
       toolName: string;
       sessionId: string;
       rememberKey: string | null;
+      timer?: ReturnType<typeof setTimeout>;
     }
   >();
   /** Remembered approvals keyed by session → approvalRememberKey (path-scoped for writes). */
   private allowBySession = new Map<string, Set<string>>();
   private running = false;
+  /** Max wait for UI confirmation before auto-reject (ms). */
+  static CONFIRM_TIMEOUT_MS = 120_000;
 
   constructor(chat: ChatEngine, store: Store, mcp: McpManager) {
     this.chat = chat;
@@ -224,6 +235,7 @@ export class AgentLoop {
     // Interrupt in-flight LLM JSON completion used by the agent loop.
     this.chat.stop();
     for (const [id, p] of this.pendingConfirm) {
+      if (p.timer) clearTimeout(p.timer);
       p.resolve(false);
       this.pendingConfirm.delete(id);
     }
@@ -236,6 +248,7 @@ export class AgentLoop {
   resolveConfirmation(id: string, approved: boolean, remember = false): void {
     const pending = this.pendingConfirm.get(id);
     if (!pending) return;
+    if (pending.timer) clearTimeout(pending.timer);
     if (approved && remember && pending.sessionId && pending.rememberKey) {
       this.allowFor(pending.sessionId).add(pending.rememberKey);
     }
@@ -320,11 +333,23 @@ export class AgentLoop {
     };
     this.emit(sessionId, { type: "confirmation_required", confirmation });
     return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        const still = this.pendingConfirm.get(confirmation.id);
+        if (!still) return;
+        this.pendingConfirm.delete(confirmation.id);
+        this.emit(sessionId, {
+          type: "confirmation_timeout",
+          confirmationId: confirmation.id,
+          toolName,
+        });
+        still.resolve(false);
+      }, AgentLoop.CONFIRM_TIMEOUT_MS);
       this.pendingConfirm.set(confirmation.id, {
         resolve,
         toolName,
         sessionId,
         rememberKey,
+        timer,
       });
     });
   }
@@ -389,6 +414,7 @@ export class AgentLoop {
     if (this.running) throw new Error("Агент уже выполняется");
     this.running = true;
     this.cancelled = false;
+    projectContextCache.clear();
 
     try {
       this.store.addMessage(sessionId, { role: "user", content: userContent });
@@ -423,10 +449,20 @@ export class AgentLoop {
       let baseSystem = projectCtx.systemPrompt;
       const session = this.store.listSessions().find((s) => s.id === sessionId);
       const restored = parseWorkingMemory(session?.agentScratchpad);
+      const freshGoal = userContent.replace(/\s+/g, " ").trim().slice(0, 400);
+      const goalChanged =
+        Boolean(restored?.goal) &&
+        restored!.goal.toLowerCase() !== freshGoal.toLowerCase() &&
+        !freshGoal.toLowerCase().includes(restored!.goal.toLowerCase().slice(0, 80));
       const workingMemory = restored
-        ? { ...restored, goal: restored.goal || userContent.slice(0, 400) }
+        ? {
+            ...restored,
+            goal: freshGoal,
+            ...(goalChanged
+              ? { plan: [], notes: [], lastError: null, lastTool: null, lastResult: null }
+              : {}),
+          }
         : createWorkingMemory(userContent);
-      if (!restored?.goal) workingMemory.goal = userContent.replace(/\s+/g, " ").trim().slice(0, 400);
 
       let transcript: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
         {
@@ -464,15 +500,32 @@ export class AgentLoop {
         workingMemory,
       });
 
-      let steps: AgentPlanStep[] = [];
+      let steps: AgentPlanStep[] = goalChanged
+        ? []
+        : (workingMemory.plan || []).map((p) => ({
+            id: p.id,
+            title: p.title,
+            status: (p.status as AgentPlanStep["status"]) || "pending",
+          }));
+      if (steps.length) {
+        this.emit(sessionId, { type: "plan", steps });
+      }
       let toolsUsed = 0;
-      let filesWritten = 0;
-      let substantialWrite = false;
+      let filesWritten = workingMemory.filesTouched?.length
+        ? workingMemory.filesTouched.filter((f) =>
+            workingMemory.notes.some((n) => n.includes(`wrote ${f}`) || /wrote /.test(n)),
+          ).length
+        : 0;
+      // Count prior writes from notes so resume doesn't re-force from zero incorrectly.
+      if (!filesWritten && workingMemory.notes.some((n) => /^wrote /.test(n))) {
+        filesWritten = workingMemory.notes.filter((n) => /^wrote /.test(n)).length;
+      }
+      let substantialWrite =
+        filesWritten > 0 &&
+        workingMemory.notes.some((n) => /^wrote /.test(n) && !/stub/i.test(n));
       let stubNudgeCount = 0;
       let lastRetrieveAt = 0;
-      const wantsFiles = /файл|код|игр[ауы]|напиш|создай|реализ|скрипт|программ|python|tetris|html|react/i.test(
-        userContent,
-      );
+      const wantsFiles = detectCodingTask(userContent);
 
       const persistScratchpad = () => {
         const cur = this.store.listSessions().find((s) => s.id === sessionId);
@@ -488,11 +541,17 @@ export class AgentLoop {
         const root = settings.projectRoot;
         if (!root) return;
         try {
-          const snippets = await retrieveProjectContext(root, workingMemory.goal || userContent, {
-            maxFiles: 6,
-            maxBytesPerFile: 3500,
-            maxTotalBytes: 14_000,
-          });
+          // Invalidate after writes so next retrieve sees new files.
+          if (/write/i.test(reason)) projectContextCache.clear();
+          const snippets = await projectContextCache.getRetrieved(
+            root,
+            workingMemory.goal || userContent,
+            {
+              maxFiles: 6,
+              maxBytesPerFile: 3500,
+              maxTotalBytes: 14_000,
+            },
+          );
           const block = formatRetrievedSnippets(snippets);
           if (!block) return;
           let next = baseSystem;
@@ -605,10 +664,17 @@ export class AgentLoop {
 
         const parsed = extractJson(raw);
         if (!parsed) {
-          transcript.push({ role: "assistant", content: raw });
+          const looksTruncated =
+            /["']\s*$/.test(raw.trim()) ||
+            /,\s*$/.test(raw.trim()) ||
+            (raw.includes("{") && !raw.includes("}")) ||
+            raw.length > 1500;
+          transcript.push({ role: "assistant", content: raw.slice(0, 4000) });
           transcript.push({
             role: "user",
-            content: "Ответ не JSON. Верни строго JSON по схеме.",
+            content: looksTruncated
+              ? "Ответ обрезан или невалидный JSON. Упрости шаг: один write_file с умеренным content, без кода в thought/final. Верни строго JSON по схеме."
+              : "Ответ не JSON. Верни строго JSON по схеме (tool или final).",
           });
           continue;
         }
@@ -618,12 +684,18 @@ export class AgentLoop {
         }
 
         if (parsed.plan?.length) {
-          steps = parsed.plan.map((p) => ({
-            id: p.id,
-            title: p.title,
-            status: "pending" as const,
-          }));
+          const prevById = new Map(steps.map((s) => [s.id, s]));
+          steps = parsed.plan.map((p) => {
+            const prev = prevById.get(p.id);
+            return {
+              id: p.id,
+              title: p.title,
+              status: prev?.status === "done" ? ("done" as const) : ("pending" as const),
+              detail: prev?.detail,
+            };
+          });
           updatePlanMemory(workingMemory, steps);
+          persistScratchpad();
           this.emit(sessionId, { type: "plan", steps });
         }
 
@@ -635,9 +707,11 @@ export class AgentLoop {
             filesWritten > 0 &&
             !substantialWrite &&
             stubNudgeCount < 2;
+          // Keep forcing writes even on the last step when no files exist yet.
           const mustWork =
-            i < settings.agentMaxSteps - 1 &&
-            (noFileYet || stubOnly || (!wantsFiles && toolsUsed === 0 && steps.length > 0));
+            noFileYet ||
+            (i < settings.agentMaxSteps - 1 &&
+              (stubOnly || (!wantsFiles && toolsUsed === 0 && steps.length > 0)));
           if (mustWork) {
             if (stubOnly) stubNudgeCount += 1;
             transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
@@ -685,8 +759,7 @@ export class AgentLoop {
         this.emit(sessionId, { type: "tool_call", name: toolName, args, callId });
 
         if (toolName === "finish") {
-          const blockFinishNoFile =
-            wantsFiles && filesWritten === 0 && i < settings.agentMaxSteps - 1;
+          const blockFinishNoFile = wantsFiles && filesWritten === 0;
           const blockFinishStub =
             wantsFiles &&
             filesWritten > 0 &&
@@ -740,13 +813,19 @@ export class AgentLoop {
           toolsUsed += 1;
           if (FILE_MUTATION_TOOLS.has(toolName)) {
             filesWritten += 1;
-            const contentLen =
-              toolName === "write_file"
-                ? String(normalizedArgs.content ?? "").length
-                : String(normalizedArgs.newText ?? "").length;
             const targetPath = String(normalizedArgs.path ?? args.path ?? "");
-            if (contentLen >= minWriteCharsForPath(targetPath)) {
-              substantialWrite = true;
+            if (toolName === "write_file") {
+              const contentLen = String(normalizedArgs.content ?? "").length;
+              if (contentLen >= minWriteCharsForPath(targetPath)) {
+                substantialWrite = true;
+              }
+            } else {
+              // apply_patch: small diffs are valid if they replace real code.
+              const newLen = String(normalizedArgs.newText ?? "").length;
+              const oldLen = String(normalizedArgs.oldText ?? "").length;
+              if (newLen >= 1 && oldLen >= 1) {
+                substantialWrite = true;
+              }
             }
           }
           if (steps.length) {
@@ -816,9 +895,13 @@ export class AgentLoop {
         }
       }
 
+      const limitMsg =
+        wantsFiles && filesWritten === 0
+          ? "Достигнут лимит шагов агента, файлы так и не были записаны. Увеличьте лимит шагов или повторите с @agent и явной просьбой write_file."
+          : "Достигнут лимит шагов агента. Уточните задачу или увеличьте лимит в настройках.";
       const msg = this.store.addMessage(sessionId, {
         role: "assistant",
-        content: "Достигнут лимит шагов агента. Уточните задачу или увеличьте лимит в настройках.",
+        content: limitMsg,
       });
       this.emit(sessionId, { type: "done", messageId: msg.id });
     } catch (err) {

@@ -51,6 +51,17 @@ describe("unified send / session tools", () => {
         projectRoot: "C:\\proj",
       }).useAgent,
     ).toBe(true);
+    expect(
+      AppService.parseAgentIntent("implement tetris game in python", false).useAgent,
+    ).toBe(true);
+    expect(
+      AppService.parseAgentIntent("запусти npm test", false, {
+        projectRoot: "C:\\proj",
+      }).useAgent,
+    ).toBe(true);
+    expect(
+      AppService.parseAgentIntent("запусти npm test", false).useAgent,
+    ).toBe(true);
   });
 
   it("sendMessage respects session toolsEnabled and rejects empty @agent", async () => {

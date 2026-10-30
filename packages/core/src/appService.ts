@@ -27,6 +27,7 @@ import {
   sessionToolsEnabled,
   type HardwareLoadSuggestion,
 } from "@kovi/shared";
+import { detectAgentTask } from "./agent/intent.js";
 import { AgentLoop } from "./agent/loop.js";
 import { ChatEngine } from "./chat/engine.js";
 import { buildProjectContext } from "./context/packer.js";
@@ -46,6 +47,7 @@ import {
 } from "./models/huggingface.js";
 import { ensureHfCli, getHfCliStatus } from "./models/hfCli.js";
 import { verifyGgufFile, withIntegrity } from "./models/integrity.js";
+import { deleteLocalModelFiles } from "./models/deleteLocal.js";
 import { scanLocalModels } from "./models/scanner.js";
 import { getAppDataDir } from "./paths.js";
 import { OpenAiProxy } from "./proxy/openaiProxy.js";
@@ -324,6 +326,21 @@ export class AppService {
     return this.modelsCache;
   }
 
+  async deleteModel(modelId: string): Promise<LocalModel[]> {
+    const model = this.modelsCache.find((m) => m.id === modelId);
+    if (!model) throw new Error("Модель не найдена");
+    const roots = this.settings.get().modelRoots;
+    const st = this.runtime.getStatus();
+    if (st.loadedModelId === modelId) {
+      if (this.chat.isBusy() || this.agent.isRunning()) {
+        throw new Error("Сначала остановите генерацию или агента, затем удалите модель");
+      }
+      await this.unloadModel();
+    }
+    deleteLocalModelFiles(model, roots);
+    return this.scanModels();
+  }
+
   async getModelRecommendations(): Promise<ModelRecommendationsReport> {
     const sys = await this.getSystemInfo();
     return buildModelRecommendations(sys);
@@ -567,7 +584,7 @@ export class AppService {
   }
 
   /**
-   * Decide chat vs agent: @agent prefix, coding intent, preferAgent flag, or projectRoot set.
+   * Decide chat vs agent: @agent prefix, coding/tool intent, preferAgent flag, or project actions.
    * Empty payload after @agent throws via sendMessage (returns useAgent + empty content marker).
    */
   static parseAgentIntent(
@@ -584,24 +601,9 @@ export class AppService {
       }
       return { content: rest, useAgent: true };
     }
-    // Coding: verb stem + concrete artifact (avoid everyday "напиши мне" / "создай настроение").
-    // Note: JS `\b` is ASCII-only — do not rely on it for Cyrillic stems.
-    const codingIntent =
-      /(напис\p{L}*|напиш\p{L}*|созда\p{L}*|сдела\p{L}*|реализ\p{L}*|постро\p{L}*|исправ\p{L}*|добав\p{L}*|перепиш\p{L}*|рефактор\p{L}*).{0,100}(игр[уыае]|программ\p{L}*|скрипт\p{L}*|файл\p{L}*|проект\p{L}*|приложени\p{L}*|код\p{L}*|модул\p{L}*|функци\p{L}*|класс\p{L}*|auth|tetris|тетрис|\.py|\.ts|\.js|\.tsx)/iu.test(
-        trimmed,
-      ) ||
-      /\b(write|create|implement|build|fix|edit|refactor|rewrite)\b.{0,80}\b(game|app|file|script|python|module|function|auth|tetris|code|\.py|\.ts|\.js)\b/i.test(
-        trimmed,
-      );
-    const hasProject = Boolean(opts?.projectRoot && String(opts.projectRoot).trim());
-    const projectAction =
-      hasProject &&
-      /(файл|код|проект|папк|каталог|исправ|добав|удал|созда|напиш|перепиш|проверь|запуст|терминал|рефактор|@|\.py|\.ts|\.js|readme|agents\.md|search|list_dir|write_file)/i.test(
-        trimmed,
-      );
     return {
       content: trimmed,
-      useAgent: preferAgent || codingIntent || projectAction,
+      useAgent: preferAgent || detectAgentTask(trimmed, opts),
     };
   }
 

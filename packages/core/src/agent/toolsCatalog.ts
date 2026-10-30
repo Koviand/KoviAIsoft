@@ -67,19 +67,19 @@ export const BUILTIN_TOOL_SPECS = [
   {
     name: "run_terminal",
     description:
-      "Выполнить команду в Windows shell (cmd.exe). cwd — папка проекта. Для PowerShell: command=\"powershell Get-ChildItem\". Требует подтверждения.",
+      "Выполнить команду в Windows (cmd.exe). cwd — папка проекта. PowerShell: префикс powershell …. Требует подтверждения. Код пиши через write_file, не через shell.",
     parameters: {
       type: "object",
       properties: {
         command: {
           type: "string",
           description:
-            "Команда Windows: dir, type, npm, python, git… (не bash). PowerShell: префикс powershell …",
+            "Синтаксис cmd/PowerShell: dir, type, call npm test, python main.py, git status. НЕ bash (export, ls|grep, <<EOF, /Users/…). Цепочки: set \"X=1\" && call npm test. PowerShell: powershell Get-ChildItem.",
         },
         cwd: {
           type: "string",
           description:
-            "Рабочая папка: относительный путь или C:/Users/... (слэш /). Можно опустить — projectRoot. В JSON один \\ пишется как \\\\, не как \\\\\\\\.",
+            "Рабочая папка: относительный путь или C:/Users/... (слэш /). Можно опустить — projectRoot. В JSON один \\ = \"\\\\\".",
         },
       },
       required: ["command"],
@@ -169,7 +169,7 @@ export function toolsPromptBlock(
     ...extras.map((t) => `- ${t.name}: ${t.description || "MCP tool"}`),
   ];
   const rules = opts?.compact
-    ? `Формат: JSON {"thought","tool":{"name","args"}|null,"final"|null}. Пиши код через write_file. Windows paths.`
+    ? `Формат: JSON {"thought","tool":{"name","args"}|null,"final"|null}. Код только write_file. Windows/cmd: dir, type, call npm, python; пути C:/… или relative. Без bash/export/<<EOF.`
     : `Формат ответа на каждом шаге — строго JSON в обычном тексте ответа (не в reasoning/thinking):
 {
   "thought": "краткие рассуждения",
@@ -186,8 +186,12 @@ export function toolsPromptBlock(
 - Не выдумывай, что файл уже создан: сначала write_file, потом final с путём и командой запуска.
 - final — короткий итог (пути, как запустить), без огромных листингов.
 - Если нужен инструмент — заполни tool и оставь final=null.
-- ОС Windows: в run_terminal используй cmd (dir, type, del, copy, npm, python) или префикс powershell …. Bash (ls/cat/rm) адаптируется частично.
-- Пути: относительно папки проекта или абсолютные с / (пример: C:/Users/Name/proj). Не пиши C:\\\\… и не учетверяй слэши. В JSON один \\ = "\\\\", не "\\\\\\\\". Unix /Users/… система поправит, но лучше относительные.
+- ОС Windows (cmd.exe по умолчанию):
+  • OK: dir, type, del, copy, mkdir, call npm test, call npx …, python main.py, git status, set "VAR=1" && call npm test
+  • PowerShell: префикс powershell … (пример: powershell Get-ChildItem)
+  • НЕЛЬЗЯ: export, VAR=value cmd, <<EOF, $(…), backticks, /Users/…, /tmp/…, 2>/dev/null, ls|grep|cat>file
+  • Одиночные ls/cat/rm/pwd система может адаптировать; цепочки пиши сразу на cmd.
+- Пути в args: относительно проекта или C:/Users/Name/proj (слэш /). В JSON один \\ = "\\\\". Не учетверяй слэши. Unix-пути в command не исправляются — используй relative или C:/.
 - Пустой cwd = папка проекта. Не удаляй корень проекта.
 - Код пиши только через write_file/apply_patch, не через echo/cat/heredoc в shell.
 - В system уже есть карта проекта и автоподобранные фрагменты (как @codebase в Cursor). Уточняй через search/read_file; можно опираться на пути из карты.`;

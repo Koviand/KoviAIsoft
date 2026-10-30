@@ -2,7 +2,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { app, BrowserWindow, dialog, ipcMain, nativeImage } from "electron";
 import type { AppSettings, McpServerConfig } from "@kovi/shared";
-import { IPC } from "@kovi/shared";
+import {
+  IPC,
+  assertAppSettingsDeep,
+  assertResolveConfirmation,
+  assertSessionExportBundle,
+} from "@kovi/shared";
 import { AppService, setAppDataDir } from "@kovi/core";
 
 let mainWindow: BrowserWindow | null = null;
@@ -131,23 +136,7 @@ function parentForDialog(event: Electron.IpcMainInvokeEvent): BrowserWindow | un
 }
 
 function assertSettingsShape(settings: unknown): AppSettings {
-  if (!settings || typeof settings !== "object") {
-    throw new Error("Некорректные настройки");
-  }
-  const s = settings as AppSettings;
-  if (s.projectRoot != null && typeof s.projectRoot !== "string") {
-    throw new Error("projectRoot должен быть строкой или null");
-  }
-  if (s.modelRoots && !Array.isArray(s.modelRoots)) {
-    throw new Error("modelRoots должен быть массивом");
-  }
-  if (s.downloadDir != null && typeof s.downloadDir !== "string") {
-    throw new Error("downloadDir должен быть строкой");
-  }
-  if (s.mcpServers && !Array.isArray(s.mcpServers)) {
-    throw new Error("mcpServers должен быть массивом");
-  }
-  return s;
+  return assertAppSettingsDeep(settings);
 }
 
 function assertMcpServer(server: unknown): McpServerConfig {
@@ -352,6 +341,12 @@ function registerIpc(svc: AppService): void {
   );
   ipcMain.handle(IPC.listModels, () => svc.listModels());
   ipcMain.handle(IPC.scanModels, () => svc.scanModels());
+  ipcMain.handle(IPC.deleteModel, (_e, modelId) => {
+    if (typeof modelId !== "string" || !modelId.trim()) {
+      throw new Error("modelId должен быть непустой строкой");
+    }
+    return svc.deleteModel(modelId);
+  });
   ipcMain.handle(IPC.getModelRecommendations, () => svc.getModelRecommendations());
   ipcMain.handle(IPC.suggestHardwareLoadSettings, (_e, opts) =>
     svc.suggestHardwareLoadSettings(opts),
@@ -407,9 +402,10 @@ function registerIpc(svc: AppService): void {
       });
     });
   });
-  ipcMain.handle(IPC.resolveConfirmation, (_e, req) =>
-    svc.resolveConfirmation(req.confirmationId, req.approved, req.rememberForSession),
-  );
+  ipcMain.handle(IPC.resolveConfirmation, (_e, req) => {
+    const r = assertResolveConfirmation(req);
+    return svc.resolveConfirmation(r.confirmationId, r.approved, r.rememberForSession);
+  });
   ipcMain.handle(IPC.cancelAgent, () => svc.stopGeneration());
   ipcMain.handle(IPC.pickDirectory, async (e) => {
     const parent = parentForDialog(e);
@@ -440,7 +436,9 @@ function registerIpc(svc: AppService): void {
     return monitorWindow.isAlwaysOnTop();
   });
   ipcMain.handle(IPC.exportSession, (_e, sessionId: string) => svc.exportSession(sessionId));
-  ipcMain.handle(IPC.importSession, (_e, bundle) => svc.importSession(bundle));
+  ipcMain.handle(IPC.importSession, (_e, bundle) =>
+    svc.importSession(assertSessionExportBundle(bundle)),
+  );
   ipcMain.handle(IPC.getErrorLog, () => svc.getErrorLog());
   ipcMain.handle(IPC.checkMcpHealth, (_e, server) => svc.checkMcpHealth(assertMcpServer(server)));
   ipcMain.handle(IPC.verifyGguf, (_e, modelId: string) => svc.verifyGguf(modelId));

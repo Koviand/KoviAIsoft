@@ -339,6 +339,8 @@ export type AgentEvent =
   | { type: "tool_call"; name: string; args: Record<string, unknown>; callId: string }
   | { type: "tool_result"; callId: string; result: string; isError?: boolean }
   | { type: "confirmation_required"; confirmation: AgentConfirmation }
+  /** Auto-rejected because the user did not answer within the confirm timeout. */
+  | { type: "confirmation_timeout"; confirmationId: string; toolName: string }
   /**
    * @deprecated Prefer `stream`. Agent no longer emits `token` (P0-4 / P2-11).
    * Kept for older UI builds.

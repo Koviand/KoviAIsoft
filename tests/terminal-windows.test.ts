@@ -59,9 +59,29 @@ describe("Windows agent shell helpers", () => {
     expect(adaptCommandForWindows("rm -rf build")).toMatch(/^rmdir \/s \/q/);
     expect(adaptCommandForWindows("which node")).toMatch(/^where/);
     expect(adaptCommandForWindows("cp a.txt b.txt")).toMatch(/^copy \/y/);
-    expect(adaptCommandForWindows("npm test")).toBe("npm test");
+    expect(adaptCommandForWindows("npm test")).toBe("call npm test");
     expect(adaptCommandForWindows("powershell Get-Date")).toBe("powershell Get-Date");
     expect(() => adaptCommandForWindows("rm -rf .")).toThrow(/Опасная/);
+  });
+
+  it("adapts chained commands and env/export for cmd", () => {
+    expect(adaptCommandForWindows("ls && npm test")).toBe("dir /b && call npm test");
+    expect(adaptCommandForWindows("export NODE_ENV=production && npm test")).toBe(
+      'set "NODE_ENV=production" && call npm test',
+    );
+    expect(adaptCommandForWindows("NODE_ENV=production npm test")).toBe(
+      'set "NODE_ENV=production" && call npm test',
+    );
+    expect(adaptCommandForWindows("mkdir -p dist && ls")).toMatch(/mkdir .+ && dir \/b/);
+    expect(adaptCommandForWindows("python -c 'print(1)'")).toBe('python -c "print(1)"');
+    expect(adaptCommandForWindows("cd D:\\work && dir")).toMatch(/^cd \/d D:\\work && dir$/i);
+    expect(() => adaptCommandForWindows("echo $(pwd)")).toThrow(/bash|powershell/i);
+  });
+
+  it("does not treat git commit heredoc as write_file redirect", () => {
+    expect(() =>
+      adaptCommandForWindows("git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\""),
+    ).toThrow(/Heredoc|git commit/i);
   });
 
   it("blocks shell cwd in Windows system trees", () => {

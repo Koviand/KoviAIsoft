@@ -7,7 +7,7 @@ import {
   fitMessagesToContext,
   isContextOverflowError,
 } from "./contextBudget.js";
-import { formatLlmFetchError, pickCompletionText } from "./llmErrors.js";
+import { formatLlmFetchError, pickCompletionText, stripThinkTags } from "./llmErrors.js";
 
 export type TokenHandler = (p: {
   sessionId: string;
@@ -326,6 +326,7 @@ export class ChatEngine {
       }
 
       let content = "";
+      let reasoning = "";
       let truncated = false;
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -358,8 +359,10 @@ export class ChatEngine {
             const finish = json.choices?.[0]?.finish_reason;
             if (finish === "length") truncated = true;
             const delta = json.choices?.[0]?.delta;
-            const piece =
-              delta?.content || delta?.text || delta?.reasoning_content || delta?.reasoning || "";
+            // Never mix thinking into JSON content — models often stream reasoning first.
+            const reason = delta?.reasoning_content || delta?.reasoning || "";
+            if (reason) reasoning += reason;
+            const piece = delta?.content || delta?.text || "";
             if (!piece) continue;
             content += piece;
             if (sessionId) {
@@ -381,46 +384,55 @@ export class ChatEngine {
       }
       // Fallback if server ignored stream and returned empty (rare).
       if (!content.trim()) {
-        const packed2 = fitMessagesToContext(msgs, ctx, maxTokens);
-        const res2 = await fetch(`${base}/chat/completions`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal,
-          body: JSON.stringify({
-            model: "local",
-            messages: packed2,
-            temperature: params.temperature,
-            top_p: params.topP,
-            max_tokens: maxTokens,
-            stream: false,
-          }),
-        });
-        if (!res2.ok) {
-          const text = await res2.text();
-          throw new Error(`Ошибка LLM: ${res2.status} ${text}`);
-        }
-        const json = (await res2.json()) as {
-          choices?: Array<{
-            message?: {
-              content?: string;
-              reasoning_content?: string;
-              reasoning?: string;
-            };
-            finish_reason?: string;
-          }>;
-        };
-        const choice = json.choices?.[0];
-        content = pickCompletionText(choice?.message);
-        if (choice?.finish_reason === "length" && !content.trim()) {
-          throw new Error(
-            "Ответ LLM обрезан по max_tokens (finish_reason=length). Упростите шаг: пишите один файл целиком через write_file или увеличьте лимит токенов.",
-          );
-        }
-        if (sessionId && content) {
-          this.onToken?.({ sessionId, text: content, draft: true });
+        // Some local models put the whole JSON only in reasoning_content.
+        if (reasoning.trim()) {
+          content = reasoning;
+          if (sessionId) {
+            this.onToken?.({ sessionId, text: content, draft: true });
+          }
+        } else {
+          const packed2 = fitMessagesToContext(msgs, ctx, maxTokens);
+          const res2 = await fetch(`${base}/chat/completions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            signal,
+            body: JSON.stringify({
+              model: "local",
+              messages: packed2,
+              temperature: params.temperature,
+              top_p: params.topP,
+              max_tokens: maxTokens,
+              stream: false,
+            }),
+          });
+          if (!res2.ok) {
+            const text = await res2.text();
+            throw new Error(`Ошибка LLM: ${res2.status} ${text}`);
+          }
+          const json = (await res2.json()) as {
+            choices?: Array<{
+              message?: {
+                content?: string;
+                reasoning_content?: string;
+                reasoning?: string;
+              };
+              finish_reason?: string;
+            }>;
+          };
+          const choice = json.choices?.[0];
+          content = pickCompletionText(choice?.message);
+          if (choice?.finish_reason === "length" && !content.trim()) {
+            throw new Error(
+              "Ответ LLM обрезан по max_tokens (finish_reason=length). Упростите шаг: пишите один файл целиком через write_file или увеличьте лимит токенов.",
+            );
+          }
+          if (sessionId && content) {
+            this.onToken?.({ sessionId, text: content, draft: true });
+          }
         }
       }
-      return content;
+      // Strip <think> blocks that some models embed in content (breaks extractJson).
+      return stripThinkTags(content);
     };
 
     // Reuse / replace abort so agent cancel (chat.stop) interrupts JSON calls too.

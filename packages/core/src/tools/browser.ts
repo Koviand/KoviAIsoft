@@ -68,6 +68,7 @@ export class BrowserTooling {
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
+  private ssrfRouteInstalled = false;
 
   private async ensurePage(): Promise<Page> {
     try {
@@ -77,6 +78,24 @@ export class BrowserTooling {
       if (!this.context) {
         this.context = await this.browser.newContext();
         this.page = await this.context.newPage();
+        this.ssrfRouteInstalled = false;
+      }
+      if (!this.ssrfRouteInstalled && this.context) {
+        // Abort navigations (incl. redirects) to private/local targets mid-flight.
+        await this.context.route("**/*", async (route) => {
+          const req = route.request();
+          if (req.isNavigationRequest() || req.resourceType() === "document") {
+            try {
+              await assertSafeNavigateUrl(req.url());
+              await route.continue();
+            } catch {
+              await route.abort("blockedbyclient");
+            }
+            return;
+          }
+          await route.continue();
+        });
+        this.ssrfRouteInstalled = true;
       }
       if (!this.page) {
         this.page = await this.context.newPage();
@@ -93,7 +112,19 @@ export class BrowserTooling {
   async navigate(url: string): Promise<string> {
     const parsed = await assertSafeNavigateUrl(url);
     const page = await this.ensurePage();
-    await page.goto(parsed.toString(), { waitUntil: "domcontentloaded", timeout: 45000 });
+    try {
+      await page.goto(parsed.toString(), { waitUntil: "domcontentloaded", timeout: 45000 });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/net::ERR_BLOCKED_BY_CLIENT|blockedbyclient/i.test(msg)) {
+        throw new Error(
+          `Навигация/redirect заблокирован SSRF-защитой (приватный или служебный URL)`,
+        );
+      }
+      throw err;
+    }
+    // Final URL after redirects must also pass the guard.
+    await assertSafeNavigateUrl(page.url());
     return `Opened ${page.url()} title=${await page.title()}`;
   }
 
@@ -106,6 +137,7 @@ export class BrowserTooling {
   async click(selector: string): Promise<string> {
     const page = await this.ensurePage();
     await page.click(selector, { timeout: 15000 });
+    await assertSafeNavigateUrl(page.url()).catch(() => undefined);
     return `Clicked ${selector}`;
   }
 
@@ -121,5 +153,6 @@ export class BrowserTooling {
     this.browser = null;
     this.context = null;
     this.page = null;
+    this.ssrfRouteInstalled = false;
   }
 }

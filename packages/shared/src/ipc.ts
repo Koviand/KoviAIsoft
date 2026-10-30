@@ -34,6 +34,7 @@ export const IPC = {
   ensureLatestRuntime: "kovi:ensureLatestRuntime",
   listModels: "kovi:listModels",
   scanModels: "kovi:scanModels",
+  deleteModel: "kovi:deleteModel",
   getModelRecommendations: "kovi:getModelRecommendations",
   suggestHardwareLoadSettings: "kovi:suggestHardwareLoadSettings",
   applyHardwareLoadSettings: "kovi:applyHardwareLoadSettings",
@@ -165,6 +166,8 @@ export interface KoviApi {
   }>;
   listModels(): Promise<LocalModel[]>;
   scanModels(): Promise<LocalModel[]>;
+  /** Delete local GGUF from disk (unloads first if active). */
+  deleteModel(modelId: string): Promise<LocalModel[]>;
   getModelRecommendations(): Promise<ModelRecommendationsReport>;
   suggestHardwareLoadSettings(opts?: {
     modelId?: string;

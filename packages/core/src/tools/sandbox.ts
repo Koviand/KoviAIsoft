@@ -306,6 +306,63 @@ export function isDangerousWrite(target: string): boolean {
  * - project mode: must stay inside projectRoot
  * - disk mode: must stay inside projectRoot ∪ modelRoots (same as file tools)
  */
+/**
+ * Block absolute `cd` / Set-Location outside allowed roots and common download+exec patterns.
+ * Relative paths are allowed (cwd is already sandboxed).
+ */
+export function assertShellCommandPolicy(
+  command: string,
+  allowedRoots: string[],
+): void {
+  const cmd = String(command || "");
+  if (!cmd.trim()) return;
+
+  if (
+    /Invoke-WebRequest[\s\S]{0,240}\|\s*i(ex|nvoke-expression)/i.test(cmd) ||
+    /\biwr\b[\s\S]{0,120}\|\s*iex\b/i.test(cmd) ||
+    /curl(\.exe)?[\s\S]{0,120}\|\s*(ba)?sh\b/i.test(cmd) ||
+    /wget(\.exe)?[\s\S]{0,120}\|\s*(ba)?sh\b/i.test(cmd)
+  ) {
+    throw new Error(
+      "Команда download→exec запрещена (pipe в iex/sh). Скачайте файл отдельно и проверьте его.",
+    );
+  }
+
+  const roots = allowedRoots.filter(Boolean).map((r) => normalizePath(r));
+  if (roots.length === 0) return;
+
+  const cdRe =
+    /(?:^|[\n;&|]\s*)(?:cd(?:\s+\/[dD])?|chdir|Set-Location|\bsl)\s+(?:"([^"]+)"|'([^']+)'|([^\n;&|]+))/gi;
+  let m: RegExpExecArray | null;
+  while ((m = cdRe.exec(cmd)) !== null) {
+    const raw = (m[1] || m[2] || m[3] || "").trim();
+    if (!raw || raw === "." || raw === ".." || /^[~%]/.test(raw)) continue;
+    // Skip /d flag leftovers and switches
+    if (/^\/[a-z]$/i.test(raw)) continue;
+    const candidate = collapseOverEscapedWinPath(raw.replace(/^\/d\s+/i, "").trim());
+    const isAbs =
+      /^[a-zA-Z]:[\\/]/.test(candidate) ||
+      candidate.startsWith("\\\\") ||
+      candidate.startsWith("//") ||
+      /^\/[a-zA-Z]\//.test(candidate);
+    if (!isAbs) continue;
+    let resolved: string;
+    try {
+      resolved = normalizePath(candidate.replace(/^\/([a-zA-Z])\//, "$1:/"));
+    } catch {
+      continue;
+    }
+    const ok = roots.some(
+      (root) => isPathInside(resolved, root) || isPathInside(realPathSafe(resolved), realPathSafe(root)),
+    );
+    if (!ok) {
+      throw new Error(
+        `Смена каталога вне разрешённых папок запрещена: ${resolved}`,
+      );
+    }
+  }
+}
+
 export function assertTerminalCwd(
   cwd: string,
   mode: FileAccessMode,

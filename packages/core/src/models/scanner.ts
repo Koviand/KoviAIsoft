@@ -56,6 +56,20 @@ function estimateFit(
   };
 }
 
+function isReparseOrLink(full: string, ent: fs.Dirent): boolean {
+  if (ent.isSymbolicLink()) return true;
+  try {
+    const st = fs.lstatSync(full);
+    if (st.isSymbolicLink()) return true;
+    const attrs = (st as fs.Stats & { fileAttributes?: number }).fileAttributes;
+    // Windows FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+    if (typeof attrs === "number" && (attrs & 0x400) !== 0) return true;
+  } catch {
+    return true;
+  }
+  return false;
+}
+
 function walkGguf(root: string, out: string[], depth = 0): void {
   if (depth > 6) return;
   let entries: fs.Dirent[];
@@ -67,6 +81,8 @@ function walkGguf(root: string, out: string[], depth = 0): void {
   for (const e of entries) {
     if (e.name === ".cache" || e.name === "node_modules" || e.name.startsWith(".")) continue;
     const full = path.join(root, e.name);
+    // Do not follow junctions/symlinks — they can escape modelRoots.
+    if (isReparseOrLink(full, e)) continue;
     if (e.isDirectory()) {
       walkGguf(full, out, depth + 1);
     } else if (e.isFile() && e.name.toLowerCase().endsWith(".gguf") && !/mmproj/i.test(e.name)) {

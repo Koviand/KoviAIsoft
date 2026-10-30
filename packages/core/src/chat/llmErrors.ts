@@ -61,6 +61,18 @@ export function formatLlmFetchError(err: unknown, baseUrl: string | null): Error
   return err instanceof Error ? err : new Error(raw);
 }
 
+/**
+ * Remove LFM/Qwen-style &lt;think&gt; / &lt;thinking&gt; blocks so agent JSON parse is not polluted.
+ */
+export function stripThinkTags(text: string): string {
+  if (!text) return text;
+  return text
+    .replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, "")
+    .replace(/<thinking\b[^>]*>[\s\S]*?<\/thinking>/gi, "")
+    .replace(/<\/?(?:think|thinking)\b[^>]*>/gi, "")
+    .trim();
+}
+
 /** Extract assistant text from OpenAI-compatible chat completion payloads (LFM puts JSON in reasoning). */
 export function pickCompletionText(message: {
   content?: string | null;
@@ -70,14 +82,14 @@ export function pickCompletionText(message: {
 } | null | undefined): string {
   if (!message) return "";
   if (typeof message.content === "string" && message.content.trim()) {
-    return message.content;
+    return stripThinkTags(message.content);
   }
   if (typeof message.reasoning_content === "string" && message.reasoning_content.trim()) {
-    return message.reasoning_content;
+    return stripThinkTags(message.reasoning_content);
   }
   if (typeof message.reasoning === "string" && message.reasoning.trim()) {
-    return message.reasoning;
+    return stripThinkTags(message.reasoning);
   }
-  if (typeof message.text === "string") return message.text;
+  if (typeof message.text === "string") return stripThinkTags(message.text);
   return "";
 }

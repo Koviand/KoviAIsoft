@@ -4,11 +4,8 @@ import {
   truncateToTokens,
 } from "../chat/contextBudget.js";
 import { loadProjectMemory } from "../agent/projectMemory.js";
-import { buildProjectMap } from "./projectMap.js";
-import {
-  formatRetrievedSnippets,
-  retrieveProjectContext,
-} from "./retrieve.js";
+import { projectContextCache } from "./projectCache.js";
+import { formatRetrievedSnippets } from "./retrieve.js";
 
 export interface ContextLayer {
   /** Stable id for tests / debugging */
@@ -130,7 +127,7 @@ export async function buildProjectContext(
   let filesMapped = 0;
 
   if (projectRoot) {
-    const snippets = await retrieveProjectContext(projectRoot, input.userQuery, {
+    const snippets = await projectContextCache.getRetrieved(projectRoot, input.userQuery, {
       maxFiles: ctx >= 12000 ? 8 : 5,
       maxBytesPerFile: ctx >= 12000 ? 4500 : 2800,
       maxTotalBytes: ctx >= 12000 ? 20_000 : 12_000,
@@ -147,7 +144,7 @@ export async function buildProjectContext(
     }
 
     try {
-      const map = buildProjectMap(projectRoot, {
+      const map = projectContextCache.getMap(projectRoot, {
         maxEntries: ctx >= 12000 ? 350 : 180,
         maxDepth: 5,
       });

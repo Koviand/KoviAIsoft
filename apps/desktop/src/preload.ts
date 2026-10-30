@@ -13,6 +13,7 @@ const api: KoviApi = {
     ipcRenderer.invoke(IPC.ensureLatestRuntime, backend, force),
   listModels: () => ipcRenderer.invoke(IPC.listModels),
   scanModels: () => ipcRenderer.invoke(IPC.scanModels),
+  deleteModel: (modelId) => ipcRenderer.invoke(IPC.deleteModel, modelId),
   getModelRecommendations: () => ipcRenderer.invoke(IPC.getModelRecommendations),
   suggestHardwareLoadSettings: (opts) =>
     ipcRenderer.invoke(IPC.suggestHardwareLoadSettings, opts),

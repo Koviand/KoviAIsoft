@@ -49,7 +49,13 @@ export {
   isShellFileWriteAttempt,
   resolveTerminalCwd,
   runTerminal,
+  splitShellChain,
 } from "./tools/terminal.js";
+export {
+  detectAgentTask,
+  detectCodingTask,
+  detectToolAction,
+} from "./agent/intent.js";
 export { applyTextReplace } from "./tools/textReplace.js";
 export { writeFileAtomic, writeFileAtomicSync } from "./fsAtomic.js";
 // resolveAgentPath exported via sandbox *

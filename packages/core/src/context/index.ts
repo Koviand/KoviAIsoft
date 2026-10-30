@@ -6,6 +6,10 @@ export {
 } from "./ignore.js";
 export { buildProjectMap, type ProjectMapResult } from "./projectMap.js";
 export {
+  ProjectContextCache,
+  projectContextCache,
+} from "./projectCache.js";
+export {
   extractKeywords,
   extractPathMentions,
   formatRetrievedSnippets,

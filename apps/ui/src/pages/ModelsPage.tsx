@@ -196,6 +196,25 @@ export function ModelsPage(props: {
     }
   }
 
+  async function removeModel(modelId: string, name: string): Promise<void> {
+    const ok = window.confirm(
+      `Удалить модель «${name}» с диска?\n\nФайл .gguf будет удалён безвозвратно.`,
+    );
+    if (!ok) return;
+    setWorking(true);
+    setHint(null);
+    try {
+      const next = await api.deleteModel(modelId);
+      props.setModels(next);
+      await props.refresh();
+      setHint(`Модель «${name}» удалена`);
+    } catch (e) {
+      props.setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setWorking(false);
+    }
+  }
+
   async function setProfile(id: string): Promise<void> {
     if (!props.settings) return;
     try {
@@ -472,7 +491,7 @@ export function ModelsPage(props: {
                     {m.fitsInVram === false ? " · может не влезть целиком в VRAM" : ""}
                     {m.integrityOk === false && m.integrityError ? ` · ${m.integrityError}` : ""}
                   </div>
-                  <div className="row" style={{ marginTop: 10 }}>
+                  <div className="row" style={{ marginTop: 10, flexWrap: "wrap", gap: 8 }}>
                     <button
                       className="btn primary"
                       type="button"
@@ -488,6 +507,15 @@ export function ModelsPage(props: {
                       onClick={() => void verify(m.id)}
                     >
                       Проверить GGUF
+                    </button>
+                    <button
+                      className="btn ghost"
+                      type="button"
+                      disabled={working}
+                      title="Удалить файл .gguf с диска"
+                      onClick={() => void removeModel(m.id, m.name)}
+                    >
+                      Удалить
                     </button>
                   </div>
                 </div>
