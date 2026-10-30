@@ -14,6 +14,9 @@ export function OnboardingWizard(props: {
     props.settings.runtimeBackendPreference || "auto",
   );
   const [modelRoot, setModelRoot] = useState(props.settings.modelRoots[0] || "C:\\Models\\LFM");
+  const [downloadDir, setDownloadDir] = useState(
+    props.settings.downloadDir || props.settings.modelRoots[0] || "C:\\Models\\LFM",
+  );
   const [projectRoot, setProjectRoot] = useState(props.settings.projectRoot || "");
   const [risk, setRisk] = useState<AgentRiskMode>(props.settings.agentRiskMode || "ask");
   const [status, setStatus] = useState("");
@@ -29,9 +32,11 @@ export function OnboardingWizard(props: {
     setBusy(true);
     setStatus("Сохраняю настройки…");
     try {
+      const roots = [...new Set([modelRoot, downloadDir].filter(Boolean))];
       await savePartial({
         runtimeBackendPreference: backend,
-        modelRoots: [modelRoot],
+        modelRoots: roots.length ? roots : [modelRoot],
+        downloadDir: downloadDir || modelRoot,
         projectRoot: projectRoot || null,
         agentRiskMode: risk,
         onboardingCompleted: true,
@@ -104,9 +109,11 @@ export function OnboardingWizard(props: {
         {step === 1 && (
           <section className="wizard-step">
             <h2>Папки</h2>
-            <p className="muted">Где искать GGUF и корень проекта для агента (AGENTS.md).</p>
+            <p className="muted">
+              Где искать GGUF, куда сохранять загрузки с HF и корень проекта для агента (AGENTS.md).
+            </p>
             <label>
-              Папка моделей
+              Папка моделей (сканирование)
               <div className="row">
                 <input
                   className="input"
@@ -119,7 +126,31 @@ export function OnboardingWizard(props: {
                   type="button"
                   onClick={async () => {
                     const p = await api.pickDirectory();
-                    if (p) setModelRoot(p);
+                    if (p) {
+                      setModelRoot(p);
+                      if (!downloadDir) setDownloadDir(p);
+                    }
+                  }}
+                >
+                  …
+                </button>
+              </div>
+            </label>
+            <label style={{ marginTop: 12, display: "block" }}>
+              Папка загрузки моделей
+              <div className="row">
+                <input
+                  className="input"
+                  style={{ flex: 1 }}
+                  value={downloadDir}
+                  onChange={(e) => setDownloadDir(e.target.value)}
+                />
+                <button
+                  className="btn"
+                  type="button"
+                  onClick={async () => {
+                    const p = await api.pickDirectory();
+                    if (p) setDownloadDir(p);
                   }}
                 >
                   …

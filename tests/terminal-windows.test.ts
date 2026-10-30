@@ -6,6 +6,7 @@ import { createDefaultSettings } from "../packages/shared/src/types";
 import { assertTerminalCwd } from "../packages/core/src/tools/sandbox";
 import {
   adaptCommandForWindows,
+  collapseOverEscapedWinPathsInCommand,
   isBlankCwd,
   resolveTerminalCwd,
   runTerminal,
@@ -34,6 +35,21 @@ describe("Windows agent shell helpers", () => {
     expect(resolveTerminalCwd("src/app", root).toLowerCase()).toContain("src");
     expect(resolveTerminalCwd("C:/Temp/work", root).toLowerCase()).toContain("temp");
     expect(() => resolveTerminalCwd("", null)).toThrow(/папк/);
+  });
+
+  it("collapses over-escaped drive paths inside commands", () => {
+    const fixed = collapseOverEscapedWinPathsInCommand("dir C:\\\\Users\\\\Kovi\\\\proj");
+    expect(fixed.toLowerCase()).toBe("dir C:\\Users\\Kovi\\proj".toLowerCase());
+    expect(collapseOverEscapedWinPathsInCommand("echo hi")).toBe("echo hi");
+    expect(collapseOverEscapedWinPathsInCommand("type C:\\Users\\a.txt").toLowerCase()).toBe(
+      "type C:\\Users\\a.txt".toLowerCase(),
+    );
+  });
+
+  it("resolves over-escaped cwd the same as a normal path", () => {
+    const root = "C:\\Users\\Kovi\\proj";
+    const over = "C:\\\\Users\\\\Kovi\\\\proj";
+    expect(resolveTerminalCwd(over, root).toLowerCase()).toBe(path.resolve(root).toLowerCase());
   });
 
   it("adapts common unix one-liners to cmd", () => {
@@ -72,6 +88,20 @@ describe("runTerminal on Windows", () => {
     expect(out).toMatch(/exit: 0/);
     expect(out).toMatch(/hello-kovi/i);
     expect(out).toMatch(/cwd:/i);
+  });
+
+  it("accepts over-escaped cwd from model JSON", async () => {
+    if (process.platform !== "win32") return;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kovi-shell-"));
+    temps.push(dir);
+    const settings = createDefaultSettings(dir);
+    settings.projectRoot = dir;
+    settings.fileAccessMode = "disk";
+    // Simulate path after JSON.parse of "C:\\\\…\\\\…"
+    const overEscaped = dir.replace(/\\/g, "\\\\");
+    const out = await runTerminal("echo ok-escape", overEscaped, settings);
+    expect(out).toMatch(/exit: 0/);
+    expect(out).toMatch(/ok-escape/i);
   });
 
   it("returns non-zero exit instead of throwing", async () => {

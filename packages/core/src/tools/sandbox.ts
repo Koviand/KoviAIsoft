@@ -32,6 +32,29 @@ export function normalizePath(p: string): string {
 }
 
 /**
+ * Collapse accidental over-escaped backslashes from model JSON
+ * (C:\\Users\\foo → C:\Users\foo). Preserves UNC leading \\.
+ */
+export function collapseOverEscapedWinPath(input: string): string {
+  const s = input.trim();
+  if (!s) return s;
+  // UNC: \\server\share — keep exactly two leading backslashes, collapse the rest
+  if (/^\\\\[^\\/]/.test(s) || /^\/\/[^\\/]/.test(s)) {
+    const rest = s.slice(2).replace(/\\{2,}/g, "\\");
+    return s.slice(0, 2) + rest;
+  }
+  // Drive letter: C:\… or C:\\…
+  if (/^[a-zA-Z]:/.test(s)) {
+    return s.slice(0, 2) + s.slice(2).replace(/\\{2,}/g, "\\");
+  }
+  // Relative / other: collapse doubled backslashes only
+  if (s.includes("\\\\")) {
+    return s.replace(/\\{2,}/g, "\\");
+  }
+  return s;
+}
+
+/**
  * Resolve agent file/cwd paths for Windows:
  * - blank → projectRoot (when required)
  * - /C:/… or /c|… (MSYS/Git Bash) → real Windows absolute
@@ -55,6 +78,8 @@ export function resolveAgentPath(
     }
     throw new Error("Путь не задан");
   }
+
+  input = collapseOverEscapedWinPath(input);
 
   // UNC keep as-is (//server/share or \\server\share)
   if (/^(\\\\|\/\/)[^\\/]+/.test(input)) {

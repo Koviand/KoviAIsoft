@@ -1,3 +1,4 @@
+import type { AgentWorkingMemory } from "../agent/workingMemory.js";
 import { estimateTokens, truncateToTokens } from "../chat/contextBudget.js";
 
 export type TranscriptMsg = { role: string; content: string; toolName?: string };
@@ -9,9 +10,28 @@ export type TranscriptMsg = { role: string; content: string; toolName?: string }
 export function summarizeTranscript(
   messages: TranscriptMsg[],
   maxTokens = 400,
+  workingMemory?: AgentWorkingMemory | null,
 ): string {
-  if (!messages.length) return "";
+  if (!messages.length && !workingMemory) return "";
   const bullets: string[] = [];
+  if (workingMemory) {
+    bullets.push(`- goal: ${workingMemory.goal}`);
+    if (workingMemory.plan.length) {
+      const done = workingMemory.plan.filter((p) => p.status === "done").length;
+      bullets.push(
+        `- plan: ${done}/${workingMemory.plan.length} done — ${workingMemory.plan
+          .map((p) => `[${p.status}] ${p.title}`)
+          .slice(0, 8)
+          .join("; ")}`,
+      );
+    }
+    if (workingMemory.filesTouched.length) {
+      bullets.push(`- files: ${workingMemory.filesTouched.slice(-10).join(", ")}`);
+    }
+    if (workingMemory.lastError) {
+      bullets.push(`- last_error: ${workingMemory.lastError}`);
+    }
+  }
   for (const m of messages) {
     const c = m.content.replace(/\s+/g, " ").trim();
     if (!c) continue;
@@ -56,7 +76,12 @@ export function summarizeTranscript(
  */
 export function condenseTranscript<T extends { role: string; content: string }>(
   transcript: T[],
-  opts?: { keepRecent?: number; summaryTokens?: number; triggerMessages?: number },
+  opts?: {
+    keepRecent?: number;
+    summaryTokens?: number;
+    triggerMessages?: number;
+    workingMemory?: AgentWorkingMemory | null;
+  },
 ): T[] {
   const keepRecent = opts?.keepRecent ?? 8;
   const summaryTokens = opts?.summaryTokens ?? 350;
@@ -69,7 +94,7 @@ export function condenseTranscript<T extends { role: string; content: string }>(
 
   const old = rest.slice(0, rest.length - keepRecent);
   const recent = rest.slice(rest.length - keepRecent);
-  const summary = summarizeTranscript(old, summaryTokens);
+  const summary = summarizeTranscript(old, summaryTokens, opts?.workingMemory);
   if (!summary) return transcript;
 
   const summaryMsg = {

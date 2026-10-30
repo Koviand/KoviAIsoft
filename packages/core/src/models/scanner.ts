@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { LocalModel, SystemInfo } from "@kovi/shared";
+import type { LocalModel, ModelPerfTier, SystemInfo } from "@kovi/shared";
 import { createHash } from "node:crypto";
 import { withIntegrity } from "./integrity.js";
 
@@ -126,4 +126,31 @@ export function recommendQuantFiles(
     })
     .sort((a, b) => b.score - a.score);
   return scored.slice(0, 5).map((s) => s.path);
+}
+
+/** Green/yellow/red fit class for a GGUF size on this PC. */
+export function classifyPerfTier(
+  sizeBytes: number,
+  vramGb: number | null | undefined,
+  ramGb: number,
+): ModelPerfTier {
+  const sizeGb = sizeBytes / 1024 ** 3;
+  let context = 8192;
+  if (vramGb && vramGb < 8) context = 4096;
+  if (vramGb && vramGb >= 16) context = 16384;
+  const kv = context * 0.00025;
+  if (vramGb && vramGb > 0) {
+    const need = sizeGb + kv;
+    const fits = need < vramGb * 0.9;
+    if (fits && sizeGb < vramGb * 0.55) return "excellent";
+    if (fits) return "good";
+    const ngl = Math.max(0, Math.floor((vramGb / need) * 99));
+    if (ngl >= 24) return "tight";
+  }
+  if (sizeGb < Math.max(1, ramGb) * 0.55) return "cpu";
+  return "too_heavy";
+}
+
+export function detectQuantLabel(name: string): string | undefined {
+  return detectQuant(name);
 }

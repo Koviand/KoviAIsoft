@@ -14,10 +14,16 @@ const api: KoviApi = {
   listModels: () => ipcRenderer.invoke(IPC.listModels),
   scanModels: () => ipcRenderer.invoke(IPC.scanModels),
   getModelRecommendations: () => ipcRenderer.invoke(IPC.getModelRecommendations),
+  suggestHardwareLoadSettings: (opts) =>
+    ipcRenderer.invoke(IPC.suggestHardwareLoadSettings, opts),
+  applyHardwareLoadSettings: (opts) =>
+    ipcRenderer.invoke(IPC.applyHardwareLoadSettings, opts),
   searchHf: (query) => ipcRenderer.invoke(IPC.searchHf, query),
   listHfFiles: (modelId) => ipcRenderer.invoke(IPC.listHfFiles, modelId),
   downloadHfFile: (modelId, filePath) =>
     ipcRenderer.invoke(IPC.downloadHfFile, modelId, filePath),
+  getHfCliStatus: () => ipcRenderer.invoke(IPC.getHfCliStatus),
+  ensureHfCli: () => ipcRenderer.invoke(IPC.ensureHfCli),
   loadModel: (modelId, params) => ipcRenderer.invoke(IPC.loadModel, modelId, params),
   unloadModel: () => ipcRenderer.invoke(IPC.unloadModel),
   listSessions: () => ipcRenderer.invoke(IPC.listSessions),

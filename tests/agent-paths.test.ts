@@ -2,12 +2,28 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   assertNotReservedWinName,
+  collapseOverEscapedWinPath,
   isDangerousSystemDir,
   resolveAgentPath,
 } from "../packages/core/src/tools/sandbox";
 
 describe("Windows agent path resolution", () => {
   const root = "C:\\Users\\Kovi\\proj";
+
+  it("collapses over-escaped drive paths from model JSON", () => {
+    // After JSON.parse of "C:\\\\Users\\\\Kovi\\\\proj" the string is C:\\Users\\Kovi\\proj
+    const over = "C:\\\\Users\\\\Kovi\\\\proj";
+    expect(collapseOverEscapedWinPath(over).toLowerCase()).toBe(
+      "C:\\Users\\Kovi\\proj".toLowerCase(),
+    );
+    expect(resolveAgentPath(over, root).toLowerCase()).toBe(
+      path.resolve(root).toLowerCase(),
+    );
+    // Correct single-backslash paths stay intact
+    expect(collapseOverEscapedWinPath("C:\\Users\\Kovi\\proj").toLowerCase()).toBe(
+      "C:\\Users\\Kovi\\proj".toLowerCase(),
+    );
+  });
 
   it("resolves relative and POSIX paths against projectRoot", () => {
     expect(resolveAgentPath("src\\a.ts", root).toLowerCase()).toContain("src");

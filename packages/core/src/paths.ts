@@ -55,3 +55,22 @@ export function getAttachmentsDir(appData: string): string {
   ensureDir(dir);
   return dir;
 }
+
+/**
+ * Portable root: parent of data/ when Electron pins appData next to EXE.
+ * Fallback: appData itself.
+ */
+export function getPortableRoot(appData = getAppDataDir()): string {
+  const base = path.resolve(appData);
+  if (path.basename(base).toLowerCase() === "data") {
+    return path.dirname(base);
+  }
+  return base;
+}
+
+/** Bundled Hugging Face CLI lives at {portable}/tools/hf */
+export function getHfToolsDir(appData = getAppDataDir()): string {
+  const dir = path.join(getPortableRoot(appData), "tools", "hf");
+  ensureDir(dir);
+  return dir;
+}

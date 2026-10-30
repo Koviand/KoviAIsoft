@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { AgentPlanStep } from "@kovi/shared";
 import { statusRu } from "../lib/labels";
 
@@ -17,23 +17,47 @@ export function ProcessTimeline(props: {
   mode: ProcessMode;
   thinking: string;
   streaming: string;
+  /** Live raw tokens while the model generates an agent JSON step. */
+  modelOutput?: string;
+  currentStep?: string | null;
   plan: AgentPlanStep[];
   tools: ProcessToolItem[];
   confirmSummary?: string | null;
 }) {
   const [thinkingOpen, setThinkingOpen] = useState(true);
+  const [draftOpen, setDraftOpen] = useState(true);
   const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
+  const draftEndRef = useRef<HTMLPreElement>(null);
 
-  if (!props.active && !props.thinking && !props.streaming && !props.plan.length && !props.tools.length) {
+  useEffect(() => {
+    if (props.active && props.modelOutput) {
+      draftEndRef.current?.scrollIntoView({ block: "nearest" });
+    }
+  }, [props.modelOutput, props.active]);
+
+  if (
+    !props.active &&
+    !props.thinking &&
+    !props.streaming &&
+    !props.modelOutput &&
+    !props.plan.length &&
+    !props.tools.length &&
+    !props.confirmSummary
+  ) {
     return null;
   }
 
   const modeLabel =
     props.mode === "agent"
-      ? "Действую инструментами…"
+      ? props.currentStep
+        ? `Агент · ${props.currentStep}`
+        : "Агент работает…"
       : props.mode === "chat"
-        ? "Отвечаю…"
+        ? "Модель отвечает…"
         : "Генерация…";
+
+  const ctxMatch = props.thinking?.match(/контекст\s*~?\s*(\d+)\s*\/\s*(\d+)\s*tok/i);
+  const condensed = /сжат(ие|ая)\s+истори/i.test(props.thinking || "");
 
   return (
     <div className="process-timeline msg assistant msg-enter" aria-live="polite">
@@ -43,6 +67,16 @@ export function ProcessTimeline(props: {
           <div className="process-status">
             <span className="gen-dots" aria-hidden="true" />
             <span>{modeLabel}</span>
+            {ctxMatch ? (
+              <span className="muted mono" style={{ marginLeft: 8, fontSize: "0.75rem" }}>
+                ctx {ctxMatch[1]}/{ctxMatch[2]}
+                {condensed ? " · сжатие" : ""}
+              </span>
+            ) : condensed ? (
+              <span className="muted" style={{ marginLeft: 8, fontSize: "0.75rem" }}>
+                сжатие истории
+              </span>
+            ) : null}
           </div>
         )}
 
@@ -54,16 +88,46 @@ export function ProcessTimeline(props: {
               aria-expanded={thinkingOpen}
               onClick={() => setThinkingOpen((v) => !v)}
             >
-              <span className="thinking-label">Размышление</span>
+              <span className="thinking-label">Статус / размышление</span>
               <span className="muted">{thinkingOpen ? "▾" : "▸"}</span>
             </button>
             {thinkingOpen ? (
               <div className="process-thinking-text">
                 {props.thinking}
-                {props.active && !props.streaming ? (
+                {props.active && !props.streaming && !props.modelOutput ? (
                   <span className="caret" aria-hidden="true" />
                 ) : null}
               </div>
+            ) : null}
+          </div>
+        ) : props.active ? (
+          <div className="process-block thinking">
+            <div className="process-thinking-text muted">
+              Ожидание ответа модели…
+              <span className="caret" aria-hidden="true" />
+            </div>
+          </div>
+        ) : null}
+
+        {props.modelOutput ? (
+          <div className="process-block process-draft">
+            <button
+              type="button"
+              className="process-toggle"
+              aria-expanded={draftOpen}
+              onClick={() => setDraftOpen((v) => !v)}
+            >
+              <span className="thinking-label">Вывод модели</span>
+              <span className="muted">
+                {props.modelOutput.length.toLocaleString("ru-RU")} симв.{" "}
+                {draftOpen ? "▾" : "▸"}
+              </span>
+            </button>
+            {draftOpen ? (
+              <pre className="process-draft-text" ref={draftEndRef}>
+                {props.modelOutput}
+                {props.active ? <span className="caret" aria-hidden="true" /> : null}
+              </pre>
             ) : null}
           </div>
         ) : null}

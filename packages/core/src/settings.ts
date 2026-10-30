@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { AppSettings, LoadProfile } from "@kovi/shared";
-import { createDefaultSettings, DEFAULT_LOAD_PROFILES } from "@kovi/shared";
+import { createDefaultSettings, DEFAULT_LOAD_PROFILES, isThemePreset } from "@kovi/shared";
 import { writeFileAtomic, writeFileAtomicSync } from "./fsAtomic.js";
 import { getSettingsPath, ensureDir, getModelsDir } from "./paths.js";
 
@@ -36,9 +36,14 @@ export class SettingsStore {
     return {
       ...defaults,
       ...parsed,
+      themePreset: isThemePreset(parsed.themePreset) ? parsed.themePreset : defaults.themePreset,
       themeCustom: { ...defaults.themeCustom, ...(parsed.themeCustom || {}) },
       defaultParams: { ...defaults.defaultParams, ...(parsed.defaultParams || {}) },
       modelRoots: parsed.modelRoots?.length ? parsed.modelRoots : defaults.modelRoots,
+      downloadDir:
+        typeof parsed.downloadDir === "string" && parsed.downloadDir.trim()
+          ? parsed.downloadDir.trim()
+          : defaults.downloadDir,
       mcpServers: parsed.mcpServers || [],
       autoUpdateRuntime:
         typeof parsed.autoUpdateRuntime === "boolean"
@@ -52,6 +57,13 @@ export class SettingsStore {
             : defaults.runtimeLastCheckAt,
       githubToken:
         typeof parsed.githubToken === "string" ? parsed.githubToken : defaults.githubToken,
+      hfDownloadMethod:
+        parsed.hfDownloadMethod === "auto" ||
+        parsed.hfDownloadMethod === "cli" ||
+        parsed.hfDownloadMethod === "http"
+          ? parsed.hfDownloadMethod
+          : defaults.hfDownloadMethod,
+      hfToken: typeof parsed.hfToken === "string" ? parsed.hfToken : defaults.hfToken,
       onboardingCompleted:
         typeof parsed.onboardingCompleted === "boolean"
           ? parsed.onboardingCompleted

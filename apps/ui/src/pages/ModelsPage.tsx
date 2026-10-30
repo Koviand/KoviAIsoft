@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import type {
   AppSettings,
+  HardwareLoadSuggestion,
+  HfCliStatus,
   HfFile,
   HfSearchResult,
   LocalModel,
@@ -8,29 +10,46 @@ import type {
   ModelRecommendation,
   ModelRecommendationsReport,
 } from "@kovi/shared";
+import { AUTO_PC_PROFILE_ID } from "@kovi/shared";
 import { api } from "../api";
 
 function fmtGb(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
 }
 
+/** Green = fits well, yellow = slow/ok, red = won't run well. */
+function tierGroup(tier: ModelPerfTier): "green" | "yellow" | "red" {
+  if (tier === "excellent" || tier === "good") return "green";
+  if (tier === "too_heavy") return "red";
+  return "yellow";
+}
+
 function tierLabel(tier: ModelPerfTier): string {
-  switch (tier) {
-    case "excellent":
-      return "Отлично";
-    case "good":
-      return "Хорошо";
-    case "tight":
-      return "Впритык";
-    case "cpu":
-      return "CPU/RAM";
-    case "too_heavy":
-      return "Тяжело";
+  switch (tierGroup(tier)) {
+    case "green":
+      return "Подходит";
+    case "yellow":
+      return tier === "cpu" ? "Медленно (CPU)" : "Медленно";
+    case "red":
+      return "Не пойдёт";
   }
 }
 
 function tierClass(tier: ModelPerfTier): string {
-  return `badge tier-${tier}`;
+  return `badge fit-${tierGroup(tier)}`;
+}
+
+function localFitGroup(
+  m: LocalModel,
+): "green" | "yellow" | "red" | null {
+  if (m.integrityOk === false) return "red";
+  if (m.fitsInVram === true) return "green";
+  if (m.fitsInVram === false) {
+    // Partial GPU offload still usable; very large vs no GPU hint → red if ngl is 0 and huge.
+    if (m.recommendedNgl <= 0 && m.sizeBytes > 12 * 1024 ** 3) return "red";
+    return "yellow";
+  }
+  return null;
 }
 
 export function ModelsPage(props: {
@@ -51,6 +70,9 @@ export function ModelsPage(props: {
   const [hint, setHint] = useState<string | null>(null);
   const [recs, setRecs] = useState<ModelRecommendationsReport | null>(null);
   const [recsLoading, setRecsLoading] = useState(false);
+  const [hwPreview, setHwPreview] = useState<HardwareLoadSuggestion | null>(null);
+  const [hwBusy, setHwBusy] = useState(false);
+  const [hfCli, setHfCli] = useState<HfCliStatus | null>(null);
 
   async function loadRecommendations(): Promise<void> {
     setRecsLoading(true);
@@ -65,6 +87,10 @@ export function ModelsPage(props: {
 
   useEffect(() => {
     void loadRecommendations();
+    void api
+      .getHfCliStatus()
+      .then(setHfCli)
+      .catch(() => setHfCli(null));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -180,9 +206,54 @@ export function ModelsPage(props: {
     }
   }
 
+  async function pickDownloadDir(): Promise<void> {
+    if (!props.settings) return;
+    try {
+      const dir = await api.pickDirectory();
+      if (!dir) return;
+      const saved = await api.saveSettings({ ...props.settings, downloadDir: dir });
+      props.setSettings(saved);
+      setHint(`Загрузки будут сохраняться в ${saved.downloadDir}`);
+    } catch (e) {
+      props.setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function suggestHardware(): Promise<void> {
+    setHwBusy(true);
+    setHint(null);
+    try {
+      setHwPreview(await api.suggestHardwareLoadSettings());
+    } catch (e) {
+      props.setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setHwBusy(false);
+    }
+  }
+
+  async function applyHardware(): Promise<void> {
+    setHwBusy(true);
+    try {
+      const saved = await api.applyHardwareLoadSettings({
+        applyBackend: true,
+        applyDefaultParams: true,
+      });
+      props.setSettings(saved);
+      setHwPreview(null);
+      setHint(
+        `Под ПК: ngl ${saved.loadProfiles.find((p) => p.id === AUTO_PC_PROFILE_ID)?.gpuLayers}, ctx ${saved.defaultParams.context}, maxTokens ${saved.defaultParams.maxTokens}, агент ${saved.agentMaxSteps} шагов.`,
+      );
+    } catch (e) {
+      props.setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setHwBusy(false);
+    }
+  }
+
   const profiles = props.settings?.loadProfiles || [];
   const activeProfileId = props.settings?.activeLoadProfileId;
-  const topRecs = (recs?.items || []).filter((i) => i.tier !== "too_heavy").slice(0, 8);
+  // Show greens/yellows first, keep a few reds so «не пойдёт» видно.
+  const topRecs = (recs?.items || []).slice(0, 12);
 
   return (
     <div className="stack-page">
@@ -210,14 +281,24 @@ export function ModelsPage(props: {
                 : recs?.summary || "Нажмите «Пересчитать», чтобы оценить модели под VRAM/RAM."}
             </p>
           </div>
-          <button
-            className="btn ghost"
-            type="button"
-            disabled={recsLoading || working}
-            onClick={() => void loadRecommendations()}
-          >
-            Пересчитать
-          </button>
+          <div className="row" style={{ flexWrap: "wrap", gap: 8 }}>
+            <button
+              className="btn"
+              type="button"
+              disabled={hwBusy || working}
+              onClick={() => void suggestHardware()}
+            >
+              Подобрать под мой ПК
+            </button>
+            <button
+              className="btn ghost"
+              type="button"
+              disabled={recsLoading || working}
+              onClick={() => void loadRecommendations()}
+            >
+              Пересчитать
+            </button>
+          </div>
         </div>
         {recs && (
           <div className="muted mono" style={{ fontSize: "0.78rem", marginTop: 8 }}>
@@ -226,9 +307,57 @@ export function ModelsPage(props: {
             {` · RAM ${recs.ramGb.toFixed(0)} GB · backend ${recs.backend}`}
           </div>
         )}
+        {hwPreview && (
+          <div
+            className="card"
+            style={{ marginTop: 12, borderColor: "color-mix(in srgb, var(--accent) 40%, var(--border))" }}
+            role="dialog"
+            aria-label="Превью настроек под ПК"
+          >
+            <strong>Предложенные настройки загрузки</strong>
+            <div className="muted mono" style={{ fontSize: "0.8rem", marginTop: 8 }}>
+              {hwPreview.gpuName ? `GPU: ${hwPreview.gpuName}` : "GPU не обнаружен"}
+              {hwPreview.vramGb != null ? ` · VRAM ${hwPreview.vramGb.toFixed(1)} GB` : ""}
+              {` · RAM ${hwPreview.ramGb.toFixed(0)} GB`}
+            </div>
+            <div className="mono" style={{ fontSize: "0.85rem", marginTop: 8 }}>
+              загрузка: ngl {hwPreview.profile.gpuLayers} · ctx {hwPreview.profile.context} ·
+              maxTokens {hwPreview.profile.maxTokens ?? "—"}
+              {hwPreview.profile.flashAttn ? " · flash-attn" : ""} · backend {hwPreview.backend}
+            </div>
+            <div className="mono" style={{ fontSize: "0.85rem", marginTop: 6 }}>
+              чат: ctx {hwPreview.defaultParams.context} · maxTokens{" "}
+              {hwPreview.defaultParams.maxTokens} · агент {hwPreview.agentMaxSteps} шагов
+            </div>
+            <p style={{ margin: "8px 0 0", fontSize: "0.82rem" }}>{hwPreview.rationale}</p>
+            <div className="row" style={{ marginTop: 12, flexWrap: "wrap", gap: 8 }}>
+              <button
+                className="btn primary"
+                type="button"
+                disabled={hwBusy}
+                onClick={() => void applyHardware()}
+              >
+                Применить
+              </button>
+              <button
+                className="btn ghost"
+                type="button"
+                disabled={hwBusy}
+                onClick={() => setHwPreview(null)}
+              >
+                Отмена
+              </button>
+            </div>
+          </div>
+        )}
+        <div className="muted" style={{ fontSize: "0.78rem", marginTop: 10 }}>
+          <span className="badge fit-green">Подходит</span>{" "}
+          <span className="badge fit-yellow">Медленно</span>{" "}
+          <span className="badge fit-red">Не пойдёт</span>
+        </div>
         <div className="recommend-grid" style={{ marginTop: 12 }}>
           {topRecs.map((item) => (
-            <div key={item.id} className="recommend-item">
+            <div key={item.id} className={`recommend-item fit-card-${tierGroup(item.tier)}`}>
               <div className="row" style={{ justifyContent: "space-between", gap: 8 }}>
                 <strong>{item.name}</strong>
                 <span className={tierClass(item.tier)}>{tierLabel(item.tier)}</span>
@@ -282,6 +411,11 @@ export function ModelsPage(props: {
                   className={`btn ${activeProfileId === p.id ? "primary" : "ghost"}`}
                   disabled={working}
                   onClick={() => void setProfile(p.id)}
+                  title={
+                    p.id === AUTO_PC_PROFILE_ID
+                      ? `ngl ${p.gpuLayers} · ctx ${p.context}${p.flashAttn ? " · flash" : ""}`
+                      : undefined
+                  }
                 >
                   {p.name}
                 </button>
@@ -301,24 +435,32 @@ export function ModelsPage(props: {
         <section className="card elevated">
           <h3>На этом компьютере</h3>
           <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-            ngl / ctx — оценка под VRAM. Красный статус — битый GGUF.
+            Зелёный — влезет в VRAM, жёлтый — offload/медленно, красный — битый или слишком тяжёлый.
           </p>
           <div className="stack" style={{ maxHeight: 420, marginTop: 10 }}>
             {props.models.map((m) => {
               const loaded = props.loadedModelId === m.id;
+              const fit = localFitGroup(m);
               return (
-                <div key={m.id} className="list-item model-row" style={{ padding: "12px 10px" }}>
+                <div
+                  key={m.id}
+                  className={`list-item model-row${fit ? ` fit-card-${fit}` : ""}`}
+                  style={{ padding: "12px 10px" }}
+                >
                   <div className="row" style={{ justifyContent: "space-between" }}>
                     <strong>{m.name}</strong>
                     <span className="row">
                       {m.integrityOk === false ? (
-                        <span className="badge badge-danger">битый GGUF</span>
+                        <span className="badge fit-red">битый GGUF</span>
                       ) : null}
-                      {m.fitsInVram === true ? (
-                        <span className="badge tier-good">в VRAM</span>
+                      {fit === "green" ? (
+                        <span className="badge fit-green">Подходит</span>
                       ) : null}
-                      {m.fitsInVram === false ? (
-                        <span className="badge tier-tight">offload</span>
+                      {fit === "yellow" ? (
+                        <span className="badge fit-yellow">Медленно</span>
+                      ) : null}
+                      {fit === "red" && m.integrityOk !== false ? (
+                        <span className="badge fit-red">Не пойдёт</span>
                       ) : null}
                       {loaded ? <span className="badge">в памяти</span> : null}
                     </span>
@@ -361,6 +503,26 @@ export function ModelsPage(props: {
 
         <section className="card elevated">
           <h3>Скачать с Hugging Face</h3>
+          <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.78rem" }}>
+            {hfCli?.installing
+              ? "Устанавливается встроенный HF CLI…"
+              : hfCli?.available
+                ? `${hfCli.bundled ? "Встроенный" : "Системный"} HF CLI${hfCli.version ? ` · ${hfCli.version}` : ""} · режим ${props.settings?.hfDownloadMethod || "auto"}`
+                : `Встроенный HF CLI ещё не установлен — поставится при скачивании (или кнопкой ниже). Режим: ${props.settings?.hfDownloadMethod || "auto"}`}
+          </p>
+          <div className="row" style={{ marginTop: 10, flexWrap: "wrap", gap: 8 }}>
+            <div className="muted mono" style={{ fontSize: "0.78rem", flex: "1 1 200px" }}>
+              папка: {props.settings?.downloadDir || "не задана"}
+            </div>
+            <button
+              className="btn"
+              type="button"
+              disabled={working || !props.settings}
+              onClick={() => void pickDownloadDir()}
+            >
+              Папка загрузки…
+            </button>
+          </div>
           <div className="row" style={{ marginTop: 10 }}>
             <input
               className="input"
@@ -375,6 +537,28 @@ export function ModelsPage(props: {
             <button className="btn primary" type="button" disabled={working} onClick={() => void search()}>
               Найти
             </button>
+            {!hfCli?.available && (
+              <button
+                className="btn"
+                type="button"
+                disabled={working || Boolean(hfCli?.installing)}
+                onClick={() => {
+                  setWorking(true);
+                  const off = api.onDownloadProgress(setProgress);
+                  void api
+                    .ensureHfCli()
+                    .then(setHfCli)
+                    .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
+                    .finally(() => {
+                      off();
+                      setProgress(null);
+                      setWorking(false);
+                    });
+                }}
+              >
+                Установить HF CLI
+              </button>
+            )}
           </div>
           {progress && (
             <div style={{ marginTop: 12 }}>
@@ -385,47 +569,71 @@ export function ModelsPage(props: {
             </div>
           )}
           <div className="stack" style={{ maxHeight: 200, marginTop: 12 }}>
-            {hf.map((r) => (
-              <button
-                key={r.id}
-                type="button"
-                className={`list-item ${selectedHf === r.id ? "active" : ""}`}
-                style={{ padding: "10px" }}
-                disabled={working}
-                onClick={() => void openRepo(r.id)}
-              >
-                <div>{r.modelId}</div>
-                <div className="muted" style={{ fontSize: "0.75rem" }}>
-                  скачиваний {r.downloads} · лайков {r.likes}
-                </div>
-              </button>
-            ))}
+            {hf.map((r) => {
+              const fit = r.tier ? tierGroup(r.tier) : null;
+              return (
+                <button
+                  key={r.id}
+                  type="button"
+                  className={`list-item${fit ? ` fit-card-${fit}` : ""}${selectedHf === r.id ? " active" : ""}`}
+                  style={{ padding: "10px" }}
+                  disabled={working}
+                  onClick={() => void openRepo(r.id)}
+                >
+                  <div className="row" style={{ justifyContent: "space-between", gap: 8 }}>
+                    <div>{r.modelId}</div>
+                    {r.tier && <span className={tierClass(r.tier)}>{tierLabel(r.tier)}</span>}
+                  </div>
+                  <div className="muted" style={{ fontSize: "0.75rem" }}>
+                    скачиваний {r.downloads} · лайков {r.likes}
+                    {r.approxSizeBytes
+                      ? ` · ~${fmtGb(r.approxSizeBytes)}${r.suggestedQuant ? ` ${r.suggestedQuant}` : ""}`
+                      : ""}
+                  </div>
+                </button>
+              );
+            })}
           </div>
           {selectedHf && (
             <div className="section-block">
               <strong>Файлы {selectedHf}</strong>
               <p className="muted" style={{ fontSize: "0.78rem", margin: "4px 0 0" }}>
-                ★ — рекомендуемый файл под ваше железо
+                ★ — рекомендуемый файл под ваше железо · цвета — подходит / медленно / не пойдёт
               </p>
-              {files.map((f) => (
-                <div
-                  key={f.path}
-                  className="row"
-                  style={{ marginTop: 8, justifyContent: "space-between" }}
-                >
-                  <span className="mono" style={{ fontSize: "0.8rem" }}>
-                    {f.path} ({fmtGb(f.size)}){f.recommended ? " ★" : ""}
-                  </span>
-                  <button
-                    className="btn"
-                    type="button"
-                    disabled={working}
-                    onClick={() => void download(f.path)}
+              {files.map((f) => {
+                const fit = f.tier ? tierGroup(f.tier) : null;
+                return (
+                  <div
+                    key={f.path}
+                    className={`row${fit ? ` fit-card-${fit}` : ""}`}
+                    style={{
+                      marginTop: 8,
+                      justifyContent: "space-between",
+                      padding: "8px 10px",
+                      borderRadius: 8,
+                    }}
                   >
-                    Скачать
-                  </button>
-                </div>
-              ))}
+                    <span className="mono" style={{ fontSize: "0.8rem" }}>
+                      {f.path} ({fmtGb(f.size)})
+                      {f.recommended ? " ★" : ""}
+                      {f.tier ? (
+                        <>
+                          {" "}
+                          <span className={tierClass(f.tier)}>{tierLabel(f.tier)}</span>
+                        </>
+                      ) : null}
+                    </span>
+                    <button
+                      className="btn"
+                      type="button"
+                      disabled={working}
+                      onClick={() => void download(f.path)}
+                    >
+                      Скачать
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           )}
         </section>

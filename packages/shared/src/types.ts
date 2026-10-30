@@ -12,7 +12,43 @@ export type AppView =
 /** @deprecated Kept for session migration; UI no longer has a separate Agent view. */
 export type LegacyAppView = AppView | "agent";
 
-export type ThemePreset = "light" | "dark" | "high-contrast" | "custom";
+export type ThemePreset =
+  | "light"
+  | "dark"
+  | "high-contrast"
+  | "ocean"
+  | "forest"
+  | "midnight"
+  | "ember"
+  | "graphite"
+  | "sakura"
+  | "nord"
+  | "citrus"
+  | "custom";
+
+/** UI catalog for theme picker (id → short Russian label). */
+export const THEME_PRESET_OPTIONS: ReadonlyArray<{ id: ThemePreset; label: string }> = [
+  { id: "light", label: "Светлая" },
+  { id: "dark", label: "Тёмная" },
+  { id: "ocean", label: "Океан" },
+  { id: "forest", label: "Лес" },
+  { id: "midnight", label: "Полночь" },
+  { id: "ember", label: "Угли" },
+  { id: "graphite", label: "Графит" },
+  { id: "sakura", label: "Сакура" },
+  { id: "nord", label: "Норд" },
+  { id: "citrus", label: "Цитрус" },
+  { id: "high-contrast", label: "Контраст" },
+  { id: "custom", label: "Своя" },
+];
+
+export const THEME_PRESET_IDS: ReadonlySet<string> = new Set(
+  THEME_PRESET_OPTIONS.map((o) => o.id),
+);
+
+export function isThemePreset(value: unknown): value is ThemePreset {
+  return typeof value === "string" && THEME_PRESET_IDS.has(value);
+}
 
 /** Agent confirmation policy. */
 export type AgentRiskMode = "ask" | "auto-safe" | "full";
@@ -106,22 +142,6 @@ export interface LocalModel {
   integrityError?: string;
 }
 
-export interface HfSearchResult {
-  id: string;
-  modelId: string;
-  downloads: number;
-  likes: number;
-  tags: string[];
-  lastModified?: string;
-}
-
-export interface HfFile {
-  path: string;
-  size: number;
-  isGguf: boolean;
-  recommended?: boolean;
-}
-
 /** How a model is expected to run on this PC. */
 export type ModelPerfTier =
   | "excellent"
@@ -129,6 +149,29 @@ export type ModelPerfTier =
   | "tight"
   | "cpu"
   | "too_heavy";
+
+export interface HfSearchResult {
+  id: string;
+  modelId: string;
+  downloads: number;
+  likes: number;
+  tags: string[];
+  lastModified?: string;
+  /** Best-guess fit for this PC from a recommended GGUF sibling. */
+  tier?: ModelPerfTier;
+  /** Approx size of the suggested quant file (bytes). */
+  approxSizeBytes?: number;
+  suggestedQuant?: string;
+}
+
+export interface HfFile {
+  path: string;
+  size: number;
+  isGguf: boolean;
+  recommended?: boolean;
+  /** How this file is expected to run on this PC. */
+  tier?: ModelPerfTier;
+}
 
 export interface ModelRecommendation {
   id: string;
@@ -203,6 +246,8 @@ export interface ChatSession {
   createdAt: string;
   updatedAt: string;
   params: GenerationParams;
+  /** Sticky agent working-memory JSON (goal/plan/files) across context shrinks. */
+  agentScratchpad?: string;
 }
 
 export function sessionToolsEnabled(session: ChatSession): boolean {
@@ -231,6 +276,40 @@ export interface LoadProfile {
   context: number;
   flashAttn: boolean;
   maxTokens?: number;
+  /** When true, loadModel merges carefully with per-model recommendedNgl/ctx. */
+  hardwareAware?: boolean;
+}
+
+/** Stable id for the auto-generated «Под этот ПК» load profile. */
+export const AUTO_PC_PROFILE_ID = "auto-pc";
+
+/** Opt-in hardware-aware load preset preview (before user applies). */
+export interface HardwareLoadSuggestion {
+  profile: LoadProfile;
+  rationale: string;
+  backend: RuntimeBackend;
+  vramGb: number | null;
+  ramGb: number;
+  gpuName: string | null;
+  /** Suggested chat/generation defaults for this PC. */
+  defaultParams: GenerationParams;
+  /** Suggested agent step budget for this PC. */
+  agentMaxSteps: number;
+}
+
+/** How to download GGUF from Hugging Face. */
+export type HfDownloadMethod = "auto" | "cli" | "http";
+
+export interface HfCliStatus {
+  available: boolean;
+  binary: string | null;
+  mode: "hf" | "huggingface-cli" | "python-module" | null;
+  version: string | null;
+  hint: string;
+  /** True when using portable tools/hf shipped with the app. */
+  bundled: boolean;
+  /** Bootstrap of embeddable Python + huggingface_hub is in progress. */
+  installing?: boolean;
 }
 
 export interface AgentPlanStep {
@@ -267,6 +346,8 @@ export type AgentEvent =
   | { type: "token"; text: string }
   /** Live assistant text chunks (chat SSE + agent finals). */
   | { type: "stream"; text: string }
+  /** Live raw model tokens while agent builds a JSON step (not the final answer). */
+  | { type: "model_output"; text: string }
   | { type: "thinking"; text: string }
   | { type: "done"; messageId: string }
   | { type: "error"; message: string }
@@ -325,6 +406,13 @@ export interface AppSettings {
   mcpServers: McpServerConfig[];
   agentMaxSteps: number;
   defaultParams: GenerationParams;
+  /**
+   * Model download: auto = HF CLI if installed else HTTP;
+   * cli = only Hugging Face CLI; http = direct fetch.
+   */
+  hfDownloadMethod: HfDownloadMethod;
+  /** Optional Hugging Face access token (gated repos / higher rate limits). */
+  hfToken?: string;
   /** First-run wizard completed. */
   onboardingCompleted: boolean;
   /** Ask = confirm medium+high; auto-safe = auto medium in project; full = skip most confirms. */
@@ -442,6 +530,8 @@ export function createDefaultSettings(appData: string): AppSettings {
     mcpServers: [],
     agentMaxSteps: 40,
     defaultParams: { ...DEFAULT_GENERATION_PARAMS },
+    hfDownloadMethod: "auto",
+    hfToken: "",
     onboardingCompleted: false,
     agentRiskMode: "ask",
     loadProfiles: DEFAULT_LOAD_PROFILES.map((p) => ({ ...p })),

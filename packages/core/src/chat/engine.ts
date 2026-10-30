@@ -2,6 +2,7 @@ import { v4 as uuid } from "uuid";
 import type { ChatMessage, GenerationParams } from "@kovi/shared";
 import type { RuntimeManager } from "../runtime/manager.js";
 import type { Store } from "../db/store.js";
+import { condenseTranscript } from "../context/summarize.js";
 import {
   fitMessagesToContext,
   isContextOverflowError,
@@ -12,6 +13,8 @@ export type TokenHandler = (p: {
   sessionId: string;
   text: string;
   thinking?: boolean;
+  /** Agent JSON-step draft tokens (shown as «Вывод модели»). */
+  draft?: boolean;
 }) => void;
 
 interface OpenAiMessage {
@@ -73,27 +76,30 @@ export class ChatEngine {
       64,
       Math.min(params.maxTokens || 1024, Math.floor(ctx * 0.45), 4096),
     );
-    const messages: OpenAiMessage[] = fitMessagesToContext(
-      [
-        { role: "system", content: systemPrompt },
-        ...history.flatMap((m): OpenAiMessage[] => {
-          if (m.role === "user" || m.role === "assistant") {
-            return [{ role: m.role, content: m.content }];
-          }
-          if (m.role === "tool") {
-            return [
-              {
-                role: "user",
-                content: `[результат ${m.toolName || "tool"}]\n${m.content.slice(0, 2500)}`,
-              },
-            ];
-          }
-          return [];
-        }),
-      ],
-      ctx,
-      maxTokens,
-    );
+    const rawMessages: OpenAiMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...history.flatMap((m): OpenAiMessage[] => {
+        if (m.role === "user" || m.role === "assistant") {
+          return [{ role: m.role, content: m.content }];
+        }
+        if (m.role === "tool") {
+          return [
+            {
+              role: "user",
+              content: `[результат ${m.toolName || "tool"}]\n${m.content.slice(0, 2500)}`,
+            },
+          ];
+        }
+        return [];
+      }),
+    ];
+    // P2-13: fold long chat history before fit (extractive, no extra LLM).
+    const condensed = condenseTranscript(rawMessages, {
+      keepRecent: 10,
+      triggerMessages: 16,
+      summaryTokens: Math.min(400, Math.floor(ctx * 0.05)),
+    });
+    const messages: OpenAiMessage[] = fitMessagesToContext(condensed, ctx, maxTokens);
 
     this.abort = new AbortController();
     this.activeSessionId = sessionId;
@@ -268,7 +274,15 @@ export class ChatEngine {
     return assistant;
   }
 
-  async completeJson(messages: OpenAiMessage[], params: GenerationParams): Promise<string> {
+  /**
+   * Agent JSON completion with live SSE so the UI can show model work-in-progress.
+   * Pass sessionId to stream draft tokens via onToken({ draft: true }).
+   */
+  async completeJson(
+    messages: OpenAiMessage[],
+    params: GenerationParams,
+    sessionId?: string,
+  ): Promise<string> {
     let base: string;
     try {
       base = await this.runtime.assertLlmReady();
@@ -288,39 +302,123 @@ export class ChatEngine {
       msgs: OpenAiMessage[],
     ): Promise<string> => {
       const packed = fitMessagesToContext(msgs, ctx, maxTokens);
-      const res = await fetch(`${base}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal,
-        body: JSON.stringify({
-          model: "local",
-          messages: packed,
-          temperature: params.temperature,
-          top_p: params.topP,
-          max_tokens: maxTokens,
-          stream: false,
-        }),
-      });
-      if (!res.ok) {
-        const text = await res.text();
+      let res: Response;
+      try {
+        res = await fetch(`${base}/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal,
+          body: JSON.stringify({
+            model: "local",
+            messages: packed,
+            temperature: params.temperature,
+            top_p: params.topP,
+            max_tokens: maxTokens,
+            stream: true,
+          }),
+        });
+      } catch (err) {
+        throw formatLlmFetchError(err, base);
+      }
+      if (!res.ok || !res.body) {
+        const text = await res.text().catch(() => "");
         throw new Error(`Ошибка LLM: ${res.status} ${text}`);
       }
-      const json = (await res.json()) as {
-        choices?: Array<{
-          message?: {
-            content?: string;
-            reasoning_content?: string;
-            reasoning?: string;
-          };
-          finish_reason?: string;
-        }>;
-      };
-      const choice = json.choices?.[0];
-      const content = pickCompletionText(choice?.message);
-      if (choice?.finish_reason === "length" && !content.trim()) {
+
+      let content = "";
+      let truncated = false;
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        if (signal.aborted) break;
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n");
+        buffer = parts.pop() || "";
+        for (const line of parts) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+          const data = trimmed.slice(5).trim();
+          if (data === "[DONE]") continue;
+          try {
+            const json = JSON.parse(data) as {
+              choices?: Array<{
+                finish_reason?: string | null;
+                delta?: {
+                  content?: string;
+                  reasoning_content?: string;
+                  reasoning?: string;
+                  text?: string;
+                };
+              }>;
+            };
+            const finish = json.choices?.[0]?.finish_reason;
+            if (finish === "length") truncated = true;
+            const delta = json.choices?.[0]?.delta;
+            const piece =
+              delta?.content || delta?.text || delta?.reasoning_content || delta?.reasoning || "";
+            if (!piece) continue;
+            content += piece;
+            if (sessionId) {
+              this.onToken?.({ sessionId, text: piece, draft: true });
+            }
+          } catch {
+            // ignore bad chunk
+          }
+        }
+      }
+
+      if (signal.aborted) {
+        throw new Error("Отменено");
+      }
+      if (truncated && !content.trim()) {
         throw new Error(
           "Ответ LLM обрезан по max_tokens (finish_reason=length). Упростите шаг: пишите один файл целиком через write_file или увеличьте лимит токенов.",
         );
+      }
+      // Fallback if server ignored stream and returned empty (rare).
+      if (!content.trim()) {
+        const packed2 = fitMessagesToContext(msgs, ctx, maxTokens);
+        const res2 = await fetch(`${base}/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal,
+          body: JSON.stringify({
+            model: "local",
+            messages: packed2,
+            temperature: params.temperature,
+            top_p: params.topP,
+            max_tokens: maxTokens,
+            stream: false,
+          }),
+        });
+        if (!res2.ok) {
+          const text = await res2.text();
+          throw new Error(`Ошибка LLM: ${res2.status} ${text}`);
+        }
+        const json = (await res2.json()) as {
+          choices?: Array<{
+            message?: {
+              content?: string;
+              reasoning_content?: string;
+              reasoning?: string;
+            };
+            finish_reason?: string;
+          }>;
+        };
+        const choice = json.choices?.[0];
+        content = pickCompletionText(choice?.message);
+        if (choice?.finish_reason === "length" && !content.trim()) {
+          throw new Error(
+            "Ответ LLM обрезан по max_tokens (finish_reason=length). Упростите шаг: пишите один файл целиком через write_file или увеличьте лимит токенов.",
+          );
+        }
+        if (sessionId && content) {
+          this.onToken?.({ sessionId, text: content, draft: true });
+        }
       }
       return content;
     };
@@ -328,6 +426,7 @@ export class ChatEngine {
     // Reuse / replace abort so agent cancel (chat.stop) interrupts JSON calls too.
     this.stop();
     this.abort = new AbortController();
+    this.activeSessionId = sessionId || null;
     const signal = this.abort.signal;
 
     try {
@@ -339,13 +438,13 @@ export class ChatEngine {
         }
         const msg = err instanceof Error ? err.message : String(err);
         if (isContextOverflowError(err)) {
-          // Hard shrink: system + last 2 messages only.
+          // Keep system (includes working memory) + last 3 turns — avoid wiping plan/goal.
           const system = messages.find((m) => m.role === "system");
-          const tail = messages.filter((m) => m.role !== "system").slice(-2);
+          const rest = messages.filter((m) => m.role !== "system");
+          const tail = rest.slice(-3);
           const emergency = system ? [system, ...tail] : tail;
           return await attemptOnce(signal, emergency);
         }
-        // One reconnect for transient Electron/undici "fetch failed" while server still up.
         if (!/fetch failed|econnreset|socket|network/i.test(msg)) {
           throw err;
         }
@@ -359,6 +458,9 @@ export class ChatEngine {
     } finally {
       if (this.abort?.signal === signal) {
         this.abort = null;
+      }
+      if (this.activeSessionId === sessionId) {
+        this.activeSessionId = null;
       }
     }
   }

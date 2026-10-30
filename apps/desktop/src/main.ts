@@ -231,12 +231,20 @@ async function createWindow(): Promise<void> {
 }
 
 async function createMonitorWindow(): Promise<void> {
+  // Existing window: show if it was stuck hidden after a failed first paint.
   if (monitorWindow && !monitorWindow.isDestroyed()) {
+    if (!monitorWindow.isVisible()) monitorWindow.show();
     monitorWindow.focus();
+    startMonitorPush();
     return;
   }
 
   const icon = appIconPath();
+  const preloadPath = path.join(__dirname, "monitorPreload.js");
+  if (!fs.existsSync(preloadPath)) {
+    throw new Error(`monitorPreload не найден: ${preloadPath}`);
+  }
+
   monitorWindow = new BrowserWindow({
     width: 420,
     height: 640,
@@ -248,7 +256,7 @@ async function createMonitorWindow(): Promise<void> {
     show: false,
     ...(icon ? { icon } : {}),
     webPreferences: {
-      preload: path.join(__dirname, "monitorPreload.js"),
+      preload: preloadPath,
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -261,11 +269,42 @@ async function createMonitorWindow(): Promise<void> {
   monitorWindow.once("ready-to-show", () => {
     if (monitorWindow && !monitorWindow.isDestroyed()) monitorWindow.show();
   });
+  monitorWindow.webContents.on("did-fail-load", (_e, code, desc) => {
+    console.error("[monitor] did-fail-load", code, desc);
+  });
   monitorWindow.on("closed", () => {
     monitorWindow = null;
     stopMonitorPush();
   });
-  await loadUi(monitorWindow, "#/monitor");
+
+  try {
+    await loadUi(monitorWindow, "#/monitor");
+  } catch (err) {
+    const win = monitorWindow;
+    monitorWindow = null;
+    if (win && !win.isDestroyed()) win.destroy();
+    throw err instanceof Error ? err : new Error(String(err));
+  }
+
+  // Fallback if ready-to-show already fired before listener (cached load).
+  if (monitorWindow && !monitorWindow.isDestroyed() && !monitorWindow.isVisible()) {
+    monitorWindow.show();
+  }
+
+  // Ensure hash route is applied (file:// loadFile hash can be flaky).
+  if (monitorWindow && !monitorWindow.isDestroyed()) {
+    try {
+      const url = monitorWindow.webContents.getURL();
+      if (url && !/#\/?monitor\b/i.test(url)) {
+        await monitorWindow.webContents.executeJavaScript(
+          `if (!/#\\/?monitor\\b/i.test(location.hash)) { location.hash = '#/monitor'; location.reload(); }`,
+        );
+      }
+    } catch {
+      // non-fatal — UI may still work via first paint
+    }
+  }
+
   startMonitorPush();
 }
 
@@ -314,11 +353,19 @@ function registerIpc(svc: AppService): void {
   ipcMain.handle(IPC.listModels, () => svc.listModels());
   ipcMain.handle(IPC.scanModels, () => svc.scanModels());
   ipcMain.handle(IPC.getModelRecommendations, () => svc.getModelRecommendations());
+  ipcMain.handle(IPC.suggestHardwareLoadSettings, (_e, opts) =>
+    svc.suggestHardwareLoadSettings(opts),
+  );
+  ipcMain.handle(IPC.applyHardwareLoadSettings, (_e, opts) =>
+    svc.applyHardwareLoadSettings(opts),
+  );
   ipcMain.handle(IPC.searchHf, (_e, query) => svc.searchHf(query));
   ipcMain.handle(IPC.listHfFiles, (_e, modelId) => svc.listHfFiles(modelId));
   ipcMain.handle(IPC.downloadHfFile, (_e, modelId, filePath) =>
     svc.downloadHf(modelId, filePath),
   );
+  ipcMain.handle(IPC.getHfCliStatus, () => svc.getHfCliStatus());
+  ipcMain.handle(IPC.ensureHfCli, () => svc.ensureHfCli());
   ipcMain.handle(IPC.loadModel, (_e, modelId, params) => svc.loadModel(modelId, params));
   ipcMain.handle(IPC.unloadModel, () => svc.unloadModel());
   ipcMain.handle(IPC.listSessions, () => svc.listSessions());

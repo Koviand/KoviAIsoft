@@ -21,9 +21,27 @@ export * from "./runtime/manager.js";
 export * from "./models/scanner.js";
 export * from "./models/huggingface.js";
 export {
+  getHfCliStatus,
+  resolveHfCli,
+  downloadViaHfCli,
+  ensureHfCli,
+} from "./models/hfCli.js";
+export {
+  ensureBundledHfCli,
+  isBundledHfCliReady,
+  resolveBundledHfCli,
+} from "./models/hfBundle.js";
+export { getHfToolsDir, getPortableRoot } from "./paths.js";
+export {
   MODEL_CATALOG,
   buildModelRecommendations,
 } from "./models/recommend.js";
+export {
+  AUTO_PC_PROFILE_ID,
+  isAutoPcProfile,
+  suggestHardwareLoadProfile,
+} from "./models/hardwareProfile.js";
+export type { HardwareLoadSuggestion } from "./models/hardwareProfile.js";
 export * from "./tools/sandbox.js";
 export {
   adaptCommandForWindows,

@@ -13,6 +13,11 @@ function fmt(n: number | null, digits = 1): string {
   return n.toFixed(digits);
 }
 
+function monitorBridge() {
+  if (typeof window !== "undefined" && window.koviMonitor) return window.koviMonitor;
+  return api;
+}
+
 export function MonitorPage() {
   const [snap, setSnap] = useState<MonitorSnapshot | null>(null);
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
@@ -20,15 +25,19 @@ export function MonitorPage() {
 
   useEffect(() => {
     let alive = true;
-    void api
-      .getSettings()
-      .then((s) => {
-        if (alive) applyTheme(s.themePreset, s.themeCustom);
-      })
-      .catch(() => undefined);
+    // Monitor preload is restricted (no getSettings). Prefer dedicated bridge.
+    const bridge = monitorBridge();
+    if (typeof (api as { getSettings?: unknown }).getSettings === "function") {
+      void api
+        .getSettings()
+        .then((s) => {
+          if (alive) applyTheme(s.themePreset, s.themeCustom);
+        })
+        .catch(() => undefined);
+    }
     const pull = async () => {
       try {
-        const next = await api.getMonitorSnapshot();
+        const next = await bridge.getMonitorSnapshot();
         if (alive) {
           setSnap(next);
           setLoadError(null);
@@ -38,7 +47,7 @@ export function MonitorPage() {
       }
     };
     void pull();
-    const off = api.onMonitorUpdate((p) => {
+    const off = bridge.onMonitorUpdate((p) => {
       if (alive) setSnap(p);
     });
     const t = window.setInterval(() => void pull(), 1500);
@@ -69,8 +78,12 @@ export function MonitorPage() {
           className={`btn ${alwaysOnTop ? "primary" : "ghost"}`}
           onClick={async () => {
             const next = !alwaysOnTop;
-            const applied = await api.setMonitorAlwaysOnTop(next);
-            setAlwaysOnTop(applied);
+            try {
+              const applied = await monitorBridge().setMonitorAlwaysOnTop(next);
+              setAlwaysOnTop(applied);
+            } catch (e) {
+              setLoadError(e instanceof Error ? e.message : String(e));
+            }
           }}
         >
           {alwaysOnTop ? "Поверх окон" : "Закрепить сверху"}

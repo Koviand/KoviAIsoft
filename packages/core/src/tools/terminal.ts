@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import type { AppSettings } from "@kovi/shared";
 import {
   assertTerminalCwd,
+  collapseOverEscapedWinPath,
   normalizePath,
   resolveAgentPath,
 } from "./sandbox.js";
@@ -26,6 +27,23 @@ export function resolveTerminalCwd(
   projectRoot: string | null,
 ): string {
   return resolveAgentPath(cwd, projectRoot, { allowBlankAsProject: true });
+}
+
+/**
+ * Fix over-escaped Windows drive paths inside a shell command string
+ * (e.g. `dir C:\\Users\\foo` → `dir C:\Users\foo`). Leaves UNC alone.
+ */
+export function collapseOverEscapedWinPathsInCommand(command: string): string {
+  if (!command || !command.includes("\\")) return command;
+  // Drive-letter paths that contain at least one doubled backslash
+  return command.replace(
+    /([A-Za-z]:)((?:\\+|\/)[^"'\s|&<>]*)/g,
+    (full, drive: string, rest: string) => {
+      if (!/\\\\/.test(rest) && !/\/\//.test(rest)) return full;
+      const collapsed = collapseOverEscapedWinPath(drive + rest.replace(/\//g, "\\"));
+      return collapsed;
+    },
+  );
 }
 
 /**
@@ -261,7 +279,10 @@ export async function runTerminal(
 
   let adapted: string;
   try {
-    adapted = adaptCommandForWindows(rawCmd, resolvedCwd);
+    adapted = adaptCommandForWindows(
+      collapseOverEscapedWinPathsInCommand(rawCmd),
+      resolvedCwd,
+    );
   } catch (err) {
     throw err instanceof Error ? err : new Error(String(err));
   }

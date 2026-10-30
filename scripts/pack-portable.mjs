@@ -201,10 +201,22 @@ function stagePackageJson() {
 function installStageDeps() {
   const electronVer = resolveLockedVersion("electron");
   const builderVer = resolveLockedVersion("electron-builder");
+  // Prefer mirror when registry.npmjs.org is flaky (ECONNRESET on some networks).
+  const npmEnv = {
+    ...process.env,
+    npm_config_registry: process.env.npm_config_registry || "https://registry.npmmirror.com",
+  };
+  delete npmEnv.npm_config_shamefully_hoist;
   // Use npm in stage for a classic flat node_modules electron-builder understands.
-  run("npm", ["install", "--omit=dev", "--no-audit", "--no-fund"], stage);
-  // electron + electron-builder as local tools for packaging (versions from workspace)
-  run(
+  const res1 = spawnSync(
+    "npm",
+    ["install", "--omit=dev", "--no-audit", "--no-fund", "--fetch-retries=5"],
+    { cwd: stage, stdio: "inherit", shell: process.platform === "win32", env: npmEnv },
+  );
+  if (res1.status !== 0) {
+    throw new Error(`npm install deps failed (${res1.status})`);
+  }
+  const res2 = spawnSync(
     "npm",
     [
       "install",
@@ -212,11 +224,15 @@ function installStageDeps() {
       "--no-audit",
       "--no-fund",
       "--ignore-scripts=false",
+      "--fetch-retries=5",
       `electron@${electronVer}`,
       `electron-builder@${builderVer}`,
     ],
-    stage,
+    { cwd: stage, stdio: "inherit", shell: process.platform === "win32", env: npmEnv },
   );
+  if (res2.status !== 0) {
+    throw new Error(`npm install electron-builder failed (${res2.status})`);
+  }
   // Ensure Electron binary is actually downloaded (npm may skip scripts).
   run("node", ["node_modules/electron/install.js"], stage);
 }
@@ -342,10 +358,35 @@ async function main() {
   installStageDeps();
   buildElectron();
   assemblePortableFolder();
+  await preseedHfCli();
 
   console.log("\nPortable app ready:");
   console.log(`  ${portableDir}`);
   console.log(`  EXE: ${path.join(portableDir, "KoviAIsoft.exe")}`);
+}
+
+/** Install portable HF CLI into release/.../tools/hf so users don't need pip. */
+async function preseedHfCli() {
+  console.log("Preseeding bundled HF CLI into portable tools/hf…");
+  const dataDir = path.join(portableDir, "data");
+  mkdirp(dataDir);
+  process.env.KOVI_DATA_DIR = dataDir;
+  try {
+    const { pathToFileURL } = await import("node:url");
+    const modUrl = pathToFileURL(
+      path.join(root, "packages", "core", "dist", "models", "hfBundle.js"),
+    ).href;
+    const { ensureBundledHfCli } = await import(modUrl);
+    await ensureBundledHfCli({
+      onProgress: (p, label) => console.log(`  [hf ${p}%] ${label}`),
+    });
+    console.log("HF CLI preseed OK:", path.join(portableDir, "tools", "hf"));
+  } catch (err) {
+    console.warn(
+      "HF CLI preseed failed (will install on first download):",
+      err instanceof Error ? err.message : err,
+    );
+  }
 }
 
 main().catch((err) => {

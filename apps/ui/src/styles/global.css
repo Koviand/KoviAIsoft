@@ -78,6 +78,163 @@
   --elev-2: none;
 }
 
+/* Cool teal / cyan — light */
+[data-theme="ocean"] {
+  --bg: #e6f2f4;
+  --bg-deep: #d0e6ea;
+  --surface: #f4fbfc;
+  --surface-2: #e8f4f6;
+  --ink: #0f2a32;
+  --text: #0f2a32;
+  --muted: #4a6b74;
+  --accent: #0d8a9a;
+  --accent-2: #0a6c79;
+  --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+  --ok: #1a8f6e;
+  --border: #b5d2d8;
+  --glass: color-mix(in srgb, #f4fbfc 84%, transparent);
+  --elev-1: 0 10px 28px color-mix(in srgb, #0f2a32 8%, transparent);
+  --elev-2: 0 18px 44px color-mix(in srgb, #0f2a32 12%, transparent);
+}
+
+/* Soft moss / pine — light */
+[data-theme="forest"] {
+  --bg: #e8eee6;
+  --bg-deep: #d5ded2;
+  --surface: #f5f8f3;
+  --surface-2: #e9efe6;
+  --ink: #1a2618;
+  --text: #1a2618;
+  --muted: #556353;
+  --accent: #3d7a4a;
+  --accent-2: #2f5f39;
+  --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+  --ok: #2f8a4a;
+  --border: #b8c7b4;
+  --glass: color-mix(in srgb, #f5f8f3 84%, transparent);
+  --elev-1: 0 10px 28px color-mix(in srgb, #1a2618 8%, transparent);
+  --elev-2: 0 18px 44px color-mix(in srgb, #1a2618 12%, transparent);
+}
+
+/* Deep navy — dark */
+[data-theme="midnight"] {
+  --bg: #0a1224;
+  --bg-deep: #060b16;
+  --surface: #121c33;
+  --surface-2: #1a2742;
+  --ink: #e8eefc;
+  --text: #e8eefc;
+  --muted: #8b97b5;
+  --accent: #4ea1ff;
+  --accent-2: #2f7fd9;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --ok: #3dba8a;
+  --border: #243353;
+  --glass: color-mix(in srgb, #121c33 80%, transparent);
+  --elev-1: 0 12px 32px color-mix(in srgb, #000 45%, transparent);
+  --elev-2: 0 20px 50px color-mix(in srgb, #000 55%, transparent);
+}
+
+/* Charcoal + amber — dark warm (not cream) */
+[data-theme="ember"] {
+  --bg: #171210;
+  --bg-deep: #100c0a;
+  --surface: #241c18;
+  --surface-2: #302620;
+  --ink: #f3ebe3;
+  --text: #f3ebe3;
+  --muted: #a89788;
+  --accent: #e07830;
+  --accent-2: #c45e1c;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --warning: #d4a017;
+  --ok: #5fa86a;
+  --danger: #d4543c;
+  --border: #3d3028;
+  --glass: color-mix(in srgb, #241c18 80%, transparent);
+  --elev-1: 0 12px 32px color-mix(in srgb, #000 45%, transparent);
+  --elev-2: 0 20px 50px color-mix(in srgb, #000 55%, transparent);
+}
+
+/* Cool neutral gray — dark */
+[data-theme="graphite"] {
+  --bg: #141618;
+  --bg-deep: #0c0d0f;
+  --surface: #1e2124;
+  --surface-2: #282c31;
+  --ink: #eceef0;
+  --text: #eceef0;
+  --muted: #949aa3;
+  --accent: #8a9bb0;
+  --accent-2: #6e8096;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --ok: #5aa884;
+  --border: #33383f;
+  --glass: color-mix(in srgb, #1e2124 80%, transparent);
+  --elev-1: 0 12px 32px color-mix(in srgb, #000 42%, transparent);
+  --elev-2: 0 20px 50px color-mix(in srgb, #000 52%, transparent);
+}
+
+/* Soft rose / blossom — light */
+[data-theme="sakura"] {
+  --bg: #f5e9ee;
+  --bg-deep: #ebd8e1;
+  --surface: #fcf6f8;
+  --surface-2: #f3e6ec;
+  --ink: #2a1820;
+  --text: #2a1820;
+  --muted: #7a5a68;
+  --accent: #c44d7a;
+  --accent-2: #a33862;
+  --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+  --ok: #3d8f6e;
+  --border: #e0c4d0;
+  --glass: color-mix(in srgb, #fcf6f8 86%, transparent);
+  --elev-1: 0 10px 28px color-mix(in srgb, #2a1820 8%, transparent);
+  --elev-2: 0 18px 44px color-mix(in srgb, #2a1820 12%, transparent);
+}
+
+/* Cool frost / arctic — dark */
+[data-theme="nord"] {
+  --bg: #2e3440;
+  --bg-deep: #242933;
+  --surface: #3b4252;
+  --surface-2: #434c5e;
+  --ink: #eceff4;
+  --text: #eceff4;
+  --muted: #a0a8b8;
+  --accent: #88c0d0;
+  --accent-2: #5e9eb0;
+  --accent-soft: color-mix(in srgb, var(--accent) 18%, transparent);
+  --ok: #a3be8c;
+  --warning: #ebcb8b;
+  --danger: #bf616a;
+  --border: #4c566a;
+  --glass: color-mix(in srgb, #3b4252 82%, transparent);
+  --elev-1: 0 12px 32px color-mix(in srgb, #000 35%, transparent);
+  --elev-2: 0 20px 50px color-mix(in srgb, #000 45%, transparent);
+}
+
+/* Bright lime accent — light */
+[data-theme="citrus"] {
+  --bg: #eef1e6;
+  --bg-deep: #dde3cf;
+  --surface: #f8faf2;
+  --surface-2: #eef2e4;
+  --ink: #1c2210;
+  --text: #1c2210;
+  --muted: #5f6a48;
+  --accent: #7a9e1a;
+  --accent-2: #5f7c12;
+  --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+  --ok: #3d8f4a;
+  --warning: #c48912;
+  --border: #c5cfaa;
+  --glass: color-mix(in srgb, #f8faf2 86%, transparent);
+  --elev-1: 0 10px 28px color-mix(in srgb, #1c2210 8%, transparent);
+  --elev-2: 0 18px 44px color-mix(in srgb, #1c2210 12%, transparent);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -295,6 +452,36 @@ button {
   display: flex;
   flex-direction: column;
   position: relative;
+  flex: 1;
+}
+
+.main > .stack-page {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* Full-height slot so kept-mounted Chat still fills .main (not content-sized mid-air). */
+.view-slot {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.view-slot-active {
+  display: flex;
+}
+
+.view-slot > .panel,
+.view-slot > .stack,
+.view-slot > .stack-page,
+.view-slot > .chat-panel {
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+  width: 100%;
 }
 
 /* —— Chat layout —— */
@@ -318,7 +505,8 @@ button {
   padding: 16px 12px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+  overflow: hidden;
 }
 
 .panel-main {
@@ -326,6 +514,13 @@ button {
   display: flex;
   flex-direction: column;
   gap: var(--gap);
+  min-height: 0;
+}
+
+.chat-panel {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
 }
 
 .chat-main {
@@ -334,24 +529,38 @@ button {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  gap: 0;
 }
 
 .chat-scroll {
-  flex: 1;
+  flex: 1 1 0;
   min-height: 0;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
 }
 
+.chat-inner,
 .chat-column {
   width: min(var(--chat-max), 100%);
+  max-width: 100%;
   margin: 0 auto;
-  padding: 18px 22px 8px;
+  padding: 14px 20px 12px;
   display: flex;
   flex-direction: column;
   gap: 12px;
-  flex: 1;
+  flex: 1 0 auto;
+  box-sizing: border-box;
+}
+
+.chat-session-bar {
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
 }
 
 .chat-header {
@@ -520,11 +729,68 @@ button {
   transition: background 160ms var(--ease), border-color 160ms var(--ease);
 }
 
+.session-list-head {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+  align-items: stretch;
+  width: 100%;
+}
+
+.session-list-head .btn.primary {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.session-list-head .btn.ghost,
+.session-list-head > label.btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.session-search {
+  width: 100%;
+  flex: 0 0 auto;
+}
+
+.session-scroll {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+  padding-right: 2px;
+}
+
+/* avatar | title/date | delete — matches ChatPage JSX */
 .session-item {
   display: grid;
-  grid-template-columns: 1fr auto;
-  align-items: stretch;
-  gap: 2px;
+  grid-template-columns: 36px minmax(0, 1fr) 32px;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 6px 8px 8px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  cursor: pointer;
+  transition: background 160ms var(--ease), border-color 160ms var(--ease);
+}
+
+.session-item:hover,
+.session-item.active {
+  background: var(--surface);
+  border-color: color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.session-item.active .session-avatar {
+  background: var(--accent);
+  color: #fff;
+  border-color: transparent;
 }
 
 .session-select {
@@ -552,31 +818,47 @@ button {
   background: var(--surface-2);
   color: var(--accent-2);
   border: 1px solid var(--border);
-}
-
-.list-item:hover,
-.list-item.active {
-  background: var(--surface);
-  border-color: color-mix(in srgb, var(--border) 70%, transparent);
-}
-
-.list-item.active .session-avatar {
-  background: var(--accent);
-  color: #fff;
-  border-color: transparent;
+  flex-shrink: 0;
 }
 
 .session-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+  display: block;
   font-weight: 600;
   font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .session-meta {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.session-sub {
   font-size: 0.7rem;
   margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-del {
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  padding: 0;
+  line-height: 1;
+  font-size: 1.15rem;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  opacity: 0.65;
+}
+
+.session-item:hover .session-del,
+.session-item.active .session-del {
+  opacity: 1;
 }
 
 .badge {
@@ -590,18 +872,15 @@ button {
   text-transform: lowercase;
 }
 
-.session-list-head .btn.primary {
-  width: 100%;
-}
-
 /* —— Messages —— */
 .messages {
-  flex: 1;
+  flex: 1 0 auto;
   display: flex;
   flex-direction: column;
   gap: 14px;
-  padding: 8px 0 28px;
-  min-height: 180px;
+  padding: 4px 0 20px;
+  width: 100%;
+  min-height: 0;
 }
 
 .msg {
@@ -761,11 +1040,14 @@ button {
 
 /* —— Composer —— */
 .composer-dock {
-  position: sticky;
-  bottom: 0;
-  padding: 8px 22px 22px;
+  flex: 0 0 auto;
+  position: relative;
+  bottom: auto;
+  width: 100%;
+  padding: 10px 20px 18px;
   background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--bg) 70%, transparent) 28%, var(--bg));
   z-index: 5;
+  box-sizing: border-box;
 }
 
 .composer {
@@ -920,6 +1202,21 @@ button {
   white-space: pre-wrap;
   font-size: 0.85rem;
   opacity: 0.9;
+}
+
+.process-draft-text {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-deep) 55%, var(--surface));
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .process-tool-head {
@@ -1374,32 +1671,80 @@ button {
   margin-top: auto;
 }
 
-.tier-excellent {
-  background: color-mix(in srgb, #15803d 18%, transparent);
+/* Fit traffic lights: green / yellow / red */
+.fit-card-green {
+  border-color: color-mix(in srgb, #16a34a 55%, var(--border));
+  background: color-mix(in srgb, #16a34a 12%, var(--surface));
+  box-shadow: inset 3px 0 0 #16a34a;
+}
+
+.fit-card-yellow {
+  border-color: color-mix(in srgb, #ca8a04 55%, var(--border));
+  background: color-mix(in srgb, #ca8a04 12%, var(--surface));
+  box-shadow: inset 3px 0 0 #ca8a04;
+}
+
+.fit-card-red {
+  border-color: color-mix(in srgb, #dc2626 55%, var(--border));
+  background: color-mix(in srgb, #dc2626 12%, var(--surface));
+  box-shadow: inset 3px 0 0 #dc2626;
+}
+
+.badge.fit-green,
+.fit-green {
+  background: color-mix(in srgb, #16a34a 22%, transparent);
   color: #15803d;
-  border-color: color-mix(in srgb, #15803d 35%, transparent);
+  border: 1px solid color-mix(in srgb, #16a34a 40%, transparent);
 }
 
+.badge.fit-yellow,
+.fit-yellow {
+  background: color-mix(in srgb, #ca8a04 22%, transparent);
+  color: #a16207;
+  border: 1px solid color-mix(in srgb, #ca8a04 40%, transparent);
+}
+
+.badge.fit-red,
+.fit-red {
+  background: color-mix(in srgb, #dc2626 20%, transparent);
+  color: #b91c1c;
+  border: 1px solid color-mix(in srgb, #dc2626 40%, transparent);
+}
+
+[data-theme="dark"] .badge.fit-green,
+[data-theme="dark"] .fit-green {
+  color: #4ade80;
+}
+
+[data-theme="dark"] .badge.fit-yellow,
+[data-theme="dark"] .fit-yellow {
+  color: #facc15;
+}
+
+[data-theme="dark"] .badge.fit-red,
+[data-theme="dark"] .fit-red {
+  color: #f87171;
+}
+
+/* Legacy tier badges → map to traffic lights */
+.tier-excellent,
 .tier-good {
-  background: color-mix(in srgb, #0369a1 16%, transparent);
-  color: #0369a1;
-  border-color: color-mix(in srgb, #0369a1 30%, transparent);
+  background: color-mix(in srgb, #16a34a 22%, transparent);
+  color: #15803d;
+  border-color: color-mix(in srgb, #16a34a 40%, transparent);
 }
 
-.tier-tight {
-  background: color-mix(in srgb, #b45309 16%, transparent);
-  color: #b45309;
-  border-color: color-mix(in srgb, #b45309 30%, transparent);
-}
-
+.tier-tight,
 .tier-cpu {
-  background: color-mix(in srgb, #6b7280 16%, transparent);
-  color: #4b5563;
+  background: color-mix(in srgb, #ca8a04 22%, transparent);
+  color: #a16207;
+  border-color: color-mix(in srgb, #ca8a04 40%, transparent);
 }
 
 .tier-too_heavy {
-  background: color-mix(in srgb, #b91c1c 14%, transparent);
+  background: color-mix(in srgb, #dc2626 20%, transparent);
   color: #b91c1c;
+  border-color: color-mix(in srgb, #dc2626 40%, transparent);
 }
 
 .gen-pending {

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { AppView, LocalModel, StatusBarInfo } from "@kovi/shared";
 import { api } from "../api";
 
@@ -19,6 +20,7 @@ export function Topbar(props: {
   onStop?: () => void;
   onLoadModel?: (modelId: string) => void;
 }) {
+  const [monitorError, setMonitorError] = useState<string | null>(null);
   const online = Boolean(props.status?.serverPort);
   const tps = props.status?.tokensPerSecond;
   const agentStep = props.status?.agentStepLabel;
@@ -97,10 +99,21 @@ export function Topbar(props: {
         <button
           type="button"
           className="btn ghost topbar-monitor"
-          onClick={() => void api.openMonitorWindow()}
+          title={monitorError || "Открыть монитор"}
+          onClick={() => {
+            setMonitorError(null);
+            void api.openMonitorWindow().catch((e) => {
+              setMonitorError(e instanceof Error ? e.message : String(e));
+            });
+          }}
         >
           Монитор
         </button>
+        {monitorError ? (
+          <span className="muted" style={{ fontSize: "0.72rem", maxWidth: 160 }} title={monitorError}>
+            монитор: ошибка
+          </span>
+        ) : null}
       </div>
     </header>
   );

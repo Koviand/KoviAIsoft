@@ -35,4 +35,39 @@ describe("settings atomic + backup", () => {
     const again = new SettingsStore(dir);
     expect(again.get().projectRoot).toBe(next.projectRoot);
   });
+
+  it("accepts named theme presets", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kovi-settings-"));
+    temps.push(dir);
+    const store = new SettingsStore(dir);
+    const next = store.get();
+    next.themePreset = "ocean";
+    await store.save(next);
+    expect(new SettingsStore(dir).get().themePreset).toBe("ocean");
+  });
+
+  it("persists custom downloadDir and rejects empty", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kovi-settings-"));
+    temps.push(dir);
+    const store = new SettingsStore(dir);
+    const custom = path.join(dir, "gguf-downloads");
+    const next = store.get();
+    next.downloadDir = custom;
+    await store.save(next);
+    expect(new SettingsStore(dir).get().downloadDir).toBe(custom);
+
+    const blank = store.get();
+    blank.downloadDir = "   ";
+    await store.save(blank);
+    // mergePartial falls back when empty/whitespace after reload from file...
+    // save writes as-is; load normalizes empty on next SettingsStore ctor.
+    fs.writeFileSync(
+      path.join(dir, "settings.json"),
+      JSON.stringify({ ...blank, downloadDir: "   " }, null, 2),
+      "utf8",
+    );
+    const reloaded = new SettingsStore(dir);
+    expect(reloaded.get().downloadDir.trim().length).toBeGreaterThan(0);
+    expect(reloaded.get().downloadDir).not.toBe("   ");
+  });
 });

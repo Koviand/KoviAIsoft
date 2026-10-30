@@ -177,7 +177,7 @@ export function App() {
         )}
         {/* Keep Chat mounted (hidden) so ProcessTimeline survives Models/Runtime navigation. */}
         <div
-          style={{ display: state.view === "chat" ? undefined : "none" }}
+          className={`view-slot${state.view === "chat" ? " view-slot-active" : ""}`}
           aria-hidden={state.view !== "chat"}
         >
           <ChatPage

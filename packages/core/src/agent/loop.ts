@@ -29,15 +29,30 @@ import {
 } from "../tools/sandbox.js";
 import { webSearch } from "../tools/websearch.js";
 import {
+  estimateMessagesTokens,
   fitMessagesToContext,
   isContextOverflowError,
 } from "../chat/contextBudget.js";
 import { buildProjectContext } from "../context/packer.js";
-import { condenseTranscript } from "../context/summarize.js";
+import {
+  formatRetrievedSnippets,
+  retrieveProjectContext,
+} from "../context/retrieve.js";
+import { condenseTranscript, summarizeTranscript } from "../context/summarize.js";
 import { toolsPromptBlock } from "./toolsCatalog.js";
+import {
+  applyWorkingMemoryToSystem,
+  createWorkingMemory,
+  emergencyShrinkTranscript,
+  parseWorkingMemory,
+  rememberToolError,
+  rememberToolSuccess,
+  serializeWorkingMemory,
+  updatePlanMemory,
+} from "./workingMemory.js";
 
 const TOOL_RESULT_TRANSCRIPT_CHARS = 2_500;
-const PRIOR_LOOKBACK_MESSAGES = 10;
+const PRIOR_LOOKBACK_MESSAGES = 14;
 
 /** Alias common model mistakes before path normalization. */
 function coerceToolArgs(
@@ -405,10 +420,18 @@ export class AgentLoop {
             : ""),
       });
 
+      let baseSystem = projectCtx.systemPrompt;
+      const session = this.store.listSessions().find((s) => s.id === sessionId);
+      const restored = parseWorkingMemory(session?.agentScratchpad);
+      const workingMemory = restored
+        ? { ...restored, goal: restored.goal || userContent.slice(0, 400) }
+        : createWorkingMemory(userContent);
+      if (!restored?.goal) workingMemory.goal = userContent.replace(/\s+/g, " ").trim().slice(0, 400);
+
       let transcript: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
         {
           role: "system",
-          content: projectCtx.systemPrompt,
+          content: applyWorkingMemoryToSystem(baseSystem, workingMemory),
         },
       ];
 
@@ -437,7 +460,8 @@ export class AgentLoop {
       transcript = condenseTranscript(transcript, {
         keepRecent: 8,
         triggerMessages: 12,
-        summaryTokens: Math.min(400, Math.floor(ctxWindow * 0.05)),
+        summaryTokens: Math.min(500, Math.floor(ctxWindow * 0.06)),
+        workingMemory,
       });
 
       let steps: AgentPlanStep[] = [];
@@ -445,9 +469,54 @@ export class AgentLoop {
       let filesWritten = 0;
       let substantialWrite = false;
       let stubNudgeCount = 0;
+      let lastRetrieveAt = 0;
       const wantsFiles = /файл|код|игр[ауы]|напиш|создай|реализ|скрипт|программ|python|tetris|html|react/i.test(
         userContent,
       );
+
+      const persistScratchpad = () => {
+        const cur = this.store.listSessions().find((s) => s.id === sessionId);
+        if (!cur) return;
+        this.store.updateSession({
+          ...cur,
+          agentScratchpad: serializeWorkingMemory(workingMemory),
+          updatedAt: new Date().toISOString(),
+        });
+      };
+
+      const refreshRetrieved = async (reason: string) => {
+        const root = settings.projectRoot;
+        if (!root) return;
+        try {
+          const snippets = await retrieveProjectContext(root, workingMemory.goal || userContent, {
+            maxFiles: 6,
+            maxBytesPerFile: 3500,
+            maxTotalBytes: 14_000,
+          });
+          const block = formatRetrievedSnippets(snippets);
+          if (!block) return;
+          let next = baseSystem;
+          const cut = next.search(/^# Релевантный код/m);
+          if (cut > 0) next = next.slice(0, cut).trimEnd();
+          baseSystem = `${next}\n\n${block}`;
+          this.emit(sessionId, {
+            type: "thinking",
+            text: `Контекст обновлён (${reason}): retrieved=${snippets.length} файлов`,
+          });
+        } catch {
+          // non-fatal
+        }
+      };
+
+      const syncSystem = () => {
+        updatePlanMemory(workingMemory, steps);
+        if (transcript[0]?.role === "system") {
+          transcript[0] = {
+            role: "system",
+            content: applyWorkingMemoryToSystem(baseSystem, workingMemory),
+          };
+        }
+      };
 
       for (let i = 0; i < settings.agentMaxSteps; i++) {
         if (this.cancelled) {
@@ -456,6 +525,10 @@ export class AgentLoop {
         }
         const stepId = `step-${i + 1}`;
         this.emit(sessionId, { type: "step_start", stepId });
+        this.emit(sessionId, {
+          type: "thinking",
+          text: `Шаг ${i + 1}/${settings.agentMaxSteps}: жду ответ модели…`,
+        });
 
         let raw: string;
         try {
@@ -464,29 +537,59 @@ export class AgentLoop {
           const want = wantsFiles
             ? Math.max(params.maxTokens || 0, 2048)
             : Math.max(params.maxTokens || 0, 1536);
-          const maxTokens = Math.min(want, Math.max(512, Math.floor(ctx * 0.35)), 3072);
+          const maxTokens = Math.min(want, Math.max(512, Math.floor(ctx * 0.32)), 3072);
           const callParams = {
             ...params,
             maxTokens,
             temperature: Math.min(params.temperature, 0.4),
           };
+          syncSystem();
+          const beforeLen = transcript.length;
           // Fold old tool turns into an extractive summary as the run grows.
           transcript = condenseTranscript(transcript, {
             keepRecent: 8,
             triggerMessages: 12,
-            summaryTokens: Math.min(400, Math.floor(ctx * 0.05)),
+            summaryTokens: Math.min(500, Math.floor(ctx * 0.06)),
+            workingMemory,
           });
+          if (transcript.length < beforeLen) {
+            workingMemory.notes.push("history condensed");
+            if (workingMemory.notes.length > 12) {
+              workingMemory.notes = workingMemory.notes.slice(-12);
+            }
+            this.emit(sessionId, {
+              type: "thinking",
+              text: `Сжатие истории шагов (цель и план сохранены в Working memory)`,
+            });
+          }
+          syncSystem();
           let packed = fitMessagesToContext(transcript, ctx, maxTokens);
+          const usedTok = estimateMessagesTokens(packed);
+          this.emit(sessionId, {
+            type: "thinking",
+            text: `Шаг ${i + 1}/${settings.agentMaxSteps}: контекст ~${usedTok}/${ctx} tok · жду модель…`,
+          });
           try {
-            raw = await this.chat.completeJson(packed, callParams);
+            raw = await this.chat.completeJson(packed, callParams, sessionId);
           } catch (err) {
             if (!isContextOverflowError(err) || this.cancelled) throw err;
-            // Emergency shrink: drop oldest non-system turns and retry once.
-            const system = transcript[0];
-            const tail = transcript.slice(Math.max(1, transcript.length - 4));
-            transcript = system ? [system, ...tail] : [...tail];
+            // Emergency: keep system+working memory + summary of dropped + recent tail.
+            transcript = emergencyShrinkTranscript(transcript, 4, (old) =>
+              summarizeTranscript(
+                old,
+                Math.min(400, Math.floor(ctx * 0.05)),
+                workingMemory,
+              ),
+            );
+            workingMemory.notes.push("emergency context shrink");
+            persistScratchpad();
+            syncSystem();
             packed = fitMessagesToContext(transcript, ctx, maxTokens);
-            raw = await this.chat.completeJson(packed, callParams);
+            this.emit(sessionId, {
+              type: "thinking",
+              text: `Шаг ${i + 1}: контекст переполнен — сжимаю историю, цель и план сохранены… (~${estimateMessagesTokens(packed)}/${ctx} tok)`,
+            });
+            raw = await this.chat.completeJson(packed, callParams, sessionId);
           }
         } catch (err) {
           if (this.cancelled || (err instanceof Error && /отмен/i.test(err.message))) {
@@ -520,6 +623,7 @@ export class AgentLoop {
             title: p.title,
             status: "pending" as const,
           }));
+          updatePlanMemory(workingMemory, steps);
           this.emit(sessionId, { type: "plan", steps });
         }
 
@@ -654,6 +758,19 @@ export class AgentLoop {
               this.emit(sessionId, { type: "plan", steps });
             }
           }
+          rememberToolSuccess(workingMemory, toolName, normalizedArgs, result);
+          updatePlanMemory(workingMemory, steps);
+          persistScratchpad();
+          if (
+            FILE_MUTATION_TOOLS.has(toolName) ||
+            (i - lastRetrieveAt >= 3 && toolsUsed > 0)
+          ) {
+            lastRetrieveAt = i;
+            await refreshRetrieved(
+              FILE_MUTATION_TOOLS.has(toolName) ? `после ${toolName}` : "периодически",
+            );
+            syncSystem();
+          }
           this.store.addMessage(sessionId, {
             role: "tool",
             content: result,
@@ -682,6 +799,8 @@ export class AgentLoop {
           });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
+          rememberToolError(workingMemory, toolName, message);
+          persistScratchpad();
           this.emit(sessionId, {
             type: "tool_result",
             callId,

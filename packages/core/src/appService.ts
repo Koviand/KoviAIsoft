@@ -21,18 +21,30 @@ import type {
   StatusBarInfo,
   SystemInfo,
 } from "@kovi/shared";
-import { DEFAULT_GENERATION_PARAMS, sessionToolsEnabled } from "@kovi/shared";
+import {
+  AUTO_PC_PROFILE_ID,
+  DEFAULT_GENERATION_PARAMS,
+  sessionToolsEnabled,
+  type HardwareLoadSuggestion,
+} from "@kovi/shared";
 import { AgentLoop } from "./agent/loop.js";
 import { ChatEngine } from "./chat/engine.js";
 import { buildProjectContext } from "./context/packer.js";
 import { Store } from "./db/store.js";
 import { McpManager } from "./mcp/manager.js";
 import {
+  isAutoPcProfile,
+  suggestHardwareLoadProfile,
+} from "./models/hardwareProfile.js";
+import {
+  annotateHfFilesWithFit,
   downloadHfFile,
+  enrichHfSearchWithFit,
   listHfGgufFiles,
   recommendHfFiles,
   searchHfModels,
 } from "./models/huggingface.js";
+import { ensureHfCli, getHfCliStatus } from "./models/hfCli.js";
 import { verifyGgufFile, withIntegrity } from "./models/integrity.js";
 import { scanLocalModels } from "./models/scanner.js";
 import { getAppDataDir } from "./paths.js";
@@ -99,15 +111,15 @@ export class AppService {
       }
       this.onChatToken?.(p);
       // Unified bus: UI listens to agentEvent for both chat and agent progress.
-      this.onAgentEvent?.({
-        sessionId: p.sessionId,
-        event: p.thinking
-          ? { type: "thinking", text: p.text }
-          : { type: "stream", text: p.text },
-      });
+      const event = p.draft
+        ? ({ type: "model_output" as const, text: p.text })
+        : p.thinking
+          ? ({ type: "thinking" as const, text: p.text })
+          : ({ type: "stream" as const, text: p.text });
+      this.onAgentEvent?.({ sessionId: p.sessionId, event });
     });
     this.agent.setEventHandler((sessionId, event) => {
-      if (event.type === "token" || event.type === "stream") {
+      if (event.type === "token" || event.type === "stream" || event.type === "model_output") {
         if (!this.genStats.startedAt) this.genStats.startedAt = Date.now();
         this.genStats.tokenChars += event.text.length;
         this.genStats.tokenApprox += Math.max(1, Math.round(event.text.length / 4));
@@ -223,7 +235,19 @@ export class AppService {
 
   async saveSettings(next: AppSettings): Promise<AppSettings> {
     const prev = this.settings.get();
-    const saved = await this.settings.save(next);
+    const downloadDir =
+      typeof next.downloadDir === "string" && next.downloadDir.trim()
+        ? next.downloadDir.trim()
+        : prev.downloadDir;
+    const downloadRoot = path.resolve(downloadDir);
+    const modelRoots = [...next.modelRoots];
+    if (
+      !modelRoots.some((r) => path.resolve(r).toLowerCase() === downloadRoot.toLowerCase())
+    ) {
+      modelRoots.push(downloadDir);
+    }
+    const normalized: AppSettings = { ...next, downloadDir, modelRoots };
+    const saved = await this.settings.save(normalized);
     this.applyRuntimeFetcherConfig(saved);
     if (JSON.stringify(prev.mcpServers) !== JSON.stringify(saved.mcpServers)) {
       await this.mcp.sync(saved.mcpServers);
@@ -305,18 +329,84 @@ export class AppService {
     return buildModelRecommendations(sys);
   }
 
-  searchHf(query: string): Promise<HfSearchResult[]> {
-    return searchHfModels(query);
+  async suggestHardwareLoadSettings(opts?: {
+    modelId?: string;
+  }): Promise<HardwareLoadSuggestion> {
+    const sys = await this.getSystemInfo();
+    let modelSizeGb: number | undefined;
+    if (opts?.modelId) {
+      const model =
+        this.modelsCache.find((m) => m.id === opts.modelId) ||
+        (await this.scanModels()).find((m) => m.id === opts.modelId);
+      if (model) modelSizeGb = model.sizeBytes / 1024 ** 3;
+    }
+    return suggestHardwareLoadProfile(sys, { modelSizeGb });
+  }
+
+  async applyHardwareLoadSettings(opts?: {
+    modelId?: string;
+    applyBackend?: boolean;
+    applyDefaultParams?: boolean;
+  }): Promise<AppSettings> {
+    const suggestion = await this.suggestHardwareLoadSettings({
+      modelId: opts?.modelId,
+    });
+    const cur = this.settings.get();
+    const others = (cur.loadProfiles || []).filter((p) => p.id !== AUTO_PC_PROFILE_ID);
+    const applyParams = opts?.applyDefaultParams !== false;
+    const next: AppSettings = {
+      ...cur,
+      loadProfiles: [...others, suggestion.profile],
+      activeLoadProfileId: AUTO_PC_PROFILE_ID,
+      runtimeBackendPreference:
+        opts?.applyBackend === false
+          ? cur.runtimeBackendPreference
+          : suggestion.backend,
+      ...(applyParams
+        ? {
+            defaultParams: {
+              ...cur.defaultParams,
+              ...suggestion.defaultParams,
+            },
+            agentMaxSteps: suggestion.agentMaxSteps,
+          }
+        : {}),
+    };
+    return this.settings.save(next);
+  }
+
+  getHfCliStatus() {
+    return getHfCliStatus();
+  }
+
+  async ensureHfCli() {
+    this.modelDownload = { active: true, progress: 0, label: "Установка HF CLI…" };
+    try {
+      return await ensureHfCli((progress, label) => {
+        this.modelDownload = { active: true, progress, label };
+        this.onDownloadProgress?.({ progress, label });
+      });
+    } finally {
+      this.modelDownload = { active: false, progress: 100, label: "" };
+    }
+  }
+
+  async searchHf(query: string): Promise<HfSearchResult[]> {
+    const results = await searchHfModels(query);
+    const sys = await this.getSystemInfo();
+    const vram = sys.gpus.find((g) => g.vramGb)?.vramGb ?? null;
+    return enrichHfSearchWithFit(results, vram, sys.totalRamGb || 16);
   }
 
   async listHfFiles(modelId: string): Promise<HfFile[]> {
     const files = await listHfGgufFiles(modelId);
     const sys = await this.getSystemInfo();
     const vram = sys.gpus.find((g) => g.vramGb)?.vramGb;
+    const ram = sys.totalRamGb || 16;
     const recommended = new Set(
-      recommendHfFiles(files, vram, sys.totalRamGb).map((f) => f.path),
+      recommendHfFiles(files, vram, ram).map((f) => f.path),
     );
-    return files
+    return annotateHfFilesWithFit(files, vram, ram)
       .map((f) => ({ ...f, recommended: recommended.has(f.path) }))
       .sort((a, b) => Number(recommended.has(b.path)) - Number(recommended.has(a.path)));
   }
@@ -325,15 +415,33 @@ export class AppService {
     this.modelDownload = { active: true, progress: 0, label: "Скачивание модели…" };
     try {
       const s = this.settings.get();
-      const dest = await downloadHfFile(
-        modelId,
-        filePath,
-        s.downloadDir,
-        (progress, label) => {
+      const method = s.hfDownloadMethod || "auto";
+      this.modelDownload = {
+        active: true,
+        progress: 0,
+        label:
+          method === "http"
+            ? "Скачивание (HTTP)…"
+            : method === "cli"
+              ? "Скачивание (HF CLI)…"
+              : "Скачивание (HF CLI / HTTP)…",
+      };
+      this.onDownloadProgress?.({
+        progress: 0,
+        label: this.modelDownload.label,
+      });
+      const result = await downloadHfFile(modelId, filePath, s.downloadDir, {
+        method,
+        token: s.hfToken,
+        onProgress: (progress, label) => {
           this.modelDownload = { active: true, progress, label };
           this.onDownloadProgress?.({ progress, label });
         },
-      );
+      });
+      this.onDownloadProgress?.({
+        progress: 100,
+        label: `Готово (${result.via === "cli" ? "HF CLI" : "HTTP"})`,
+      });
       // Ensure downloaded files appear in the local scan list.
       const downloadRoot = path.resolve(s.downloadDir);
       if (!s.modelRoots.some((r) => path.resolve(r).toLowerCase() === downloadRoot.toLowerCase())) {
@@ -343,7 +451,7 @@ export class AppService {
         });
       }
       await this.scanModels();
-      return dest;
+      return result.path;
     } finally {
       this.modelDownload = { active: false, progress: 100, label: "" };
     }
@@ -360,14 +468,29 @@ export class AppService {
       }
       const settings = this.settings.get();
       const profile = settings.loadProfiles.find((p) => p.id === settings.activeLoadProfileId);
-      const profileParams: Partial<GenerationParams> = profile
-        ? {
+      const hardwareAware =
+        Boolean(profile?.hardwareAware) || isAutoPcProfile(settings.activeLoadProfileId);
+      let profileParams: Partial<GenerationParams> = {};
+      if (profile) {
+        if (hardwareAware) {
+          // Respect per-model fit: take the safer (lower) of profile vs model estimate.
+          const nglModel = model.recommendedNgl ?? profile.gpuLayers;
+          const ctxModel = model.recommendedContext ?? profile.context;
+          profileParams = {
+            gpuLayers: Math.min(profile.gpuLayers, nglModel),
+            context: Math.min(profile.context, ctxModel),
+            flashAttn: profile.flashAttn,
+            maxTokens: profile.maxTokens ?? settings.defaultParams.maxTokens,
+          };
+        } else {
+          profileParams = {
             gpuLayers: profile.gpuLayers,
             context: profile.context,
             flashAttn: profile.flashAttn,
             maxTokens: profile.maxTokens ?? settings.defaultParams.maxTokens,
-          }
-        : {};
+          };
+        }
+      }
       const merged: GenerationParams = {
         ...DEFAULT_GENERATION_PARAMS,
         ...settings.defaultParams,

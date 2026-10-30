@@ -62,6 +62,8 @@ export function ChatPage(props: {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState("");
   const [thinking, setThinking] = useState("");
+  const [modelOutput, setModelOutput] = useState("");
+  const [currentStep, setCurrentStep] = useState<string | null>(null);
   const [plan, setPlan] = useState<AgentPlanStep[]>([]);
   const [toolTrail, setToolTrail] = useState<ProcessToolItem[]>([]);
   const [genMode, setGenMode] = useState<ProcessMode>(null);
@@ -109,12 +111,14 @@ export function ChatPage(props: {
     setToolTrail([]);
     setStreaming("");
     setThinking("");
+    setModelOutput("");
+    setCurrentStep(null);
     setGenMode(null);
   }, [activeSession?.id]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [props.messages, streaming, thinking, plan, toolTrail, props.busy]);
+  }, [props.messages, streaming, thinking, modelOutput, plan, toolTrail, props.busy]);
 
   /** UI content updates only for the viewed session + current generation. */
   function acceptsUiUpdate(sessionId: string, epoch: number): boolean {
@@ -151,6 +155,8 @@ export function ChatPage(props: {
             if (activeIdRef.current !== p.sessionId) return;
             setStreaming("");
             setThinking("");
+            setModelOutput("");
+            setCurrentStep(null);
             setGenMode(null);
             setPlan([]);
             setToolTrail([]);
@@ -173,12 +179,17 @@ export function ChatPage(props: {
         setToolTrail([]);
         setStreaming("");
         setThinking("");
+        setModelOutput("");
+        setCurrentStep(null);
         setGenMode(ev.mode);
         props.setBusy(true);
       }
       // Prefer stream only; ignore legacy token duplicates (P0-4).
       if (ev.type === "stream") {
         setStreaming((t) => t + ev.text);
+      }
+      if (ev.type === "model_output") {
+        setModelOutput((t) => t + ev.text);
       }
       if (ev.type === "thinking") {
         setThinking((t) => t + (t ? "\n" : "") + ev.text);
@@ -187,6 +198,8 @@ export function ChatPage(props: {
         setPlan(ev.steps);
       }
       if (ev.type === "step_start") {
+        setCurrentStep(ev.stepId);
+        setModelOutput("");
         setPlan((prev) =>
           prev.map((s) => (s.id === ev.stepId ? { ...s, status: "running" as const } : s)),
         );
@@ -201,6 +214,7 @@ export function ChatPage(props: {
         );
       }
       if (ev.type === "tool_call") {
+        setCurrentStep(`tool · ${ev.name}`);
         setToolTrail((prev) => [
           ...prev.filter((t) => t.callId !== ev.callId),
           {
@@ -260,6 +274,8 @@ export function ChatPage(props: {
     setInput("");
     setStreaming("");
     setThinking("");
+    setModelOutput("");
+    setCurrentStep(null);
     setPlan([]);
     setToolTrail([]);
     setGenMode(null);
@@ -303,6 +319,8 @@ export function ChatPage(props: {
     streamSessionRef.current = null;
     setStreaming("");
     setThinking("");
+    setModelOutput("");
+    setCurrentStep(null);
     try {
       await api.stopGeneration();
     } finally {
@@ -337,7 +355,14 @@ export function ChatPage(props: {
 
   const showProcess =
     props.busy ||
-    Boolean(streaming || thinking || plan.length || toolTrail.length || props.pendingConfirmSummary);
+    Boolean(
+      streaming ||
+        thinking ||
+        modelOutput ||
+        plan.length ||
+        toolTrail.length ||
+        props.pendingConfirmSummary,
+    );
   const isEmpty = props.messages.length === 0 && !showProcess;
 
   async function exportActive(): Promise<void> {
@@ -387,7 +412,7 @@ export function ChatPage(props: {
   return (
     <div className="panel chat-panel">
       <div className="panel-list">
-        <div className="row session-list-head">
+        <div className="session-list-head">
           <button
             className="btn primary"
             type="button"
@@ -605,6 +630,8 @@ export function ChatPage(props: {
                   mode={genMode}
                   thinking={thinking}
                   streaming={streaming}
+                  modelOutput={modelOutput}
+                  currentStep={currentStep}
                   plan={plan}
                   tools={toolTrail}
                   confirmSummary={props.pendingConfirmSummary}

@@ -1,3 +1,5 @@
+import { truncateSystemPreservingWm } from "../agent/workingMemory.js";
+
 /** Rough token estimate for mixed RU/EN prompts (llama BPE-ish). */
 export function estimateTokens(text: string): number {
   if (!text) return 0;
@@ -46,7 +48,9 @@ export function fitMessagesToContext<T extends { role: string; content: string }
   reserveCompletion: number,
 ): T[] {
   if (!messages.length) return messages;
-  const budget = Math.max(256, contextTokens - Math.max(64, reserveCompletion) - 32);
+  // 15% safety vs heuristic token estimate (local llama BPE often higher than estimate).
+  const rawBudget = contextTokens - Math.max(64, reserveCompletion) - 32;
+  const budget = Math.max(256, Math.floor(rawBudget * 0.85));
 
   const out = messages.map((m) => ({ ...m }));
   const systemIdx = out.findIndex((m) => m.role === "system");
@@ -57,7 +61,12 @@ export function fitMessagesToContext<T extends { role: string; content: string }
   if (system && estimateTokens(system.content) > systemBudget) {
     system = {
       ...system,
-      content: truncateToTokens(system.content, systemBudget),
+      content: truncateSystemPreservingWm(
+        system.content,
+        systemBudget,
+        truncateToTokens,
+        estimateTokens,
+      ),
     };
   }
 

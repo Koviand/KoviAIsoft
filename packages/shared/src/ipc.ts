@@ -12,6 +12,8 @@ import type {
   LocalModel,
   McpHealthResult,
   McpServerConfig,
+  HardwareLoadSuggestion,
+  HfCliStatus,
   ModelRecommendationsReport,
   RuntimeAsset,
   RuntimeBackend,
@@ -33,9 +35,13 @@ export const IPC = {
   listModels: "kovi:listModels",
   scanModels: "kovi:scanModels",
   getModelRecommendations: "kovi:getModelRecommendations",
+  suggestHardwareLoadSettings: "kovi:suggestHardwareLoadSettings",
+  applyHardwareLoadSettings: "kovi:applyHardwareLoadSettings",
   searchHf: "kovi:searchHf",
   listHfFiles: "kovi:listHfFiles",
   downloadHfFile: "kovi:downloadHfFile",
+  getHfCliStatus: "kovi:getHfCliStatus",
+  ensureHfCli: "kovi:ensureHfCli",
   loadModel: "kovi:loadModel",
   unloadModel: "kovi:unloadModel",
   listSessions: "kovi:listSessions",
@@ -160,9 +166,19 @@ export interface KoviApi {
   listModels(): Promise<LocalModel[]>;
   scanModels(): Promise<LocalModel[]>;
   getModelRecommendations(): Promise<ModelRecommendationsReport>;
+  suggestHardwareLoadSettings(opts?: {
+    modelId?: string;
+  }): Promise<HardwareLoadSuggestion>;
+  applyHardwareLoadSettings(opts?: {
+    modelId?: string;
+    applyBackend?: boolean;
+    applyDefaultParams?: boolean;
+  }): Promise<AppSettings>;
   searchHf(query: string): Promise<HfSearchResult[]>;
   listHfFiles(modelId: string): Promise<HfFile[]>;
   downloadHfFile(modelId: string, filePath: string): Promise<string>;
+  getHfCliStatus(): Promise<HfCliStatus>;
+  ensureHfCli(): Promise<HfCliStatus>;
   loadModel(modelId: string, params?: Partial<GenerationParams>): Promise<void>;
   unloadModel(): Promise<void>;
   listSessions(): Promise<ChatSession[]>;

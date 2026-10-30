@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import type { AppSettings } from "@kovi/shared";
+import type { AppSettings, HardwareLoadSuggestion } from "@kovi/shared";
+import { AUTO_PC_PROFILE_ID, THEME_PRESET_OPTIONS } from "@kovi/shared";
 import { api } from "../api";
 import { paramLabel } from "../lib/labels";
 
@@ -10,6 +11,8 @@ export function SettingsPage(props: {
 }) {
   const [draft, setDraft] = useState<AppSettings | null>(props.settings);
   const [saving, setSaving] = useState(false);
+  const [hwPreview, setHwPreview] = useState<HardwareLoadSuggestion | null>(null);
+  const [hwBusy, setHwBusy] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -69,20 +72,16 @@ export function SettingsPage(props: {
 
       <section className="card elevated">
         <h3>Тема</h3>
-        <div className="row" style={{ marginTop: 10 }}>
-          {(
-            [
-              ["light", "Светлая"],
-              ["dark", "Тёмная"],
-              ["high-contrast", "Контраст"],
-              ["custom", "Своя"],
-            ] as const
-          ).map(([p, label]) => (
+        <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
+          Готовые палитры и своя тема с ручным акцентом/фоном.
+        </p>
+        <div className="row" style={{ marginTop: 10, flexWrap: "wrap", gap: 8 }}>
+          {THEME_PRESET_OPTIONS.map(({ id, label }) => (
             <button
-              key={p}
+              key={id}
               type="button"
-              className={`btn ${s.themePreset === p ? "primary" : ""}`}
-              onClick={() => void saveNow({ ...s, themePreset: p })}
+              className={`btn ${s.themePreset === id ? "primary" : ""}`}
+              onClick={() => void saveNow({ ...s, themePreset: id })}
             >
               {label}
             </button>
@@ -154,9 +153,96 @@ export function SettingsPage(props: {
       </section>
 
       <section className="card">
+        <h3>Скачивание с Hugging Face</h3>
+        <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
+          Скачивание через встроенный Hugging Face CLI (Python + huggingface_hub в{" "}
+          <span className="mono">tools/hf</span>). Если CLI недоступен — HTTP.
+        </p>
+        <label style={{ display: "block", marginTop: 12 }}>
+          Папка для загрузки моделей
+          <div className="row" style={{ marginTop: 6 }}>
+            <input
+              className="input mono"
+              style={{ flex: 1 }}
+              value={s.downloadDir}
+              onChange={(e) => queueSave({ ...s, downloadDir: e.target.value })}
+              placeholder="C:\\Models\\GGUF"
+            />
+            <button
+              type="button"
+              className="btn"
+              disabled={saving}
+              onClick={async () => {
+                const dir = await api.pickDirectory();
+                if (dir) await saveNow({ ...s, downloadDir: dir });
+              }}
+            >
+              Выбрать…
+            </button>
+          </div>
+        </label>
+        <div className="row" style={{ marginTop: 10 }}>
+          <button
+            type="button"
+            className="btn"
+            disabled={saving}
+            onClick={() => {
+              setSaving(true);
+              void api
+                .ensureHfCli()
+                .then((st) => {
+                  props.setError(
+                    st.available
+                      ? null
+                      : st.hint || "HF CLI не установился",
+                  );
+                  if (st.available) {
+                    // brief success via hint in Models; clear error
+                  }
+                })
+                .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
+                .finally(() => setSaving(false));
+            }}
+          >
+            Установить / проверить встроенный HF CLI
+          </button>
+        </div>
+        <div className="row" style={{ marginTop: 10, flexWrap: "wrap" }}>
+          {(
+            [
+              ["auto", "Авто (CLI → HTTP)"],
+              ["cli", "Только HF CLI"],
+              ["http", "Только HTTP"],
+            ] as const
+          ).map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              className={`btn ${(s.hfDownloadMethod || "auto") === id ? "primary" : ""}`}
+              onClick={() => void saveNow({ ...s, hfDownloadMethod: id })}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <label style={{ display: "block", marginTop: 12 }}>
+          HF Token (опционально, для gated-моделей)
+          <input
+            className="input"
+            type="password"
+            autoComplete="off"
+            placeholder="hf_…"
+            value={s.hfToken || ""}
+            onChange={(e) => queueSave({ ...s, hfToken: e.target.value })}
+          />
+        </label>
+      </section>
+
+      <section className="card">
         <h3>Профили загрузки модели</h3>
         <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-          GPU layers / context / flash-attn при «Загрузить в память».
+          GPU layers / context / flash-attn при «Загрузить в память». Кнопка ниже также предложит
+          параметры чата (ctx, maxTokens) и лимит шагов агента под VRAM/RAM — без автоприменения.
         </p>
         <div className="row" style={{ marginTop: 10, flexWrap: "wrap" }}>
           {(s.loadProfiles || []).map((p) => (
@@ -169,6 +255,21 @@ export function SettingsPage(props: {
               {p.name}
             </button>
           ))}
+          <button
+            type="button"
+            className="btn"
+            disabled={hwBusy || saving}
+            onClick={() => {
+              setHwBusy(true);
+              void api
+                .suggestHardwareLoadSettings()
+                .then(setHwPreview)
+                .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
+                .finally(() => setHwBusy(false));
+            }}
+          >
+            Подобрать под мой ПК
+          </button>
         </div>
         {(() => {
           const active = (s.loadProfiles || []).find((p) => p.id === s.activeLoadProfileId);
@@ -177,9 +278,82 @@ export function SettingsPage(props: {
             <div className="muted mono" style={{ marginTop: 10, fontSize: "0.8rem" }}>
               ngl {active.gpuLayers} · ctx {active.context}
               {active.flashAttn ? " · flash-attn" : ""}
+              {active.maxTokens != null ? ` · maxTokens ${active.maxTokens}` : ""}
+              {active.id === AUTO_PC_PROFILE_ID ? " · hardware-aware" : ""}
             </div>
           );
         })()}
+        {hwPreview && (
+          <div className="card" style={{ marginTop: 12 }} role="dialog" aria-label="Превью под ПК">
+            <strong>Превью: {hwPreview.profile.name}</strong>
+            <div className="mono" style={{ fontSize: "0.85rem", marginTop: 8 }}>
+              загрузка: ngl {hwPreview.profile.gpuLayers} · ctx {hwPreview.profile.context} ·
+              maxTokens {hwPreview.profile.maxTokens ?? "—"}
+              {hwPreview.profile.flashAttn ? " · flash-attn" : ""} · backend {hwPreview.backend}
+            </div>
+            <div className="mono" style={{ fontSize: "0.85rem", marginTop: 6 }}>
+              чат по умолчанию: ctx {hwPreview.defaultParams.context} · maxTokens{" "}
+              {hwPreview.defaultParams.maxTokens} · ngl {hwPreview.defaultParams.gpuLayers}
+              {hwPreview.defaultParams.flashAttn ? " · flash" : ""} · агент{" "}
+              {hwPreview.agentMaxSteps} шагов
+            </div>
+            <p style={{ margin: "8px 0 0", fontSize: "0.82rem" }}>{hwPreview.rationale}</p>
+            <div className="row" style={{ marginTop: 12, flexWrap: "wrap", gap: 8 }}>
+              <button
+                className="btn primary"
+                type="button"
+                disabled={hwBusy}
+                onClick={() => {
+                  setHwBusy(true);
+                  void api
+                    .applyHardwareLoadSettings({
+                      applyBackend: true,
+                      applyDefaultParams: true,
+                    })
+                    .then((saved) => {
+                      props.setSettings(saved);
+                      setDraft(saved);
+                      setHwPreview(null);
+                    })
+                    .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
+                    .finally(() => setHwBusy(false));
+                }}
+              >
+                Применить всё
+              </button>
+              <button
+                className="btn"
+                type="button"
+                disabled={hwBusy}
+                onClick={() => {
+                  setHwBusy(true);
+                  void api
+                    .applyHardwareLoadSettings({
+                      applyBackend: true,
+                      applyDefaultParams: false,
+                    })
+                    .then((saved) => {
+                      props.setSettings(saved);
+                      setDraft(saved);
+                      setHwPreview(null);
+                    })
+                    .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
+                    .finally(() => setHwBusy(false));
+                }}
+              >
+                Только профиль загрузки
+              </button>
+              <button
+                className="btn ghost"
+                type="button"
+                disabled={hwBusy}
+                onClick={() => setHwPreview(null)}
+              >
+                Отмена
+              </button>
+            </div>
+          </div>
+        )}
       </section>
 
       <section className="card">
@@ -220,7 +394,10 @@ export function SettingsPage(props: {
 
       <section className="card">
         <h3>Модели и runtime</h3>
-        <div className="row" style={{ marginTop: 10 }}>
+        <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
+          Папки сканирования GGUF и отдельная папка, куда сохраняются новые загрузки с HF.
+        </p>
+        <div className="row" style={{ marginTop: 10, flexWrap: "wrap" }}>
           <button
             type="button"
             className="btn"
@@ -231,9 +408,22 @@ export function SettingsPage(props: {
           >
             Добавить папку моделей
           </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={async () => {
+              const dir = await api.pickDirectory();
+              if (dir) await saveNow({ ...s, downloadDir: dir });
+            }}
+          >
+            Папка загрузки…
+          </button>
         </div>
         <div className="muted mono" style={{ marginTop: 10 }}>
-          {s.modelRoots.join(" | ") || "папки не заданы"}
+          загрузка: {s.downloadDir || "не задана"}
+        </div>
+        <div className="muted mono" style={{ marginTop: 6 }}>
+          сканирование: {s.modelRoots.join(" | ") || "папки не заданы"}
         </div>
         <div className="section-block">
           <label className="row">
@@ -304,7 +494,8 @@ export function SettingsPage(props: {
       <section className="card">
         <h3>Параметры генерации по умолчанию</h3>
         <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-          Используются для новых диалогов. В чате можно переопределить для сессии.
+          Используются для новых диалогов. В чате можно переопределить для сессии. Значения
+          context / maxTokens / ngl можно подобрать кнопкой «Подобрать под мой ПК» выше.
         </p>
         <div className="grid-2" style={{ marginTop: 10 }}>
           {(
