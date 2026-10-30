@@ -121,6 +121,10 @@ export interface RuntimeStatus {
   serverRunning: boolean;
   serverPort: number | null;
   loadedModelId: string | null;
+  /** Context size actually passed to llama-server on last successful load. */
+  loadedContext: number | null;
+  /** GPU layers actually passed to llama-server on last successful load. */
+  loadedGpuLayers: number | null;
   lastError: string | null;
   update: RuntimeUpdateInfo | null;
 }
@@ -468,6 +472,7 @@ export const DEFAULT_GENERATION_PARAMS: GenerationParams = {
   topP: 0.95,
   topK: 40,
   minP: 0.05,
+  /** Aligned with balanced load profile; runtime may use more via clampCompletionTokens. */
   maxTokens: 4096,
   context: 8192,
   gpuLayers: 99,
@@ -482,7 +487,7 @@ export const DEFAULT_LOAD_PROFILES: LoadProfile[] = [
     gpuLayers: 99,
     context: 4096,
     flashAttn: true,
-    maxTokens: 1024,
+    maxTokens: 2048,
     hardwareAware: true,
   },
   {
@@ -491,7 +496,7 @@ export const DEFAULT_LOAD_PROFILES: LoadProfile[] = [
     gpuLayers: 99,
     context: 8192,
     flashAttn: false,
-    maxTokens: 2048,
+    maxTokens: 4096,
     hardwareAware: true,
   },
   {
@@ -500,7 +505,7 @@ export const DEFAULT_LOAD_PROFILES: LoadProfile[] = [
     gpuLayers: 99,
     context: 16384,
     flashAttn: true,
-    maxTokens: 4096,
+    maxTokens: 8192,
     hardwareAware: true,
   },
   {
@@ -509,7 +514,7 @@ export const DEFAULT_LOAD_PROFILES: LoadProfile[] = [
     gpuLayers: 0,
     context: 4096,
     flashAttn: false,
-    maxTokens: 1024,
+    maxTokens: 2048,
   },
 ];
 

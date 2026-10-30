@@ -169,15 +169,15 @@ export function toolsPromptBlock(
     ...extras.map((t) => `- ${t.name}: ${t.description || "MCP tool"}`),
   ];
   const rules = opts?.compact
-    ? `Строго JSON {"thought","plan?","tool"|null,"final"|null}. Сначала plan (3–7, tool=null), потом один tool/шаг; plan не переписывать. Код — write_file кусками. Windows/cmd без bash.`
-    : `Формат ответа на каждом шаге — строго один JSON-объект (сервер может требовать schema):
+    ? `ТОЛЬКО один JSON {"thought","plan?","tool"|null,"final"|null} — без prose/markdown вокруг. Сначала plan (3–7, tool=null), потом один tool/шаг; plan не переписывать. Код — write_file кусками. Windows/cmd без bash.`
+    : `Формат ответа на каждом шаге — строго ОДИН JSON-объект без текста до/после (сервер может требовать schema):
 {
   "thought": "краткие рассуждения",
   "plan": [{"id":"1","title":"..."}],
   "tool": {"name":"tool_name","args":{...}} | null,
   "final": "текст пользователю если закончили" | null
 }
-Запрещены XML/Hermes tool_call и bash-heredoc — только JSON с tool.name из списка ниже.
+Запрещены XML/Hermes tool_call, markdown-обёртки и bash-heredoc — только JSON с tool.name из списка ниже.
 
 Двухфазный режим:
 1) ФАЗА ПЛАНА (первый ответ): только plan из 3–7 коротких пунктов, tool=null, final=null.

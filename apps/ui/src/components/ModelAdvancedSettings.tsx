@@ -11,6 +11,8 @@ type Props = {
   loadedModelId: string | null;
   /** Prefer this model for fit hints (selected / loaded). */
   focusModelId?: string | null;
+  /** Sync generation defaults into this chat session (not sessions[0]). */
+  activeSessionId?: string | null;
   setError: (e: string | null) => void;
   onHint?: (msg: string) => void;
 };
@@ -92,8 +94,14 @@ export function ModelAdvancedSettings(props: Props) {
       // Sync active session params if present.
       try {
         const sessions = await api.listSessions();
-        // Prefer most recently updated session that matches current defaults usage.
-        const active = sessions[0];
+        const byId = props.activeSessionId
+          ? sessions.find((s) => s.id === props.activeSessionId)
+          : null;
+        const active =
+          byId ||
+          [...sessions].sort(
+            (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+          )[0];
         if (active) {
           await api.updateSession({
             ...active,
@@ -139,6 +147,8 @@ export function ModelAdvancedSettings(props: Props) {
                 context: load.context,
                 flashAttn: load.flashAttn,
                 maxTokens: gen.maxTokens,
+                // Manual override — loadModel must not recalculate over these numbers.
+                hardwareAware: false,
               }
             : p,
         );

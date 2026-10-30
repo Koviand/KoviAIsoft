@@ -54,6 +54,7 @@ const api: KoviApi = {
   previewFileDiff: (filePath, content) =>
     ipcRenderer.invoke(IPC.previewFileDiff, filePath, content),
   getCodebaseIndexStatus: () => ipcRenderer.invoke(IPC.getCodebaseIndexStatus),
+  listProjectMentions: () => ipcRenderer.invoke(IPC.listProjectMentions),
   reindexCodebase: () => ipcRenderer.invoke(IPC.reindexCodebase),
   listEmbeddingModels: () => ipcRenderer.invoke(IPC.listEmbeddingModels),
   getEmbeddingStatus: () => ipcRenderer.invoke(IPC.getEmbeddingStatus),

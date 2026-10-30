@@ -35,6 +35,7 @@ import { detectAgentTask } from "./agent/intent.js";
 import { AgentLoop } from "./agent/loop.js";
 import { ChatEngine } from "./chat/engine.js";
 import { buildProjectContext } from "./context/packer.js";
+import { projectContextCache } from "./context/projectCache.js";
 import {
   downloadEmbeddingModel,
   getEmbeddingStatus,
@@ -52,9 +53,11 @@ import { Store } from "./db/store.js";
 import { McpManager } from "./mcp/manager.js";
 import {
   buildHardwareTierProfiles,
+  estimateLoadPlan,
   isAutoPcProfile,
   mergeProfileIntoDefaultParams,
   suggestHardwareLoadProfile,
+  tierFromProfileId,
   type LoadTier,
 } from "./models/hardwareProfile.js";
 import {
@@ -75,7 +78,7 @@ import { configureRuntimeAssetFetcher } from "./runtime/assets.js";
 import { RuntimeManager } from "./runtime/manager.js";
 import { fetchLlamaServerMetrics } from "./runtime/serverMetrics.js";
 import { SettingsStore } from "./settings.js";
-import { detectSystemInfo, sampleVram } from "./system/detect.js";
+import { detectSystemInfo, pickMaxVram, sampleVram } from "./system/detect.js";
 import { buildModelRecommendations } from "./models/recommend.js";
 import { previewWriteDiff } from "./tools/diff.js";
 
@@ -210,10 +213,25 @@ export class AppService {
     });
   }
 
+  /** Real token when settings.json holds `__secure__` placeholder (Electron safeStorage). */
+  private githubTokenOverride: string | null = null;
+
+  setGithubTokenOverride(token: string | null): void {
+    this.githubTokenOverride = token && token.trim() ? token.trim() : null;
+    this.applyRuntimeFetcherConfig();
+  }
+
+  private resolveGithubToken(s = this.settings.get()): string | undefined {
+    if (this.githubTokenOverride) return this.githubTokenOverride;
+    const raw = s.githubToken?.trim();
+    if (!raw || raw === "__secure__") return undefined;
+    return raw;
+  }
+
   private applyRuntimeFetcherConfig(s = this.settings.get()): void {
     configureRuntimeAssetFetcher({
       cacheDir: path.join(this.appData, "cache"),
-      githubToken: s.githubToken?.trim() || undefined,
+      githubToken: this.resolveGithubToken(s),
     });
   }
 
@@ -455,7 +473,32 @@ export class AppService {
           }
         : {}),
     };
-    return this.settings.save(next);
+    this.systemCache = null;
+    const saved = await this.settings.save(next);
+    await this.reloadLoadedModelAfterProfileChange();
+    return saved;
+  }
+
+  /** If a model is in memory, reload so -c/-ngl match the new profile. */
+  private async reloadLoadedModelAfterProfileChange(): Promise<void> {
+    const loadedId = this.runtime.getStatus().loadedModelId;
+    if (!loadedId) return;
+    if (this.chat.isBusy() || this.agent.isRunning()) {
+      this.pushErrorLog(
+        "loadProfile",
+        "Профиль сохранён. Остановите генерацию и перезагрузите модель, чтобы применить ngl/ctx.",
+      );
+      return;
+    }
+    try {
+      await this.loadModel(loadedId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.pushErrorLog(
+        "loadProfile",
+        `Профиль сохранён, но перезагрузка модели не удалась: ${msg}`,
+      );
+    }
   }
 
   /**
@@ -526,13 +569,16 @@ export class AppService {
       throw new Error(`Профиль загрузки не найден: ${opts.profileId}`);
     }
 
-    return this.settings.save({
+    this.systemCache = null;
+    const saved = await this.settings.save({
       ...cur,
       loadProfiles: profiles,
       activeLoadProfileId: opts.profileId,
       defaultParams,
       agentMaxSteps,
     });
+    await this.reloadLoadedModelAfterProfileChange();
+    return saved;
   }
 
   getHfCliStatus() {
@@ -554,14 +600,14 @@ export class AppService {
   async searchHf(query: string): Promise<HfSearchResult[]> {
     const results = await searchHfModels(query);
     const sys = await this.getSystemInfo();
-    const vram = sys.gpus.find((g) => g.vramGb)?.vramGb ?? null;
+    const vram = pickMaxVram(sys);
     return enrichHfSearchWithFit(results, vram, sys.totalRamGb || 16);
   }
 
   async listHfFiles(modelId: string): Promise<HfFile[]> {
     const files = await listHfGgufFiles(modelId);
     const sys = await this.getSystemInfo();
-    const vram = sys.gpus.find((g) => g.vramGb)?.vramGb;
+    const vram = pickMaxVram(sys) ?? undefined;
     const ram = sys.totalRamGb || 16;
     const recommended = new Set(
       recommendHfFiles(files, vram, ram).map((f) => f.path),
@@ -631,39 +677,52 @@ export class AppService {
       }
       const settings = this.settings.get();
       const profile = settings.loadProfiles.find((p) => p.id === settings.activeLoadProfileId);
-      let profileParams: Partial<GenerationParams> = {};
-      if (profile) {
-        // B5: always clamp ngl/ctx to min(profile, model estimate) to reduce OOM.
-        const nglModel = model.recommendedNgl ?? profile.gpuLayers;
-        const ctxModel = model.recommendedContext ?? profile.context;
-        profileParams = {
-          gpuLayers: Math.min(profile.gpuLayers, nglModel),
-          context: Math.min(profile.context, ctxModel),
+      const sys = await this.getSystemInfo();
+      const modelSizeGb = model.sizeBytes / 1024 ** 3;
+      let loadParams: Partial<GenerationParams>;
+
+      if (profile?.hardwareAware) {
+        // Recalculate under this model — same calculator as scanner / «Под этот ПК».
+        const plan = estimateLoadPlan(sys, {
+          modelSizeGb,
+          tier: tierFromProfileId(profile.id),
+        });
+        loadParams = {
+          gpuLayers: plan.gpuLayers,
+          context: plan.context,
+          flashAttn: plan.flashAttn,
+          maxTokens: plan.maxTokens,
+        };
+        if (plan.fitsInVram === false) {
+          this.pushErrorLog(
+            "vram",
+            `Модель ${model.name} тесно по VRAM (ngl=${plan.gpuLayers}, ctx=${plan.context}).`,
+          );
+        }
+      } else if (profile) {
+        // Manual / Advanced / CPU — respect profile as saved (no silent min with scanner).
+        loadParams = {
+          gpuLayers: profile.gpuLayers,
+          context: profile.context,
           flashAttn: profile.flashAttn,
           maxTokens: profile.maxTokens ?? settings.defaultParams.maxTokens,
         };
+      } else {
+        const plan = estimateLoadPlan(sys, { modelSizeGb, tier: "balanced" });
+        loadParams = {
+          gpuLayers: plan.gpuLayers,
+          context: plan.context,
+          flashAttn: plan.flashAttn,
+          maxTokens: plan.maxTokens,
+        };
       }
+
       const merged: GenerationParams = {
         ...DEFAULT_GENERATION_PARAMS,
         ...settings.defaultParams,
-        gpuLayers: model.recommendedNgl,
-        context: model.recommendedContext,
-        ...profileParams,
+        ...loadParams,
         ...params,
       };
-      // Re-clamp after Advanced/IPC overrides (anti-OOM).
-      if (profile) {
-        merged.gpuLayers = Math.min(
-          merged.gpuLayers,
-          profile.gpuLayers,
-          model.recommendedNgl ?? merged.gpuLayers,
-        );
-        merged.context = Math.min(
-          merged.context,
-          profile.context,
-          model.recommendedContext ?? merged.context,
-        );
-      }
       if (model.fitsInVram === false && merged.gpuLayers > 0) {
         this.pushErrorLog(
           "vram",
@@ -791,7 +850,8 @@ export class AppService {
           toolBlock:
             "Инструменты недоступны в этом ответе. Для правок файлов начните с @agent или опишите задачу по коду.",
           contextTokens: merged.context || 8192,
-          reserveTokens: Math.min(Math.floor((merged.context || 8192) * 0.5), 4000),
+          // Leave generous room for a long reply (aligned with completionBudget).
+          reserveTokens: Math.min(Math.floor((merged.context || 8192) * 0.55), 10000),
         });
         system = packed.systemPrompt;
       } catch {
@@ -938,7 +998,8 @@ export class AppService {
   }
 
   cancelAgent(): void {
-    this.agent.cancel();
+    // Same as Stop: abort chat stream and agent loop.
+    this.stopGeneration();
   }
 
   async getStatusBar(): Promise<Omit<StatusBarInfo, "view">> {
@@ -999,6 +1060,17 @@ export class AppService {
 
   getCodebaseIndexStatus(): CodebaseIndexStatus {
     return getCodebaseIndexStatus();
+  }
+
+  listProjectMentions(): { root: string | null; files: string[] } {
+    const root = this.settings.get().projectRoot;
+    if (!root) return { root: null, files: [] };
+    try {
+      const map = projectContextCache.getMap(root, { maxEntries: 500, maxDepth: 8 });
+      return { root, files: map.files };
+    } catch {
+      return { root, files: [] };
+    }
   }
 
   listEmbeddingModels(): EmbeddingModelInfo[] {

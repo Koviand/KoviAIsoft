@@ -74,6 +74,7 @@ export const IPC = {
   verifyGguf: "kovi:verifyGguf",
   previewFileDiff: "kovi:previewFileDiff",
   getCodebaseIndexStatus: "kovi:getCodebaseIndexStatus",
+  listProjectMentions: "kovi:listProjectMentions",
   reindexCodebase: "kovi:reindexCodebase",
   listEmbeddingModels: "kovi:listEmbeddingModels",
   getEmbeddingStatus: "kovi:getEmbeddingStatus",
@@ -229,6 +230,8 @@ export interface KoviApi {
   verifyGguf(modelId: string): Promise<LocalModel>;
   previewFileDiff(path: string, content: string): Promise<string>;
   getCodebaseIndexStatus(): Promise<CodebaseIndexStatus>;
+  /** File paths for @-picker in chat composer. */
+  listProjectMentions(): Promise<{ root: string | null; files: string[] }>;
   reindexCodebase(): Promise<CodebaseIndexStatus>;
   listEmbeddingModels(): Promise<EmbeddingModelInfo[]>;
   getEmbeddingStatus(): Promise<EmbeddingStatus>;

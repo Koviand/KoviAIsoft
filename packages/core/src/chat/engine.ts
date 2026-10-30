@@ -3,6 +3,7 @@ import type { ChatMessage, GenerationParams } from "@kovi/shared";
 import type { RuntimeManager } from "../runtime/manager.js";
 import type { Store } from "../db/store.js";
 import { condenseTranscript } from "../context/summarize.js";
+import { clampCompletionTokens } from "./completionBudget.js";
 import {
   fitMessagesToContext,
   isContextOverflowError,
@@ -21,6 +22,12 @@ import {
   pickCompletionText,
   stripThinkTags,
 } from "./llmErrors.js";
+import {
+  AGENT_JSON_SCHEMA_HINT,
+  balancedJsonPrefix,
+  looksBrokenJson,
+  preferBalancedJson,
+} from "./jsonStream.js";
 
 export type TokenHandler = (p: {
   sessionId: string;
@@ -89,10 +96,11 @@ export class ChatEngine {
     const history = this.store.getMessages(sessionId);
     // Skip orphan tool rows from agent turns — plain chat has no tool_calls protocol.
     const ctx = Math.max(512, params.context || 4096);
-    const maxTokens = Math.max(
-      64,
-      Math.min(params.maxTokens || 1024, Math.floor(ctx * 0.45), 4096),
-    );
+    // Cursor-like: allow long replies — honor settings up to ~70% of the window.
+    const maxTokens = clampCompletionTokens(ctx, params.maxTokens || 0, {
+      min: 64,
+      promptReserveRatio: 0.3,
+    });
     const rawMessages: OpenAiMessage[] = [
       { role: "system", content: systemPrompt },
       ...history.flatMap((m): OpenAiMessage[] => {
@@ -116,146 +124,181 @@ export class ChatEngine {
       triggerMessages: 16,
       summaryTokens: Math.min(400, Math.floor(ctx * 0.05)),
     });
-    const messages: OpenAiMessage[] = fitMessagesToContext(condensed, ctx, maxTokens);
+    const baseMessages: OpenAiMessage[] = fitMessagesToContext(condensed, ctx, maxTokens);
 
     this.abort = new AbortController();
     this.activeSessionId = sessionId;
     const signal = this.abort.signal;
-    let res: Response;
-    try {
-      res = await fetch(`${base}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal,
-        body: JSON.stringify({
-          model: "local",
-          messages,
-          temperature: params.temperature,
-          top_p: params.topP,
-          top_k: params.topK,
-          min_p: params.minP,
-          max_tokens: maxTokens,
-          stream: true,
-          seed: params.seed ?? undefined,
-        }),
-      });
-    } catch (err) {
-      this.abort = null;
-      this.activeSessionId = null;
-      // Re-probe: if server died mid-flight, clear stale "loaded" state via assert.
-      try {
-        await this.runtime.assertLlmReady();
-      } catch (probeErr) {
-        throw formatLlmFetchError(probeErr, base);
-      }
-      throw formatLlmFetchError(err, base);
-    }
-
-    if (!res.ok || !res.body) {
-      const text = await res.text().catch(() => "");
-      this.abort = null;
-      this.activeSessionId = null;
-      if (isContextOverflowError(text) || isContextOverflowError(`Ошибка генерации: ${res.status} ${text}`)) {
-        throw formatLlmFetchError(
-          new Error(`Ошибка генерации: ${res.status} ${text}`),
-          base,
-        );
-      }
-      throw new Error(`Ошибка генерации: ${res.status} ${text}`);
-    }
 
     let content = "";
     let thinking = "";
-    let inThink = false;
     let truncated = false;
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
+    /** Auto-continue when finish_reason=length (Cursor-like long answers). */
+    const maxContinues = 2;
 
-    try {
-      while (true) {
-        if (signal.aborted) break;
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const parts = buffer.split("\n");
-        buffer = parts.pop() || "";
-        for (const line of parts) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("data:")) continue;
-          const data = trimmed.slice(5).trim();
-          if (data === "[DONE]") continue;
-          try {
-            const json = JSON.parse(data) as {
-              choices?: Array<{
-                finish_reason?: string | null;
-                delta?: { content?: string; reasoning_content?: string };
-              }>;
-            };
-            const finish = json.choices?.[0]?.finish_reason;
-            if (finish === "length") truncated = true;
-            const delta = json.choices?.[0]?.delta as
-              | {
-                  content?: string;
-                  reasoning_content?: string;
-                  reasoning?: string;
-                  text?: string;
-                }
-              | undefined;
-            const piece = delta?.content || delta?.text || "";
-            const reason = delta?.reasoning_content || delta?.reasoning || "";
-            if (reason) {
-              thinking += reason;
-              this.onToken?.({ sessionId, text: reason, thinking: true });
-            }
-            if (!piece) continue;
-            // Support <think> / <thinking> tags from some models (LFM, Qwen, etc.)
-            let rest = piece;
-            while (rest.length) {
-              if (!inThink) {
-                const m = rest.match(/<(?:think|thinking)>/i);
-                if (!m || m.index == null) {
-                  content += rest;
-                  this.onToken?.({ sessionId, text: rest });
-                  rest = "";
-                } else {
-                  const before = rest.slice(0, m.index);
-                  if (before) {
-                    content += before;
-                    this.onToken?.({ sessionId, text: before });
-                  }
-                  inThink = true;
-                  rest = rest.slice(m.index + m[0].length);
-                }
-              } else {
-                const m = rest.match(/<\/(?:think|thinking)>/i);
-                if (!m || m.index == null) {
-                  thinking += rest;
-                  this.onToken?.({ sessionId, text: rest, thinking: true });
-                  rest = "";
-                } else {
-                  const chunk = rest.slice(0, m.index);
-                  if (chunk) {
-                    thinking += chunk;
-                    this.onToken?.({ sessionId, text: chunk, thinking: true });
-                  }
-                  inThink = false;
-                  rest = rest.slice(m.index + m[0].length);
-                }
-              }
-            }
-          } catch {
-            // ignore bad chunk
-          }
-        }
+    for (let leg = 0; leg <= maxContinues; leg++) {
+      let messages = baseMessages;
+      if (leg > 0) {
+        if (!content.trim() || signal.aborted) break;
+        messages = fitMessagesToContext(
+          [
+            ...baseMessages,
+            { role: "assistant", content },
+            {
+              role: "user",
+              content:
+                "Continue exactly from where you left off. Do not repeat previous text. Keep the same language and formatting.",
+            },
+          ],
+          ctx,
+          maxTokens,
+        );
       }
-    } catch (err) {
-      if ((err as Error).name === "AbortError" || signal.aborted) {
-        // fall through to cancel path below
-      } else {
+
+      let res: Response;
+      try {
+        res = await fetch(`${base}/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal,
+          body: JSON.stringify({
+            model: "local",
+            messages,
+            temperature: params.temperature,
+            top_p: params.topP,
+            top_k: params.topK,
+            min_p: params.minP,
+            max_tokens: maxTokens,
+            stream: true,
+            seed: params.seed ?? undefined,
+          }),
+        });
+      } catch (err) {
         this.abort = null;
         this.activeSessionId = null;
-        throw err;
+        try {
+          await this.runtime.assertLlmReady();
+        } catch (probeErr) {
+          throw formatLlmFetchError(probeErr, base);
+        }
+        throw formatLlmFetchError(err, base);
+      }
+
+      if (!res.ok || !res.body) {
+        const text = await res.text().catch(() => "");
+        this.abort = null;
+        this.activeSessionId = null;
+        if (
+          isContextOverflowError(text) ||
+          isContextOverflowError(`Ошибка генерации: ${res.status} ${text}`)
+        ) {
+          throw formatLlmFetchError(
+            new Error(`Ошибка генерации: ${res.status} ${text}`),
+            base,
+          );
+        }
+        throw new Error(`Ошибка генерации: ${res.status} ${text}`);
+      }
+
+      let inThink = false;
+      truncated = false;
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let legContent = "";
+
+      try {
+        while (true) {
+          if (signal.aborted) break;
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const parts = buffer.split("\n");
+          buffer = parts.pop() || "";
+          for (const line of parts) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("data:")) continue;
+            const data = trimmed.slice(5).trim();
+            if (data === "[DONE]") continue;
+            try {
+              const json = JSON.parse(data) as {
+                choices?: Array<{
+                  finish_reason?: string | null;
+                  delta?: { content?: string; reasoning_content?: string };
+                }>;
+              };
+              const finish = json.choices?.[0]?.finish_reason;
+              if (finish === "length") truncated = true;
+              const delta = json.choices?.[0]?.delta as
+                | {
+                    content?: string;
+                    reasoning_content?: string;
+                    reasoning?: string;
+                    text?: string;
+                  }
+                | undefined;
+              const piece = delta?.content || delta?.text || "";
+              const reason = delta?.reasoning_content || delta?.reasoning || "";
+              if (reason) {
+                thinking += reason;
+                this.onToken?.({ sessionId, text: reason, thinking: true });
+              }
+              if (!piece) continue;
+              let rest = piece;
+              while (rest.length) {
+                if (!inThink) {
+                  const m = rest.match(/<(?:think|thinking)>/i);
+                  if (!m || m.index == null) {
+                    content += rest;
+                    legContent += rest;
+                    this.onToken?.({ sessionId, text: rest });
+                    rest = "";
+                  } else {
+                    const before = rest.slice(0, m.index);
+                    if (before) {
+                      content += before;
+                      legContent += before;
+                      this.onToken?.({ sessionId, text: before });
+                    }
+                    inThink = true;
+                    rest = rest.slice(m.index + m[0].length);
+                  }
+                } else {
+                  const m = rest.match(/<\/(?:think|thinking)>/i);
+                  if (!m || m.index == null) {
+                    thinking += rest;
+                    this.onToken?.({ sessionId, text: rest, thinking: true });
+                    rest = "";
+                  } else {
+                    const chunk = rest.slice(0, m.index);
+                    if (chunk) {
+                      thinking += chunk;
+                      this.onToken?.({ sessionId, text: chunk, thinking: true });
+                    }
+                    inThink = false;
+                    rest = rest.slice(m.index + m[0].length);
+                  }
+                }
+              }
+            } catch {
+              // ignore bad chunk
+            }
+          }
+        }
+      } catch (err) {
+        if ((err as Error).name === "AbortError" || signal.aborted) {
+          // fall through
+        } else {
+          this.abort = null;
+          this.activeSessionId = null;
+          throw err;
+        }
+      }
+
+      if (signal.aborted) break;
+      if (!truncated || !legContent.trim()) {
+        truncated = false;
+        break;
       }
     }
 
@@ -276,10 +319,10 @@ export class ChatEngine {
     let finalContent = content || "(пусто)";
     if (truncated) {
       finalContent +=
-        "\n\n⚠️ Ответ обрезан по лимиту max tokens. Увеличьте параметр «Макс. токены» в параметрах диалога или попросите продолжить.";
+        "\n\n⚠️ Ответ всё ещё обрезан по лимиту. Увеличьте «Макс. токены» / context или попросите продолжить.";
       this.onToken?.({
         sessionId,
-        text: "\n\n⚠️ Ответ обрезан по лимиту max tokens.",
+        text: "\n\n⚠️ Ответ всё ещё обрезан по лимиту.",
       });
     }
     const assistant = this.store.addMessage(sessionId, {
@@ -310,11 +353,19 @@ export class ChatEngine {
       throw formatLlmFetchError(err, this.runtime.getOpenAiBaseUrl());
     }
 
-    // Keep completion within context headroom — leave ≥512 for prompt packing.
+    // Agent JSON may need a large budget (full file bodies). Cap only by context headroom.
     const ctx = Math.max(512, params.context || 4096);
-    const hardCap = Math.max(1024, Math.min(6144, ctx - 512));
+    const hardCap = clampCompletionTokens(ctx, Number.MAX_SAFE_INTEGER, {
+      min: 1024,
+      promptReserveRatio: 0.25,
+      minPromptReserve: 512,
+    });
     const requested = Math.max(256, params.maxTokens || 1024);
-    let maxTokens = Math.max(256, Math.min(requested, Math.floor(ctx * 0.55), hardCap));
+    let maxTokens = clampCompletionTokens(ctx, requested, {
+      min: 256,
+      promptReserveRatio: 0.25,
+      minPromptReserve: 512,
+    });
 
     const buildBody = (
       packed: OpenAiMessage[],
@@ -368,9 +419,20 @@ export class ChatEngine {
       let content = "";
       let reasoning = "";
       let truncated = false;
+      /** Only emit balanced JSON prefixes to the UI (avoid mid-token broken drafts). */
+      let draftEmitted = 0;
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+
+      const emitBalancedDraft = () => {
+        if (!sessionId) return;
+        const bal = balancedJsonPrefix(content);
+        if (bal.length <= draftEmitted) return;
+        const deltaText = bal.slice(draftEmitted);
+        draftEmitted = bal.length;
+        if (deltaText) this.onToken?.({ sessionId, text: deltaText, draft: true });
+      };
 
       while (true) {
         if (signal.aborted) break;
@@ -405,13 +467,23 @@ export class ChatEngine {
             const piece = delta?.content || delta?.text || "";
             if (!piece) continue;
             content += piece;
-            if (sessionId) {
-              this.onToken?.({ sessionId, text: piece, draft: true });
-            }
+            emitBalancedDraft();
           } catch {
             // ignore bad chunk
           }
         }
+      }
+      // Final flush: if never balanced, show raw tail once so UI is not empty.
+      if (sessionId && draftEmitted === 0 && content.trim()) {
+        this.onToken?.({ sessionId, text: content, draft: true });
+        draftEmitted = content.length;
+      } else if (sessionId && content.length > draftEmitted) {
+        // Prefer balanced; if incomplete, still show remainder after stream ends.
+        this.onToken?.({
+          sessionId,
+          text: content.slice(draftEmitted),
+          draft: true,
+        });
       }
 
       if (signal.aborted) {
@@ -456,29 +528,8 @@ export class ChatEngine {
           }
         }
       }
-      const cleaned = stripThinkTags(content);
-      if (truncated && !cleaned.trim()) {
-        throw new LlmTruncatedError();
-      }
-      // Truncated incomplete JSON — force repair path instead of silent parse fail.
-      if (truncated && cleaned.trim()) {
-        const open = (cleaned.match(/\{/g) || []).length;
-        const close = (cleaned.match(/\}/g) || []).length;
-        const looksBroken =
-          open !== close ||
-          /["']\s*$/.test(cleaned.trim()) ||
-          /,\s*$/.test(cleaned.trim());
-        if (looksBroken) throw new LlmTruncatedError();
-      }
-      // Reject prose-only reasoning mistaken for JSON action.
-      if (
-        !cleaned.trim().startsWith("{") &&
-        !/<tool_call\b/i.test(cleaned) &&
-        cleaned.length > 40
-      ) {
-        // Keep returning — parseAgentAction will fail and repair; but avoid
-        // treating empty JSON-looking stubs as success upstream.
-      }
+      const cleaned = preferBalancedJson(stripThinkTags(content));
+      // Do not throw here — caller boosts max_tokens first, then may throw.
       return { content: cleaned, truncated, mode };
     };
 
@@ -509,16 +560,36 @@ export class ChatEngine {
       });
 
       const runWithMode = async (m: ConstraintMode) => {
-        let result = await attemptOnce(signal, msgs, maxTokens, m);
-        if (result.truncated) {
+        let attemptMsgs = msgs;
+        let result = await attemptOnce(signal, attemptMsgs, maxTokens, m);
+        // Boost before failing — truncated JSON is common on large write_file turns.
+        let boosts = 0;
+        while (
+          result.truncated &&
+          boosts < 2 &&
+          (looksBrokenJson(result.content) || !result.content.trim())
+        ) {
           const boosted = Math.min(
             hardCap,
-            Math.max(maxTokens + 1024, Math.floor(ctx * 0.55)),
+            Math.max(maxTokens + 2048, Math.floor(ctx * 0.65)),
           );
-          if (boosted > maxTokens) {
-            maxTokens = boosted;
-            result = await attemptOnce(signal, msgs, maxTokens, m);
+          if (boosted <= maxTokens) break;
+          maxTokens = boosted;
+          boosts += 1;
+          // One short schema nudge on first boost (helps small GGUF).
+          if (boosts === 1) {
+            attemptMsgs = [
+              ...msgs,
+              { role: "user", content: AGENT_JSON_SCHEMA_HINT },
+            ];
           }
+          result = await attemptOnce(signal, attemptMsgs, maxTokens, m);
+        }
+        if (result.truncated && !result.content.trim()) {
+          throw new LlmTruncatedError();
+        }
+        if (result.truncated && looksBrokenJson(result.content)) {
+          throw new LlmTruncatedError();
         }
         return result;
       };
@@ -528,9 +599,6 @@ export class ChatEngine {
         try {
           const result = await runWithMode(mode);
           markConstraintSuccess(mode);
-          if (result.truncated && !result.content.trim()) {
-            throw new LlmTruncatedError();
-          }
           return result.content;
         } catch (err) {
           if (signal.aborted || (err instanceof Error && err.name === "AbortError")) {

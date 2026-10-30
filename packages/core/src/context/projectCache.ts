@@ -30,6 +30,17 @@ export class ProjectContextCache {
     this.retrieveCache.clear();
   }
 
+  /** Drop entries for one project (after writes / reindex). */
+  invalidateRoot(projectRoot: string): void {
+    const prefix = `${projectRoot}|`;
+    for (const key of [...this.mapCache.keys()]) {
+      if (key.startsWith(prefix)) this.mapCache.delete(key);
+    }
+    for (const key of [...this.retrieveCache.keys()]) {
+      if (key.startsWith(prefix)) this.retrieveCache.delete(key);
+    }
+  }
+
   getMap(projectRoot: string, opts: ProjectMapOptions = {}): ProjectMapResult {
     const key = `${projectRoot}|${opts.maxEntries ?? 400}|${opts.maxDepth ?? 6}`;
     const hit = this.mapCache.get(key);

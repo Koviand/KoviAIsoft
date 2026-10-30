@@ -8,7 +8,12 @@ import {
   assertResolveConfirmation,
   assertSessionExportBundle,
 } from "@kovi/shared";
-import { AppService, setAppDataDir } from "@kovi/core";
+import { AppService, getAppDataDir, setAppDataDir } from "@kovi/core";
+import {
+  isSecureTokenAvailable,
+  loadGithubTokenSecure,
+  saveGithubTokenSecure,
+} from "./secureToken";
 
 let mainWindow: BrowserWindow | null = null;
 let monitorWindow: BrowserWindow | null = null;
@@ -328,10 +333,31 @@ async function shutdown(): Promise<void> {
 
 function registerIpc(svc: AppService): void {
   ipcMain.handle(IPC.getSystemInfo, () => svc.getSystemInfo());
-  ipcMain.handle(IPC.getSettings, () => svc.getSettings());
-  ipcMain.handle(IPC.saveSettings, (_e, settings) =>
-    svc.saveSettings(assertSettingsShape(settings)),
-  );
+  ipcMain.handle(IPC.getSettings, () => {
+    const s = svc.getSettings();
+    const secure = loadGithubTokenSecure(getAppDataDir());
+    if (secure != null && secure !== "") {
+      return { ...s, githubToken: secure };
+    }
+    return s;
+  });
+  ipcMain.handle(IPC.saveSettings, (_e, settings) => {
+    const shaped = assertSettingsShape(settings);
+    const token = typeof shaped.githubToken === "string" ? shaped.githubToken : "";
+    const appData = getAppDataDir();
+    let stored = shaped;
+    if (isSecureTokenAvailable() && saveGithubTokenSecure(appData, token)) {
+      // Keep settings.json free of plaintext token when OS encryption works.
+      stored = { ...shaped, githubToken: token ? "__secure__" : "" };
+      svc.setGithubTokenOverride(token || null);
+    } else {
+      svc.setGithubTokenOverride(null);
+    }
+    return svc.saveSettings(stored).then((saved) => ({
+      ...saved,
+      githubToken: token,
+    }));
+  });
   ipcMain.handle(IPC.getRuntimeStatus, () => svc.getRuntimeStatus());
   ipcMain.handle(IPC.detectRuntimeAsset, (_e, backend) => svc.detectRuntimeAsset(backend));
   ipcMain.handle(IPC.installRuntime, (_e, backend) => svc.installRuntime(backend));
@@ -446,6 +472,7 @@ function registerIpc(svc: AppService): void {
   ipcMain.handle(IPC.checkMcpHealth, (_e, server) => svc.checkMcpHealth(assertMcpServer(server)));
   ipcMain.handle(IPC.verifyGguf, (_e, modelId: string) => svc.verifyGguf(modelId));
   ipcMain.handle(IPC.getCodebaseIndexStatus, () => svc.getCodebaseIndexStatus());
+  ipcMain.handle(IPC.listProjectMentions, () => svc.listProjectMentions());
   ipcMain.handle(IPC.reindexCodebase, () => svc.reindexCodebase());
   ipcMain.handle(IPC.listEmbeddingModels, () => svc.listEmbeddingModels());
   ipcMain.handle(IPC.getEmbeddingStatus, () => svc.getEmbeddingStatus());
@@ -482,6 +509,8 @@ if (!gotLock) {
     configurePortablePaths();
     service = new AppService();
     await service.init();
+    const secured = loadGithubTokenSecure(getAppDataDir());
+    if (secured) service.setGithubTokenOverride(secured);
     registerIpc(service);
     await createWindow();
 

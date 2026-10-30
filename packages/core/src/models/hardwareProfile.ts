@@ -2,11 +2,14 @@ import type {
   GenerationParams,
   HardwareLoadSuggestion,
   LoadProfile,
+  RuntimeBackend,
   SystemInfo,
 } from "@kovi/shared";
 import { AUTO_PC_PROFILE_ID, DEFAULT_GENERATION_PARAMS } from "@kovi/shared";
+import { suggestedMaxTokens } from "../chat/completionBudget.js";
+import { pickGpuNameForVram, pickMaxVram } from "../system/detect.js";
 
-export { AUTO_PC_PROFILE_ID };
+export { AUTO_PC_PROFILE_ID, pickMaxVram };
 export type { HardwareLoadSuggestion };
 
 /** UX load tiers: speed vs quality tradeoff on top of hardware base. */
@@ -14,19 +17,22 @@ export type LoadTier = "fast" | "balanced" | "quality";
 
 export const LOAD_TIER_IDS = ["fast", "balanced", "quality"] as const;
 
-function pickVram(sys: SystemInfo): number | null {
-  const vals = sys.gpus
-    .map((g) => g.vramGb)
-    .filter((x): x is number => typeof x === "number" && x > 0);
-  if (!vals.length) return null;
-  return Math.max(...vals);
-}
-
-function pickGpuName(sys: SystemInfo, vramGb: number | null): string | null {
-  if (vramGb == null) return sys.gpus[0]?.name || null;
-  const match = sys.gpus.find((g) => g.vramGb === vramGb);
-  return match?.name || sys.gpus[0]?.name || null;
-}
+/** Single source of truth for ngl/ctx/maxTokens from PC (+ optional model size). */
+export type LoadPlan = {
+  gpuLayers: number;
+  context: number;
+  flashAttn: boolean;
+  maxTokens: number;
+  agentMaxSteps: number;
+  temperature: number;
+  vramGb: number | null;
+  ramGb: number;
+  backend: RuntimeBackend;
+  gpuName: string | null;
+  rationale: string;
+  /** Whether model+KV fits in ~90% VRAM (undefined if no model size / no VRAM). */
+  fitsInVram?: boolean;
+};
 
 function applyTier(
   tier: LoadTier,
@@ -45,12 +51,11 @@ function applyTier(
 
   if (tier === "fast") {
     const context = Math.max(2048, Math.floor(base.context * 0.5));
-    const maxTokens = Math.max(512, Math.min(2048, Math.floor(context * 0.25)));
     return {
       gpuLayers: base.gpuLayers,
       context,
       flashAttn: base.flashAttn || (vramGb != null && vramGb >= 6 && backend === "cuda"),
-      maxTokens,
+      maxTokens: suggestedMaxTokens(context, "fast"),
       agentMaxSteps: Math.max(12, Math.floor(base.agentMaxSteps * 0.75)),
       temperature: Math.min(base.temperature, 0.6),
     };
@@ -64,31 +69,30 @@ function applyTier(
   if (vramGb != null && vramGb < 6) {
     context = Math.min(context, 4096);
   }
-  const maxTokens = Math.max(1024, Math.min(4096, Math.floor(context * 0.35)));
   return {
     gpuLayers: base.gpuLayers,
     context,
     flashAttn:
       base.flashAttn ||
       (vramGb != null && vramGb >= 8 && (backend === "cuda" || backend === "vulkan")),
-    maxTokens,
+    maxTokens: suggestedMaxTokens(context, "quality"),
     agentMaxSteps: Math.min(56, Math.floor(base.agentMaxSteps * 1.15)),
     temperature: Math.max(base.temperature, 0.7),
   };
 }
 
 /**
- * Suggest llama-server load settings from detected PC hardware.
- * Optional modelSizeGb tightens ngl/ctx; tier adjusts speed vs quality.
+ * Unified load estimate — used by hardware profiles, scanner badges, and loadModel.
+ * VRAM buckets: none→CPU/4k; <6→partial/4k; <10→99/8k; <16→99/8k; ≥16→99/16k.
  */
-export function suggestHardwareLoadProfile(
+export function estimateLoadPlan(
   sys: SystemInfo,
   opts?: { modelSizeGb?: number; tier?: LoadTier },
-): HardwareLoadSuggestion {
-  const vramGb = pickVram(sys);
+): LoadPlan {
+  const vramGb = pickMaxVram(sys);
   const ramGb = sys.totalRamGb || 16;
   const backend = sys.recommendedBackend;
-  const gpuName = pickGpuName(sys, vramGb);
+  const gpuName = pickGpuNameForVram(sys.gpus, vramGb);
   const modelSizeGb =
     typeof opts?.modelSizeGb === "number" && opts.modelSizeGb > 0 ? opts.modelSizeGb : null;
   const tier: LoadTier = opts?.tier || "balanced";
@@ -97,6 +101,7 @@ export function suggestHardwareLoadProfile(
   let context: number;
   let flashAttn: boolean;
   let rationale: string;
+  let fitsInVram: boolean | undefined;
 
   if (vramGb == null || vramGb <= 0) {
     gpuLayers = 0;
@@ -128,7 +133,8 @@ export function suggestHardwareLoadProfile(
   if (modelSizeGb != null && vramGb != null && vramGb > 0) {
     const kv = context * 0.00025;
     const need = modelSizeGb + kv;
-    if (need >= vramGb * 0.9) {
+    fitsInVram = need < vramGb * 0.9;
+    if (!fitsInVram) {
       const ratio = vramGb / need;
       gpuLayers = Math.max(0, Math.floor(ratio * 99));
       if (context > 4096 && need > vramGb * 0.75) {
@@ -138,13 +144,14 @@ export function suggestHardwareLoadProfile(
       rationale += ` Учтена модель ≈${modelSizeGb.toFixed(1)} GB → ngl ${gpuLayers}, ctx ${context}.`;
     }
   } else if (modelSizeGb != null && (vramGb == null || vramGb <= 0)) {
+    fitsInVram = false;
     if (modelSizeGb > ramGb * 0.4) {
       context = 4096;
       rationale += ` Модель ≈${modelSizeGb.toFixed(1)} GB велика для RAM — ctx ${context}.`;
     }
   }
 
-  let maxTokens = Math.max(512, Math.min(4096, Math.floor(context * 0.3)));
+  let maxTokens = suggestedMaxTokens(context, "balanced");
   let agentMaxSteps = 24;
   if (vramGb != null && vramGb >= 16 && ramGb >= 32) agentMaxSteps = 48;
   else if (vramGb != null && vramGb >= 10) agentMaxSteps = 40;
@@ -158,19 +165,46 @@ export function suggestHardwareLoadProfile(
     vramGb,
     backend,
   );
-  gpuLayers = tuned.gpuLayers;
-  context = tuned.context;
-  flashAttn = tuned.flashAttn;
-  maxTokens = tuned.maxTokens;
-  agentMaxSteps = tuned.agentMaxSteps;
-  temperature = tuned.temperature;
+
+  // Re-check fit after tier may change context (KV grows).
+  if (modelSizeGb != null && vramGb != null && vramGb > 0) {
+    const kv = tuned.context * 0.00025;
+    fitsInVram = modelSizeGb + kv < vramGb * 0.9;
+  }
 
   const tierLabel =
     tier === "fast" ? "Быстро" : tier === "quality" ? "Качество" : "Баланс";
   if (tier !== "balanced") {
-    rationale += ` Уровень «${tierLabel}»: ctx ${context}, maxTokens ${maxTokens}.`;
+    rationale += ` Уровень «${tierLabel}»: ctx ${tuned.context}, maxTokens ${tuned.maxTokens}.`;
   }
+  rationale += ` Чат: ctx ${tuned.context}, maxTokens ${tuned.maxTokens}, ngl ${tuned.gpuLayers}; агент до ${tuned.agentMaxSteps} шагов.`;
 
+  return {
+    gpuLayers: tuned.gpuLayers,
+    context: tuned.context,
+    flashAttn: tuned.flashAttn,
+    maxTokens: tuned.maxTokens,
+    agentMaxSteps: tuned.agentMaxSteps,
+    temperature: tuned.temperature,
+    vramGb,
+    ramGb,
+    backend,
+    gpuName,
+    rationale,
+    fitsInVram,
+  };
+}
+
+/**
+ * Suggest llama-server load settings from detected PC hardware.
+ * Optional modelSizeGb tightens ngl/ctx; tier adjusts speed vs quality.
+ */
+export function suggestHardwareLoadProfile(
+  sys: SystemInfo,
+  opts?: { modelSizeGb?: number; tier?: LoadTier },
+): HardwareLoadSuggestion {
+  const plan = estimateLoadPlan(sys, opts);
+  const tier: LoadTier = opts?.tier || "balanced";
   const profileId = tier === "balanced" && !opts?.tier ? AUTO_PC_PROFILE_ID : tier;
   const profileName =
     tier === "fast"
@@ -184,36 +218,34 @@ export function suggestHardwareLoadProfile(
   const profile: LoadProfile = {
     id: profileId === AUTO_PC_PROFILE_ID ? AUTO_PC_PROFILE_ID : tier,
     name: profileName,
-    gpuLayers,
-    context,
-    flashAttn,
-    maxTokens,
+    gpuLayers: plan.gpuLayers,
+    context: plan.context,
+    flashAttn: plan.flashAttn,
+    maxTokens: plan.maxTokens,
     hardwareAware: true,
   };
 
   const defaultParams: GenerationParams = {
     ...DEFAULT_GENERATION_PARAMS,
-    context,
-    gpuLayers,
-    maxTokens,
-    flashAttn,
-    temperature,
+    context: plan.context,
+    gpuLayers: plan.gpuLayers,
+    maxTokens: plan.maxTokens,
+    flashAttn: plan.flashAttn,
+    temperature: plan.temperature,
     topP: 0.95,
     topK: tier === "fast" ? 30 : 40,
-    minP: tier === "quality" ? 0.05 : 0.05,
+    minP: 0.05,
   };
-
-  rationale += ` Чат: ctx ${context}, maxTokens ${maxTokens}, ngl ${gpuLayers}; агент до ${agentMaxSteps} шагов.`;
 
   return {
     profile,
-    rationale,
-    backend,
-    vramGb,
-    ramGb,
-    gpuName,
+    rationale: plan.rationale,
+    backend: plan.backend,
+    vramGb: plan.vramGb,
+    ramGb: plan.ramGb,
+    gpuName: plan.gpuName,
     defaultParams,
-    agentMaxSteps,
+    agentMaxSteps: plan.agentMaxSteps,
   };
 }
 
@@ -235,6 +267,11 @@ export function buildHardwareTierProfiles(
 
 export function isAutoPcProfile(profileId: string | null | undefined): boolean {
   return profileId === AUTO_PC_PROFILE_ID;
+}
+
+export function tierFromProfileId(profileId: string | null | undefined): LoadTier {
+  if (profileId === "fast" || profileId === "quality") return profileId;
+  return "balanced";
 }
 
 /** Sync defaultParams load fields from an active LoadProfile. */

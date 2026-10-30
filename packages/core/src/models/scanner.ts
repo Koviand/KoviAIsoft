@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { LocalModel, ModelPerfTier, SystemInfo } from "@kovi/shared";
 import { createHash } from "node:crypto";
+import { estimateLoadPlan } from "./hardwareProfile.js";
 import { withIntegrity } from "./integrity.js";
 
 const QUANT_RE =
@@ -31,34 +32,20 @@ function findMmproj(dir: string, baseName: string): string | undefined {
   return path.join(dir, related || mmprojs[0]);
 }
 
-function pickMaxVram(sys?: SystemInfo): number | undefined {
-  const vals = (sys?.gpus || [])
-    .map((g) => g.vramGb)
-    .filter((x): x is number => typeof x === "number" && x > 0);
-  if (!vals.length) return undefined;
-  return Math.max(...vals);
-}
-
 function estimateFit(
   sizeBytes: number,
   sys?: SystemInfo,
 ): { recommendedNgl: number; recommendedContext: number; fitsInVram?: boolean } {
   const sizeGb = sizeBytes / 1024 ** 3;
-  const vram = pickMaxVram(sys);
-  let recommendedContext = 8192;
-  if (vram != null && vram < 8) recommendedContext = 4096;
-  if (vram != null && vram >= 16) recommendedContext = 16384;
-
-  if (vram == null) {
-    return { recommendedNgl: 0, recommendedContext, fitsInVram: undefined };
+  if (!sys) {
+    return { recommendedNgl: 0, recommendedContext: 8192, fitsInVram: undefined };
   }
-  // rough KV overhead ~ context * 0.0002 GB for mid models
-  const kv = recommendedContext * 0.00025;
-  const fits = sizeGb + kv < vram * 0.9;
+  // Same calculator as «Под этот ПК» / loadModel (balanced tier).
+  const plan = estimateLoadPlan(sys, { modelSizeGb: sizeGb, tier: "balanced" });
   return {
-    recommendedNgl: fits ? 99 : Math.max(0, Math.floor((vram / (sizeGb + kv)) * 99)),
-    recommendedContext,
-    fitsInVram: fits,
+    recommendedNgl: plan.gpuLayers,
+    recommendedContext: plan.context,
+    fitsInVram: plan.fitsInVram,
   };
 }
 

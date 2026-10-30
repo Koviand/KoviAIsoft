@@ -5,7 +5,7 @@ import { api } from "../api";
 const NAV: Array<{ id: AppView; label: string }> = [
   { id: "chat", label: "Чат" },
   { id: "models", label: "Модели" },
-  { id: "runtime", label: "Runtime" },
+  { id: "runtime", label: "Движок" },
   { id: "mcp", label: "MCP" },
   { id: "settings", label: "Настройки" },
 ];

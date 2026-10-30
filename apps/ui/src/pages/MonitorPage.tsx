@@ -47,14 +47,16 @@ export function MonitorPage() {
       }
     };
     void pull();
+    // Prefer main-process push (1.5s) — avoid a second polling loop in the UI.
     const off = bridge.onMonitorUpdate((p) => {
-      if (alive) setSnap(p);
+      if (alive) {
+        setSnap(p);
+        setLoadError(null);
+      }
     });
-    const t = window.setInterval(() => void pull(), 1500);
     return () => {
       alive = false;
       off();
-      window.clearInterval(t);
     };
   }, []);
 
@@ -181,7 +183,7 @@ export function MonitorPage() {
 
       {snap?.updateAvailable && (
         <div className="monitor-banner">
-          Доступен runtime {snap.latestTag} (сейчас {snap.runtimeTag || "—"}). Откройте «Runtime» →
+          Доступен runtime {snap.latestTag} (сейчас {snap.runtimeTag || "—"}). Откройте «Движок» →
           «Установить сейчас».
         </div>
       )}

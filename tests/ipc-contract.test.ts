@@ -21,6 +21,14 @@ const root = path.resolve(__dirname, "..");
 const preloadSrc = fs.readFileSync(path.join(root, "apps/desktop/src/preload.ts"), "utf8");
 const mainSrc = fs.readFileSync(path.join(root, "apps/desktop/src/main.ts"), "utf8");
 
+/** Desktop-only (dialogs / windows) — not AppService methods. */
+const DESKTOP_ONLY = new Set([
+  "pickDirectory",
+  "pickFile",
+  "openMonitorWindow",
+  "setMonitorAlwaysOnTop",
+]);
+
 describe("IPC contract", () => {
   it("every invoke channel is registered in main and exposed in preload", () => {
     for (const [key, channel] of Object.entries(IPC)) {
@@ -31,6 +39,25 @@ describe("IPC contract", () => {
       expect(mainSrc, `main missing handler for ${key}`).toContain(`IPC.${key}`);
       expect(preloadSrc, `preload missing ${key}`).toContain(key);
       expect(preloadSrc).toContain(channel.includes("kovi:") ? `IPC.${key}` : key);
+    }
+  });
+
+  it("IPC catalog lists all expected public channels", () => {
+    const keys = Object.keys(IPC);
+    expect(keys.length).toBeGreaterThanOrEqual(50);
+    for (const required of [
+      "sendMessage",
+      "startAgent",
+      "loadModel",
+      "setEmbeddingModel",
+      "reindexCodebase",
+      "applyHardwareLoadSettings",
+      "checkMcpHealth",
+    ]) {
+      expect(keys).toContain(required);
+    }
+    for (const k of DESKTOP_ONLY) {
+      expect(keys).toContain(k);
     }
   });
 

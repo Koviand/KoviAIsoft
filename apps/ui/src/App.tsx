@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, isElectronBridge } from "./api";
+import { AgentChangesPanel } from "./components/AgentChangesPanel";
 import { Topbar } from "./components/Topbar";
 import { useAppState } from "./hooks/useAppState";
 import { riskRu } from "./lib/labels";
@@ -130,6 +131,17 @@ export function App() {
             </div>
           </div>
         )}
+        {state.agentChanges.length > 0 && (
+          <AgentChangesPanel
+            items={state.agentChanges}
+            confirmBusy={state.confirmBusy}
+            selectedId={state.selectedChangeId}
+            onSelect={state.setSelectedChangeId}
+            onDismiss={state.clearAgentChanges}
+            onAccept={(item) => void state.resolveChangeItem(item, true)}
+            onReject={(item) => void state.resolveChangeItem(item, false)}
+          />
+        )}
         {state.pendingConfirm && (
           <div
             className="confirm-banner"
@@ -186,6 +198,7 @@ export function App() {
             messages={state.messages}
             busy={state.generating || Boolean(state.pendingConfirm)}
             settings={state.settings}
+            runtime={state.runtime}
             pendingConfirmSummary={state.pendingConfirm?.summary ?? null}
             setSessions={state.setSessions}
             setActiveSessionId={state.setActiveSessionId}
@@ -193,6 +206,7 @@ export function App() {
             setBusy={state.setGenerating}
             setError={state.setError}
             setSettings={state.setSettings}
+            onOpenModels={() => state.setView("models")}
           />
         </div>
         {state.view === "models" && (
@@ -200,6 +214,7 @@ export function App() {
             models={state.models}
             loadedModelId={state.runtime?.loadedModelId ?? null}
             settings={state.settings}
+            activeSessionId={state.activeSessionId}
             setModels={state.setModels}
             setSettings={state.setSettings}
             setError={state.setError}
@@ -210,6 +225,8 @@ export function App() {
           <RuntimePage
             system={state.system}
             runtime={state.runtime}
+            settings={state.settings}
+            setSettings={state.setSettings}
             setError={state.setError}
             refresh={state.refresh}
           />
@@ -228,6 +245,7 @@ export function App() {
             setError={state.setError}
             models={state.models}
             loadedModelId={state.runtime?.loadedModelId ?? null}
+            activeSessionId={state.activeSessionId}
           />
         )}
       </main>

@@ -11,6 +11,7 @@ import type {
   ThemePreset,
 } from "@kovi/shared";
 import { api } from "../api";
+import type { AgentChangeItem } from "../components/AgentChangesPanel";
 
 function normalizeView(view: string): AppView {
   if (view === "agent") return "chat";
@@ -46,6 +47,8 @@ export function useAppState() {
     risk: string;
     diff?: string;
   } | null>(null);
+  const [agentChanges, setAgentChanges] = useState<AgentChangeItem[]>([]);
+  const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [booting, setBooting] = useState(true);
   const activeSessionRef = useRef<string | null>(null);
@@ -105,6 +108,8 @@ export function useAppState() {
       const ev = p.event;
       if (ev.type === "started") {
         setGenerating(true);
+        setAgentChanges([]);
+        setSelectedChangeId(null);
         void api
           .getStatusBar()
           .then((bar) => setStatus({ ...bar, view: viewRef.current }))
@@ -118,10 +123,45 @@ export function useAppState() {
           risk: ev.confirmation.risk,
           diff: ev.confirmation.diff,
         });
+        const pathGuess =
+          typeof ev.confirmation.args.path === "string"
+            ? ev.confirmation.args.path
+            : ev.confirmation.toolName;
+        const change: AgentChangeItem = {
+          id: ev.confirmation.id,
+          path: pathGuess,
+          summary: ev.confirmation.summary,
+          diff: ev.confirmation.diff,
+          confirmationId: ev.confirmation.id,
+          status: "pending",
+        };
+        setAgentChanges((cur) => {
+          const without = cur.filter((c) => c.confirmationId !== change.confirmationId);
+          return [...without, change];
+        });
+        setSelectedChangeId(change.id);
         setConfirmBusy(false);
         setActiveSessionId(p.sessionId);
         setViewRaw("chat");
         setGenerating(true);
+      }
+      if (ev.type === "tool_call" && (ev.name === "write_file" || ev.name === "apply_patch")) {
+        const pathGuess = typeof ev.args.path === "string" ? ev.args.path : ev.name;
+        setAgentChanges((cur) => {
+          if (cur.some((c) => c.path === pathGuess && c.status === "pending")) return cur;
+          if (cur.some((c) => c.path === pathGuess && c.status === "applied")) {
+            return cur.map((c) =>
+              c.path === pathGuess ? { ...c, summary: `${ev.name}…`, status: "applied" } : c,
+            );
+          }
+          const item: AgentChangeItem = {
+            id: ev.callId,
+            path: pathGuess,
+            summary: ev.name,
+            status: "applied",
+          };
+          return [...cur.filter((c) => c.path !== pathGuess), item];
+        });
       }
       if (ev.type === "confirmation_timeout") {
         setPendingConfirm((cur) => (cur?.id === ev.confirmationId ? null : cur));
@@ -165,6 +205,13 @@ export function useAppState() {
           approved,
           rememberForSession: remember,
         });
+        setAgentChanges((cur) =>
+          cur.map((c) =>
+            c.confirmationId === pendingConfirm.id
+              ? { ...c, status: approved ? "accepted" : "rejected" }
+              : c,
+          ),
+        );
         setPendingConfirm(null);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -173,6 +220,31 @@ export function useAppState() {
       }
     },
     [pendingConfirm, confirmBusy],
+  );
+
+  const resolveChangeItem = useCallback(
+    async (item: AgentChangeItem, approved: boolean) => {
+      if (!item.confirmationId || confirmBusy) return;
+      setConfirmBusy(true);
+      try {
+        await api.resolveConfirmation({
+          confirmationId: item.confirmationId,
+          approved,
+          rememberForSession: false,
+        });
+        setAgentChanges((cur) =>
+          cur.map((c) =>
+            c.id === item.id ? { ...c, status: approved ? "accepted" : "rejected" } : c,
+          ),
+        );
+        setPendingConfirm((cur) => (cur?.id === item.confirmationId ? null : cur));
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setConfirmBusy(false);
+      }
+    },
+    [confirmBusy],
   );
 
   useEffect(() => {
@@ -233,8 +305,16 @@ export function useAppState() {
     busy: generating,
     setBusy: setGenerating,
     pendingConfirm,
+    agentChanges,
+    selectedChangeId,
+    setSelectedChangeId,
+    clearAgentChanges: () => {
+      setAgentChanges([]);
+      setSelectedChangeId(null);
+    },
     confirmBusy,
     resolvePendingConfirm,
+    resolveChangeItem,
     error,
     setError,
     booting,

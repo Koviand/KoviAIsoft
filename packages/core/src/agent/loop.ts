@@ -28,6 +28,7 @@ import {
   shouldConfirmRisk,
 } from "../tools/sandbox.js";
 import { webSearch } from "../tools/websearch.js";
+import { clampCompletionTokens } from "../chat/completionBudget.js";
 import {
   estimateMessagesTokens,
   fitMessagesToContext,
@@ -62,6 +63,16 @@ import {
   validateToolArgs,
 } from "./parseAction.js";
 import { toolsPromptBlock } from "./toolsCatalog.js";
+import {
+  AGENT_IDENTICAL_TOOL_MAX,
+  AGENT_NON_ADVANCING_MAX,
+  AGENT_REPAIR_MAX,
+  AGENT_TRUNCATION_MAX,
+  clampAgentMaxSteps,
+  inFinishWindow,
+  synthesizeBudgetExhaustedAnswer,
+  toolFingerprint,
+} from "./finishPolicy.js";
 import {
   applyWorkingMemoryToSystem,
   createWorkingMemory,
@@ -528,8 +539,8 @@ export class AgentLoop {
         const root = settings.projectRoot;
         if (!root) return;
         try {
-          // Invalidate after writes so next retrieve sees new files.
-          if (/write/i.test(reason)) projectContextCache.clear();
+          // Invalidate after file mutations so next retrieve sees new files.
+          if (/write|patch|mutat/i.test(reason)) projectContextCache.clear();
           const snippets = await projectContextCache.getRetrieved(
             root,
             workingMemory.goal || userContent,
@@ -567,12 +578,18 @@ export class AgentLoop {
 
       let lastPhaseKind: "plan" | "exec" | null = null;
       let repairAttempts = 0;
+      let truncationStreak = 0;
+      let identicalToolStreak = 0;
+      let lastToolFp: string | null = null;
+      let nonAdvancingStreak = 0;
+      const maxSteps = clampAgentMaxSteps(settings.agentMaxSteps);
 
-      for (let i = 0; i < settings.agentMaxSteps; i++) {
+      for (let i = 0; i < maxSteps; i++) {
         if (this.cancelled) {
           this.emit(sessionId, { type: "cancelled" });
           return;
         }
+        const finishOnly = inFinishWindow(i, maxSteps);
         const planFrozen = Boolean(workingMemory.planFrozen) && steps.length > 0;
         const curPlan = currentPlanStep(steps);
         // Match plan step ids ("1","2",…) so ChatPage checklist updates.
@@ -580,10 +597,19 @@ export class AgentLoop {
         this.emit(sessionId, { type: "step_start", stepId });
         this.emit(sessionId, {
           type: "thinking",
-          text: planFrozen
-            ? `Шаг ${i + 1}/${settings.agentMaxSteps}: исполнение плана…`
-            : `Шаг ${i + 1}/${settings.agentMaxSteps}: составление плана…`,
+          text: finishOnly
+            ? `Шаг ${i + 1}/${maxSteps}: финальный ответ…`
+            : planFrozen
+              ? `Шаг ${i + 1}/${maxSteps}: исполнение плана…`
+              : `Шаг ${i + 1}/${maxSteps}: составление плана…`,
         });
+        if (finishOnly && planFrozen) {
+          transcript.push({
+            role: "user",
+            content:
+              "Лимит шагов почти исчерпан. ЗАПРЕЩЕНЫ новые tool. Верни JSON с final (краткий итог по сделанному) или tool finish. Если файлы не созданы — честно скажи об этом в final.",
+          });
+        }
 
         // Inject phase instruction once per phase (not every tool turn).
         syncSystem();
@@ -599,22 +625,18 @@ export class AgentLoop {
         let raw: string;
         try {
           // Coding writes need a large completion budget (JSON + full file content).
-          // Plan-only phase can use a smaller budget.
+          // Plan-only phase stays smaller; exec with files can use most of the window.
           const ctx = params.context || 8192;
-          const hardCap = Math.max(
-            1024,
-            Math.min(planFrozen ? 6144 : 2048, ctx - 512),
-          );
           const want = !planFrozen
-            ? 1024
+            ? Math.max(params.maxTokens || 0, 1536)
             : wantsFiles
-              ? Math.max(params.maxTokens || 0, 4096)
-              : Math.max(params.maxTokens || 0, 2048);
-          const maxTokens = Math.min(
-            want,
-            Math.max(512, Math.floor(ctx * (!planFrozen ? 0.2 : wantsFiles ? 0.5 : 0.4))),
-            hardCap,
-          );
+              ? Math.max(params.maxTokens || 0, 8192)
+              : Math.max(params.maxTokens || 0, 4096);
+          const maxTokens = clampCompletionTokens(ctx, want, {
+            min: planFrozen ? 1024 : 512,
+            promptReserveRatio: !planFrozen ? 0.45 : wantsFiles ? 0.25 : 0.35,
+            minPromptReserve: 512,
+          });
           const loadedId = this.chat.getRuntime().getStatus().loadedModelId || "";
           const family = detectModelFamily(loadedId);
           const tuning = agentTuningForFamily(family);
@@ -648,25 +670,44 @@ export class AgentLoop {
           const usedTok = estimateMessagesTokens(packed);
           this.emit(sessionId, {
             type: "thinking",
-            text: `Шаг ${i + 1}/${settings.agentMaxSteps}: контекст ~${usedTok}/${ctx} tok · жду модель…`,
+            text: `Шаг ${i + 1}/${maxSteps}: контекст ~${usedTok}/${ctx} tok · жду модель…`,
           });
           try {
             raw = await this.chat.completeJson(packed, callParams, sessionId, {
               extraToolNames,
             });
+            truncationStreak = 0;
           } catch (err) {
             if (this.cancelled) throw err;
             if (isLlmTruncatedError(err)) {
+              truncationStreak += 1;
               this.emit(sessionId, {
                 type: "thinking",
-                text: `Ответ обрезан по max_tokens — прошу модель разбить код на несколько write_file`,
+                text: `Ответ обрезан по max_tokens (${truncationStreak}/${AGENT_TRUNCATION_MAX})`,
+              });
+              if (truncationStreak >= AGENT_TRUNCATION_MAX || finishOnly) {
+                this.emit(sessionId, {
+                  type: "step_done",
+                  stepId,
+                  detail: "truncation → final",
+                });
+                transcript.push({
+                  role: "user",
+                  content:
+                    "Слишком много обрезок. Больше не пиши крупные write_file. Верни JSON с final: краткий итог и что осталось сделать.",
+                });
+                continue;
+              }
+              this.emit(sessionId, {
+                type: "step_done",
+                stepId,
+                detail: "truncated",
               });
               transcript.push({
                 role: "user",
                 content:
-                  "Предыдущий ответ обрезан (finish_reason=length). НЕ пытайся уместить всю игру в один write_file. " +
-                  "Сделай несколько коротких шагов: сначала минимальный запускаемый файл (~80–150 строк), " +
-                  "затем отдельные write_file для модулей (pieces, board, ui). thought короткий. Верни один tool JSON.",
+                  "Предыдущий ответ обрезан (finish_reason=length). НЕ пытайся уместить всё в один write_file. " +
+                  "Короткий thought + один небольшой write_file. Верни один tool JSON.",
               });
               continue;
             }
@@ -690,6 +731,7 @@ export class AgentLoop {
             raw = await this.chat.completeJson(packed, callParams, sessionId, {
               extraToolNames,
             });
+            truncationStreak = 0;
           }
         } catch (err) {
           if (this.cancelled || (err instanceof Error && /отмен/i.test(err.message))) {
@@ -697,14 +739,22 @@ export class AgentLoop {
             return;
           }
           if (isLlmTruncatedError(err)) {
+            truncationStreak += 1;
             this.emit(sessionId, {
               type: "thinking",
-              text: `Обрезка ответа — продолжаю со следующим шагом (меньше кода за раз)`,
+              text: `Обрезка ответа (${truncationStreak}/${AGENT_TRUNCATION_MAX})`,
+            });
+            this.emit(sessionId, {
+              type: "step_done",
+              stepId,
+              detail: truncationStreak >= AGENT_TRUNCATION_MAX ? "truncation cap" : "truncated",
             });
             transcript.push({
               role: "user",
               content:
-                "Ответ снова обрезан. Пиши МЕНЬШЕ за шаг: один небольшой write_file (один модуль). Без длинного thought.",
+                truncationStreak >= AGENT_TRUNCATION_MAX || finishOnly
+                  ? "Обрезки исчерпали лимит. Верни JSON с final — итог без новых крупных файлов."
+                  : "Ответ снова обрезан. Пиши МЕНЬШЕ за шаг: один небольшой write_file. Без длинного thought.",
             });
             continue;
           }
@@ -715,7 +765,10 @@ export class AgentLoop {
           return;
         }
 
-        const parsed = parseAgentAction(raw, planFrozen ? "execute" : "plan");
+        const parsed = parseAgentAction(
+          raw,
+          finishOnly ? "execute" : planFrozen ? "execute" : "plan",
+        );
         if (!parsed) {
           repairAttempts += 1;
           const looksTruncated =
@@ -726,6 +779,20 @@ export class AgentLoop {
           transcript.push({ role: "assistant", content: raw.slice(0, 4000) });
           const loadedId = this.chat.getRuntime().getStatus().loadedModelId || "";
           const familyNudge = agentTuningForFamily(detectModelFamily(loadedId)).jsonNudge;
+          if (repairAttempts >= AGENT_REPAIR_MAX || finishOnly) {
+            this.emit(sessionId, {
+              type: "step_done",
+              stepId,
+              detail: "repair cap → final",
+            });
+            transcript.push({
+              role: "user",
+              content:
+                "Не удалось получить валидный JSON. Верни ТОЛЬКО: " +
+                `{"thought":"итог","tool":null,"final":"${workingMemory.goal.slice(0, 80) || "Готово"} — прогресс сохранён, нужен следующий запуск."}`,
+            });
+            continue;
+          }
           const repair =
             repairAttempts <= 2
               ? looksTruncated
@@ -734,10 +801,12 @@ export class AgentLoop {
               : looksTruncated
                 ? "Снова обрезка. Ещё короче: thought 1 фраза, один tool, без final."
                 : `Снова не JSON. ${familyNudge}`;
+          this.emit(sessionId, { type: "step_done", stepId, detail: "repair" });
           transcript.push({ role: "user", content: repair });
           continue;
         }
         repairAttempts = 0;
+        truncationStreak = 0;
 
         if (parsed.thought) {
           this.emit(sessionId, { type: "thinking", text: parsed.thought });
@@ -814,27 +883,33 @@ export class AgentLoop {
         }
 
         if (parsed.final && !parsed.tool) {
-          // Coding: list_dir/read alone must not unlock final (seen in Tetris sessions).
-          const noFileYet = wantsFiles && filesWritten === 0;
+          // Coding: list_dir/read alone must not unlock final — except finish window / last steps.
+          const noFileYet = wantsFiles && filesWritten === 0 && !finishOnly;
           const stubOnly =
             wantsFiles &&
             filesWritten > 0 &&
             !substantialWrite &&
-            stubNudgeCount < 2;
+            stubNudgeCount < 2 &&
+            !finishOnly;
           const pendingLeft = steps.some((s) => s.status === "pending");
           const current = currentPlanStep(steps);
           const currentIsFinalish =
             current &&
             /итог|final|finish|отчет|отчёт|резюме/i.test(current.title);
-          // Keep forcing writes even on the last step when no files exist yet.
           const mustWork =
             noFileYet ||
-            (i < settings.agentMaxSteps - 1 &&
+            (!finishOnly &&
+              i < maxSteps - 1 &&
               (stubOnly ||
                 (!wantsFiles && toolsUsed === 0 && steps.length > 0) ||
                 (pendingLeft && !currentIsFinalish && toolsUsed === 0)));
           if (mustWork) {
             if (stubOnly) stubNudgeCount += 1;
+            this.emit(sessionId, {
+              type: "step_done",
+              stepId,
+              detail: "final_blocked",
+            });
             transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
             transcript.push({
               role: "user",
@@ -846,6 +921,11 @@ export class AgentLoop {
             });
             continue;
           }
+          let finalText = parsed.final;
+          if (wantsFiles && filesWritten === 0) {
+            finalText +=
+              "\n\n⚠️ Файлы не были записаны до завершения (лимит шагов / финальное окно).";
+          }
           const marked = skipRemainingPlan(steps);
           if (marked.length) {
             steps = marked;
@@ -855,21 +935,40 @@ export class AgentLoop {
           }
           const msg = this.store.addMessage(sessionId, {
             role: "assistant",
-            content: parsed.final,
+            content: finalText,
             thinking: parsed.thought,
           });
-          this.emit(sessionId, { type: "stream", text: parsed.final });
+          this.emit(sessionId, { type: "step_done", stepId, detail: "final" });
+          this.emit(sessionId, { type: "stream", text: finalText });
           this.emit(sessionId, { type: "done", messageId: msg.id });
           return;
         }
 
         if (!parsed.tool?.name) {
+          this.emit(sessionId, { type: "step_done", stepId, detail: "no tool" });
           transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
           transcript.push({
             role: "user",
-            content: wantsFiles
-              ? "Нужен tool (write_file) или final. Для кода сначала write_file."
-              : "Нужен tool или final. Продолжай.",
+            content: finishOnly
+              ? "Нужен final или finish. Tool на этом шаге запрещён."
+              : wantsFiles
+                ? "Нужен tool (write_file) или final. Для кода сначала write_file."
+                : "Нужен tool или final. Продолжай.",
+          });
+          continue;
+        }
+
+        if (finishOnly && parsed.tool.name !== "finish") {
+          this.emit(sessionId, {
+            type: "step_done",
+            stepId,
+            detail: "finish window — tool blocked",
+          });
+          transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+          transcript.push({
+            role: "user",
+            content:
+              "Финальное окно: только final или tool finish. Кратко подведи итог без новых инструментов.",
           });
           continue;
         }
@@ -896,13 +995,14 @@ export class AgentLoop {
         this.emit(sessionId, { type: "tool_call", name: toolName, args, callId });
 
         if (toolName === "finish") {
-          const blockFinishNoFile = wantsFiles && filesWritten === 0;
+          const blockFinishNoFile = wantsFiles && filesWritten === 0 && !finishOnly;
           const blockFinishStub =
             wantsFiles &&
             filesWritten > 0 &&
             !substantialWrite &&
             stubNudgeCount < 2 &&
-            i < settings.agentMaxSteps - 1;
+            !finishOnly &&
+            i < maxSteps - 1;
           if (blockFinishNoFile || blockFinishStub) {
             if (blockFinishStub) stubNudgeCount += 1;
             const deny = blockFinishNoFile
@@ -914,7 +1014,11 @@ export class AgentLoop {
             transcript.push({ role: "user", content: deny });
             continue;
           }
-          const summary = String(args.summary || parsed.final || "Готово");
+          let summary = String(args.summary || parsed.final || "Готово");
+          if (wantsFiles && filesWritten === 0) {
+            summary +=
+              "\n\n⚠️ Файлы не были записаны до завершения.";
+          }
           if (steps.length) {
             steps = skipRemainingPlan(steps);
             updatePlanMemory(workingMemory, steps);
@@ -931,9 +1035,63 @@ export class AgentLoop {
             callId,
             result: summary,
           });
+          this.emit(sessionId, { type: "step_done", stepId, detail: "finish" });
           this.emit(sessionId, { type: "stream", text: summary });
           this.emit(sessionId, { type: "done", messageId: msg.id });
           return;
+        }
+
+        const fp = toolFingerprint(toolName, args);
+        if (fp === lastToolFp) identicalToolStreak += 1;
+        else {
+          identicalToolStreak = 1;
+          lastToolFp = fp;
+        }
+        if (identicalToolStreak > AGENT_IDENTICAL_TOOL_MAX) {
+          this.emit(sessionId, {
+            type: "tool_result",
+            callId,
+            result: "Повтор того же tool отклонён",
+            isError: true,
+          });
+          this.emit(sessionId, {
+            type: "step_done",
+            stepId,
+            detail: "identical tool",
+          });
+          transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+          transcript.push({
+            role: "user",
+            content:
+              "Ты повторяешь тот же инструмент с теми же аргументами. Сделай другой tool или верни final с итогом.",
+          });
+          continue;
+        }
+        if (!PLAN_ADVANCING_TOOLS.has(toolName)) {
+          nonAdvancingStreak += 1;
+          if (nonAdvancingStreak > AGENT_NON_ADVANCING_MAX) {
+            this.emit(sessionId, {
+              type: "tool_result",
+              callId,
+              result: "Слишком много разведочных tool подряд",
+              isError: true,
+            });
+            this.emit(sessionId, {
+              type: "step_done",
+              stepId,
+              detail: "non-advancing cap",
+            });
+            transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+            transcript.push({
+              role: "user",
+              content: wantsFiles
+                ? "Хватит list_dir/read/search. Сделай write_file/apply_patch или final."
+                : "Хватит разведки. Выполни действие по плану или final.",
+            });
+            continue;
+          }
+        } else {
+          nonAdvancingStreak = 0;
         }
 
         const approved = await this.confirmIfNeeded(sessionId, toolName, args, settings);
@@ -971,7 +1129,10 @@ export class AgentLoop {
               }
             }
             if (settings.projectRoot && targetPath) {
-              void invalidateIndexPaths(settings.projectRoot, [targetPath]).catch(() => undefined);
+              projectContextCache.invalidateRoot(settings.projectRoot);
+              await invalidateIndexPaths(settings.projectRoot, [targetPath]).catch(
+                () => undefined,
+              );
             }
           }
           if (steps.length && PLAN_ADVANCING_TOOLS.has(toolName)) {
@@ -1040,18 +1201,23 @@ export class AgentLoop {
         }
       }
 
-      const limitMsg =
-        wantsFiles && filesWritten === 0
-          ? "Достигнут лимит шагов агента, файлы так и не были записаны. Увеличьте лимит шагов или повторите с @agent и явной просьбой write_file."
-          : "Достигнут лимит шагов агента. Уточните задачу или увеличьте лимит в настройках.";
+      const synthesized = synthesizeBudgetExhaustedAnswer(workingMemory, {
+        wantsFiles,
+        filesWritten,
+        toolsUsed,
+        substantialWrite,
+      });
       const msg = this.store.addMessage(sessionId, {
         role: "assistant",
-        content: limitMsg,
+        content: synthesized.content,
       });
-      this.emit(sessionId, {
-        type: "error",
-        message: `incomplete: ${limitMsg}`,
-      });
+      this.emit(sessionId, { type: "stream", text: synthesized.content });
+      if (synthesized.incomplete) {
+        this.emit(sessionId, {
+          type: "error",
+          message: `incomplete: ${synthesized.content.slice(0, 240)}`,
+        });
+      }
       this.emit(sessionId, { type: "done", messageId: msg.id });
     } catch (err) {
       this.emit(sessionId, {

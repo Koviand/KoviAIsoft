@@ -1,12 +1,54 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { AgentPlanStep, AppSettings, ChatMessage, ChatSession } from "@kovi/shared";
+import type {
+  AgentPlanStep,
+  AppSettings,
+  ChatMessage,
+  ChatSession,
+  RuntimeStatus,
+} from "@kovi/shared";
 import { api } from "../api";
 import {
   ProcessTimeline,
   type ProcessMode,
   type ProcessToolItem,
 } from "../components/ProcessTimeline";
+import {
+  MentionPicker,
+  applyMention,
+  buildMentionItems,
+  mentionQueryAt,
+} from "../components/MentionPicker";
 import { paramLabel } from "../lib/labels";
+
+const RESUME_PROMPT =
+  "Продолжи задачу с того места, где остановился. Не начинай план заново — используй рабочую память и уже записанные файлы. Один JSON-шаг: tool или final.";
+
+function canResumeAgent(session: ChatSession | null, messages: ChatMessage[]): boolean {
+  if (!session) return false;
+  if (session.agentScratchpad && session.agentScratchpad.length > 8) return true;
+  const last = [...messages].reverse().find((m) => m.role === "assistant");
+  if (!last?.content) return false;
+  return /лимит шагов|незаверш|incomplete|отмен|останов|продолж/i.test(last.content);
+}
+
+function resumePromptFor(session: ChatSession | null): string {
+  let goal = "";
+  try {
+    if (session?.agentScratchpad) {
+      const parsed = JSON.parse(session.agentScratchpad) as { goal?: string };
+      if (typeof parsed.goal === "string" && parsed.goal.trim()) {
+        goal = parsed.goal.trim().slice(0, 240);
+      }
+    }
+  } catch {
+    // ignore
+  }
+  if (!goal) return RESUME_PROMPT;
+  return (
+    `Продолжи задачу с того места, где остановился. Цель была: ${goal}. ` +
+    `Не начинай план заново — используй рабочую память и уже записанные файлы. Один JSON-шаг: tool или final.`
+  );
+}
 
 const PROMPT_CHIPS = [
   "Кратко объясни, что умеет этот чат",
@@ -51,6 +93,7 @@ export function ChatPage(props: {
   messages: ChatMessage[];
   busy: boolean;
   settings: AppSettings | null;
+  runtime?: RuntimeStatus | null;
   pendingConfirmSummary?: string | null;
   setSessions: (s: ChatSession[]) => void;
   setActiveSessionId: (id: string | null) => void;
@@ -58,6 +101,7 @@ export function ChatPage(props: {
   setBusy: (b: boolean) => void;
   setError: (e: string | null) => void;
   setSettings: (s: AppSettings) => void;
+  onOpenModels?: () => void;
 }) {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState("");
@@ -70,7 +114,28 @@ export function ChatPage(props: {
   const [showParams, setShowParams] = useState(false);
   const [sessionQuery, setSessionQuery] = useState("");
   const [folderFilter, setFolderFilter] = useState<string>("");
+  const [composerCaret, setComposerCaret] = useState(0);
+  const [mentionOpen, setMentionOpen] = useState(true);
+  const [mentionFiles, setMentionFiles] = useState<string[]>([]);
+  const [mentionHi, setMentionHi] = useState(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (!mentionOpen || !mentionQueryAt(input, composerCaret)) return;
+    let cancelled = false;
+    void api
+      .listProjectMentions()
+      .then((r) => {
+        if (!cancelled) setMentionFiles(r.files);
+      })
+      .catch(() => {
+        if (!cancelled) setMentionFiles([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mentionOpen, input, composerCaret]);
   const activeIdRef = useRef(props.activeSessionId);
   /** Session that owns the in-flight generation (null after terminal event). */
   const streamSessionRef = useRef<string | null>(null);
@@ -537,6 +602,15 @@ export function ChatPage(props: {
                   <button type="button" className="btn danger" onClick={() => void onStop()}>
                     Стоп
                   </button>
+                ) : canResumeAgent(activeSession, props.messages) ? (
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    title="Продолжить агента без полного перепланирования"
+                    onClick={() => void onSend(resumePromptFor(activeSession))}
+                  >
+                    Продолжить
+                  </button>
                 ) : null}
               </div>
             )}
@@ -549,8 +623,6 @@ export function ChatPage(props: {
                       ["temperature", activeSession.params.temperature],
                       ["topP", activeSession.params.topP],
                       ["maxTokens", activeSession.params.maxTokens],
-                      ["context", activeSession.params.context],
-                      ["gpuLayers", activeSession.params.gpuLayers],
                     ] as const
                   ).map(([key, value]) => (
                     <label key={key} className="param-field">
@@ -574,6 +646,32 @@ export function ChatPage(props: {
                     </label>
                   ))}
                 </div>
+                <p className="muted" style={{ marginTop: 10, fontSize: "0.8rem" }}>
+                  {props.runtime?.loadedModelId &&
+                  props.runtime.loadedContext != null &&
+                  props.runtime.loadedGpuLayers != null ? (
+                    <>
+                      Загружено в память: ctx={props.runtime.loadedContext}, ngl=
+                      {props.runtime.loadedGpuLayers}. Контекст и GPU-слои меняются во вкладке
+                      «Модели» (нужна перезагрузка модели).
+                    </>
+                  ) : (
+                    <>
+                      Контекст и GPU-слои задаются при загрузке модели во вкладке «Модели», не в
+                      чате.
+                    </>
+                  )}{" "}
+                  {props.onOpenModels ? (
+                    <button
+                      type="button"
+                      className="btn ghost"
+                      style={{ padding: "0 6px", fontSize: "0.8rem" }}
+                      onClick={() => props.onOpenModels?.()}
+                    >
+                      Открыть Модели
+                    </button>
+                  ) : null}
+                </p>
                 <label className="muted" style={{ display: "block", marginTop: 10, fontSize: "0.8rem" }}>
                   Системный промпт
                   <textarea
@@ -646,23 +744,110 @@ export function ChatPage(props: {
           <div className="composer">
             <div className="composer-toolbar">
               <span className="muted composer-hint">
-                Один чат: ответы и действия. @codebase — семантический поиск по проекту, @agent —
-                tools. Enter — отправить, Shift+Enter — новая строка.
+                Один чат: ответы и действия. @ — файлы / @codebase / @agent. Enter — отправить,
+                Shift+Enter — новая строка.
               </span>
             </div>
-            <textarea
-              className="textarea composer-input"
-              value={input}
-              placeholder="Спросите… или @codebase / @agent …"
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  void onSend();
-                }
-              }}
-            />
+            <div className="composer-input-wrap">
+              {mentionOpen && mentionQueryAt(input, composerCaret) ? (
+                <MentionPicker
+                  value={input}
+                  caret={composerCaret}
+                  files={mentionFiles}
+                  highlight={mentionHi}
+                  disabled={props.busy}
+                  onHighlightChange={setMentionHi}
+                  onClose={() => setMentionOpen(false)}
+                  onPick={(next, nextCaret) => {
+                    setInput(next);
+                    setComposerCaret(nextCaret);
+                    setMentionOpen(false);
+                    requestAnimationFrame(() => {
+                      const el = composerRef.current;
+                      if (!el) return;
+                      el.focus();
+                      el.setSelectionRange(nextCaret, nextCaret);
+                    });
+                  }}
+                />
+              ) : null}
+              <textarea
+                ref={composerRef}
+                className="textarea composer-input"
+                value={input}
+                placeholder="Спросите… или @файл / @codebase / @agent …"
+                onChange={(e) => {
+                  setInput(e.target.value);
+                  setComposerCaret(e.target.selectionStart);
+                  setMentionOpen(true);
+                  setMentionHi(0);
+                }}
+                onClick={(e) => setComposerCaret((e.target as HTMLTextAreaElement).selectionStart)}
+                onKeyUp={(e) => setComposerCaret((e.target as HTMLTextAreaElement).selectionStart)}
+                onKeyDown={(e) => {
+                  const mq = mentionOpen ? mentionQueryAt(input, composerCaret) : null;
+                  const items = mq ? buildMentionItems(mq.query, mentionFiles) : [];
+                  if (mq && items.length) {
+                    if (e.key === "ArrowDown") {
+                      e.preventDefault();
+                      setMentionHi((h) => Math.min(items.length - 1, h + 1));
+                      return;
+                    }
+                    if (e.key === "ArrowUp") {
+                      e.preventDefault();
+                      setMentionHi((h) => Math.max(0, h - 1));
+                      return;
+                    }
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      setMentionOpen(false);
+                      return;
+                    }
+                    if ((e.key === "Enter" || e.key === "Tab") && !e.shiftKey) {
+                      e.preventDefault();
+                      const picked = applyMention(input, composerCaret, items[mentionHi] || items[0]!);
+                      if (picked) {
+                        setInput(picked.next);
+                        setComposerCaret(picked.nextCaret);
+                        setMentionOpen(false);
+                        requestAnimationFrame(() => {
+                          const el = composerRef.current;
+                          if (!el) return;
+                          el.focus();
+                          el.setSelectionRange(picked.nextCaret, picked.nextCaret);
+                        });
+                      }
+                      return;
+                    }
+                  }
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void onSend();
+                  }
+                }}
+              />
+            </div>
             <div className="composer-actions">
+              <button
+                className="btn ghost"
+                type="button"
+                disabled={props.busy}
+                title="Вставить @"
+                onClick={() => {
+                  setInput((v) => `${v}${v.endsWith(" ") || !v ? "" : " "}@`);
+                  setMentionOpen(true);
+                  requestAnimationFrame(() => {
+                    const el = composerRef.current;
+                    if (!el) return;
+                    el.focus();
+                    const c = el.value.length;
+                    el.setSelectionRange(c, c);
+                    setComposerCaret(c);
+                  });
+                }}
+              >
+                @
+              </button>
               <button
                 className="btn ghost"
                 type="button"
@@ -674,6 +859,16 @@ export function ChatPage(props: {
               >
                 @codebase
               </button>
+              {!props.busy && canResumeAgent(activeSession, props.messages) ? (
+                <button
+                  className="btn ghost"
+                  type="button"
+                  title="Продолжить агента"
+                  onClick={() => void onSend(resumePromptFor(activeSession))}
+                >
+                  Продолжить
+                </button>
+              ) : null}
               <button
                 className="btn primary"
                 type="button"

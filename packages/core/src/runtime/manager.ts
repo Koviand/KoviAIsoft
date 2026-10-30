@@ -62,6 +62,8 @@ export class RuntimeManager {
   private process: ChildProcess | null = null;
   private port: number | null = null;
   private loadedModelId: string | null = null;
+  private loadedContext: number | null = null;
+  private loadedGpuLayers: number | null = null;
   private downloading = false;
   private downloadProgress = 0;
   private downloadLabel = "";
@@ -101,6 +103,8 @@ export class RuntimeManager {
       serverRunning: Boolean(this.process && !this.process.killed),
       serverPort: this.port,
       loadedModelId: this.loadedModelId,
+      loadedContext: this.loadedModelId ? this.loadedContext : null,
+      loadedGpuLayers: this.loadedModelId ? this.loadedGpuLayers : null,
       lastError: this.lastError,
       update: this.updateInfo,
     };
@@ -109,6 +113,12 @@ export class RuntimeManager {
   getOpenAiBaseUrl(): string | null {
     if (!this.isProcessAlive() || !this.port) return null;
     return `http://127.0.0.1:${this.port}/v1`;
+  }
+
+  private clearLoadedModel(): void {
+    this.loadedModelId = null;
+    this.loadedContext = null;
+    this.loadedGpuLayers = null;
   }
 
   /** True when we still have a live llama-server child process. */
@@ -138,7 +148,7 @@ export class RuntimeManager {
   async assertLlmReady(): Promise<string> {
     if (!this.isProcessAlive() || !this.port) {
       this.port = null;
-      this.loadedModelId = null;
+      this.clearLoadedModel();
       this.process = null;
       const hint = this.lastError ? ` Последняя ошибка runtime: ${this.lastError}` : "";
       throw new Error(
@@ -186,7 +196,7 @@ export class RuntimeManager {
         (logTail ? ` Лог: …${logTail}` : "");
     } else {
       this.port = null;
-      this.loadedModelId = null;
+      this.clearLoadedModel();
       this.process = null;
     }
     throw new Error(
@@ -597,7 +607,7 @@ export class RuntimeManager {
     this.grammarOk = null;
     if (!this.process) {
       this.port = null;
-      this.loadedModelId = null;
+      this.clearLoadedModel();
       return;
     }
     const proc = this.process;
@@ -623,7 +633,7 @@ export class RuntimeManager {
       }
     });
     this.port = null;
-    this.loadedModelId = null;
+    this.clearLoadedModel();
   }
 
   async loadModel(model: LocalModel, params: GenerationParams): Promise<void> {
@@ -684,6 +694,8 @@ export class RuntimeManager {
     this.process = child;
     this.port = port;
     this.loadedModelId = model.id;
+    this.loadedContext = params.context;
+    this.loadedGpuLayers = params.gpuLayers;
     this.lastError = null;
     this.serverLog = "";
 
@@ -698,7 +710,7 @@ export class RuntimeManager {
       if (this.process === child) {
         this.process = null;
         this.port = null;
-        this.loadedModelId = null;
+        this.clearLoadedModel();
         const tail = this.getServerLogTail(500);
         if (code && code !== 0) {
           this.lastError = `llama-server завершился с кодом ${code}. ${tail}`;

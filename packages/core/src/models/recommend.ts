@@ -4,6 +4,8 @@ import type {
   ModelRecommendationsReport,
   SystemInfo,
 } from "@kovi/shared";
+import { pickGpuNameForVram, pickMaxVram } from "../system/detect.js";
+import { estimateLoadPlan } from "./hardwareProfile.js";
 
 interface CatalogEntry {
   id: string;
@@ -181,11 +183,6 @@ export const MODEL_CATALOG: CatalogEntry[] = [
   },
 ];
 
-function pickVram(sys: SystemInfo): number | null {
-  const v = sys.gpus.map((g) => g.vramGb).find((x): x is number => typeof x === "number" && x > 0);
-  return v ?? null;
-}
-
 function pickQuant(
   entry: CatalogEntry,
   budgetGb: number,
@@ -193,27 +190,6 @@ function pickQuant(
   const fitting = entry.quants.filter((q) => q.sizeGb <= budgetGb);
   if (fitting.length) return fitting[0];
   return entry.quants[entry.quants.length - 1];
-}
-
-function contextForVram(vramGb: number | null): number {
-  if (vramGb == null) return 4096;
-  if (vramGb < 8) return 4096;
-  if (vramGb >= 16) return 16384;
-  return 8192;
-}
-
-function estimateNgl(
-  sizeGb: number,
-  context: number,
-  vramGb: number | null,
-): { ngl: number; fits: boolean } {
-  if (vramGb == null || vramGb <= 0) return { ngl: 0, fits: false };
-  const kv = context * 0.00025;
-  const need = sizeGb + kv;
-  const fits = need < vramGb * 0.9;
-  if (fits) return { ngl: 99, fits: true };
-  const ratio = vramGb / need;
-  return { ngl: Math.max(0, Math.floor(ratio * 99)), fits: false };
 }
 
 function classifyTier(
@@ -277,17 +253,17 @@ function scoreTier(tier: ModelPerfTier, paramsB: number, tags: string[]): number
 }
 
 export function buildModelRecommendations(sys: SystemInfo): ModelRecommendationsReport {
-  const vramGb = pickVram(sys);
+  const vramGb = pickMaxVram(sys);
   const ramGb = sys.totalRamGb || 16;
   const backend = sys.recommendedBackend;
-  const gpuName = sys.gpus[0]?.name || null;
+  const gpuName = pickGpuNameForVram(sys.gpus, vramGb);
   // Prefer fitting into VRAM; if none, use half of RAM as soft budget for CPU mode.
   const budgetGb = vramGb && vramGb > 0 ? vramGb * 0.85 : ramGb * 0.45;
-  const context = contextForVram(vramGb);
-
   const items: ModelRecommendation[] = MODEL_CATALOG.map((entry) => {
     const picked = pickQuant(entry, budgetGb);
-    const { ngl, fits } = estimateNgl(picked.sizeGb, context, vramGb);
+    const plan = estimateLoadPlan(sys, { modelSizeGb: picked.sizeGb, tier: "balanced" });
+    const ngl = plan.gpuLayers;
+    const fits = plan.fitsInVram === true;
     const tier = classifyTier(picked.sizeGb, vramGb, ramGb, fits, ngl);
     return {
       id: entry.id,
@@ -303,7 +279,7 @@ export function buildModelRecommendations(sys: SystemInfo): ModelRecommendations
       verdict: tierVerdict(tier, picked.quant, ngl),
       expectedSpeed: tierSpeed(tier, backend),
       recommendedNgl: ngl,
-      recommendedContext: context,
+      recommendedContext: plan.context,
       fitsInVram: fits,
       score: scoreTier(tier, entry.paramsB, entry.tags),
     };

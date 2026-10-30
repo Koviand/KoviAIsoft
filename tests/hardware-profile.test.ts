@@ -77,7 +77,7 @@ describe("suggestHardwareLoadProfile", () => {
     );
     expect(s.profile.gpuLayers).toBe(99);
     expect(s.profile.context).toBe(16384);
-    expect(s.profile.maxTokens).toBeGreaterThanOrEqual(512);
+    expect(s.profile.maxTokens).toBeGreaterThanOrEqual(4096);
     expect(s.profile.flashAttn).toBe(true);
   });
 

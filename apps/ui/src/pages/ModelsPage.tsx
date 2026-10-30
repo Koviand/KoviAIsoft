@@ -12,7 +12,15 @@ import type {
 } from "@kovi/shared";
 import { AUTO_PC_PROFILE_ID } from "@kovi/shared";
 import { api } from "../api";
+import { PageShell, SettingsSection } from "../components/PageShell";
 import { ModelAdvancedSettings } from "../components/ModelAdvancedSettings";
+
+const MODELS_NAV = [
+  { id: "recommend", label: "Рекомендации", group: "Подбор" },
+  { id: "load-tier", label: "Нагрузка", group: "Подбор" },
+  { id: "local-models", label: "На ПК", group: "Файлы" },
+  { id: "hf-download", label: "Hugging Face", group: "Файлы" },
+] as const;
 
 const TIER_PROFILE_IDS = ["fast", "balanced", "quality"] as const;
 
@@ -59,6 +67,7 @@ export function ModelsPage(props: {
   models: LocalModel[];
   loadedModelId: string | null;
   settings: AppSettings | null;
+  activeSessionId?: string | null;
   setModels: (m: LocalModel[]) => void;
   setSettings: (s: AppSettings) => void;
   setError: (e: string | null) => void;
@@ -79,8 +88,9 @@ export function ModelsPage(props: {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [focusModelId, setFocusModelId] = useState<string | null>(null);
 
+  /** Only loaded or explicitly focused model — never models[0] (wrong size tightens profile). */
   function preferModelId(): string | undefined {
-    return props.loadedModelId || focusModelId || props.models[0]?.id || undefined;
+    return props.loadedModelId || focusModelId || undefined;
   }
 
   async function loadRecommendations(): Promise<void> {
@@ -241,7 +251,8 @@ export function ModelsPage(props: {
       });
       props.setSettings(saved);
       if (props.loadedModelId) {
-        setHint("Профиль применён. Перезагрузите модель, чтобы сменить ngl/ctx.");
+        setHint("Профиль применён, модель перезагружена с новыми ngl/ctx.");
+        await props.refresh();
       } else {
         setHint(`Профиль «${saved.loadProfiles.find((p) => p.id === id)?.name || id}» активен`);
       }
@@ -267,9 +278,12 @@ export function ModelsPage(props: {
     setHwBusy(true);
     setHint(null);
     try {
-      setHwPreview(
-        await api.suggestHardwareLoadSettings({ modelId: preferModelId() }),
-      );
+      const mid = preferModelId();
+      const preview = await api.suggestHardwareLoadSettings({ modelId: mid });
+      setHwPreview(preview);
+      if (!mid) {
+        setHint("Превью без размера модели — загрузите модель, чтобы учесть её вес в VRAM.");
+      }
     } catch (e) {
       props.setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -280,18 +294,25 @@ export function ModelsPage(props: {
   async function applyHardware(): Promise<void> {
     setHwBusy(true);
     try {
+      const mid = preferModelId();
       const saved = await api.applyHardwareLoadSettings({
-        modelId: preferModelId(),
+        modelId: mid,
         applyBackend: true,
         applyDefaultParams: true,
       });
       props.setSettings(saved);
       setHwPreview(null);
+      const auto = saved.loadProfiles.find((p) => p.id === AUTO_PC_PROFILE_ID);
       setHint(
-        `Под ПК: ngl ${saved.loadProfiles.find((p) => p.id === AUTO_PC_PROFILE_ID)?.gpuLayers}, ctx ${saved.defaultParams.context}, maxTokens ${saved.defaultParams.maxTokens}, агент ${saved.agentMaxSteps} шагов.${
-          props.loadedModelId ? " Перезагрузите модель." : ""
+        `Под ПК: ngl ${auto?.gpuLayers}, ctx ${saved.defaultParams.context}, maxTokens ${saved.defaultParams.maxTokens}.${
+          props.loadedModelId
+            ? " Модель перезагружена с этими параметрами."
+            : mid
+              ? ""
+              : " Размер модели не учтён — загрузите модель и нажмите снова."
         }`,
       );
+      await props.refresh();
     } catch (e) {
       props.setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -314,32 +335,27 @@ export function ModelsPage(props: {
   const topRecs = (recs?.items || []).slice(0, 12);
 
   return (
-    <div className="stack-page">
-      <header className="page-header">
-        <div className="row" style={{ justifyContent: "space-between", width: "100%" }}>
-          <div>
-            <h1 className="h1">Модели</h1>
-            <p className="muted page-sub">
-              Рекомендации под ваше железо, локальные GGUF и загрузка с Hugging Face
-            </p>
-          </div>
-          <button className="btn" type="button" disabled={working} onClick={() => void scan()}>
-            Обновить список
-          </button>
-        </div>
-      </header>
-
-      <section className="card elevated recommend-card">
-        <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-          <div>
-            <h3 style={{ margin: 0 }}>Что скачать на этот ПК</h3>
-            <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-              {recsLoading && !recs
-                ? "Считаем рекомендации…"
-                : recs?.summary || "Нажмите «Пересчитать», чтобы оценить модели под VRAM/RAM."}
-            </p>
-          </div>
-          <div className="row" style={{ flexWrap: "wrap", gap: 8 }}>
+    <PageShell
+      title="Модели"
+      subtitle="Рекомендации под железо, локальные GGUF и загрузка с Hugging Face"
+      actions={
+        <button className="btn" type="button" disabled={working} onClick={() => void scan()}>
+          Обновить список
+        </button>
+      }
+      nav={[...MODELS_NAV]}
+    >
+      <SettingsSection
+        id="recommend"
+        title="Что скачать на этот ПК"
+        description={
+          recsLoading && !recs
+            ? "Считаем рекомендации…"
+            : recs?.summary || "Нажмите «Пересчитать», чтобы оценить модели под VRAM/RAM."
+        }
+        elevated
+      >
+        <div className="toolbar-row">
             <button
               className="btn"
               type="button"
@@ -356,10 +372,9 @@ export function ModelsPage(props: {
             >
               Пересчитать
             </button>
-          </div>
         </div>
         {recs && (
-          <div className="muted mono" style={{ fontSize: "0.78rem", marginTop: 8 }}>
+          <div className="status-strip mono">
             {recs.gpuName ? `GPU: ${recs.gpuName}` : "GPU не обнаружен"}
             {recs.vramGb != null ? ` · VRAM ${recs.vramGb.toFixed(1)} GB` : ""}
             {` · RAM ${recs.ramGb.toFixed(0)} GB · backend ${recs.backend}`}
@@ -368,27 +383,32 @@ export function ModelsPage(props: {
         {hwPreview && (
           <div
             className="card"
-            style={{ marginTop: 12, borderColor: "color-mix(in srgb, var(--accent) 40%, var(--border))" }}
+            style={{ borderColor: "color-mix(in srgb, var(--accent) 40%, var(--border))" }}
             role="dialog"
             aria-label="Превью настроек под ПК"
           >
             <strong>Предложенные настройки загрузки</strong>
-            <div className="muted mono" style={{ fontSize: "0.8rem", marginTop: 8 }}>
-              {hwPreview.gpuName ? `GPU: ${hwPreview.gpuName}` : "GPU не обнаружен"}
-              {hwPreview.vramGb != null ? ` · VRAM ${hwPreview.vramGb.toFixed(1)} GB` : ""}
-              {` · RAM ${hwPreview.ramGb.toFixed(0)} GB`}
-            </div>
-            <div className="mono" style={{ fontSize: "0.85rem", marginTop: 8 }}>
-              загрузка: ngl {hwPreview.profile.gpuLayers} · ctx {hwPreview.profile.context} ·
-              maxTokens {hwPreview.profile.maxTokens ?? "—"}
-              {hwPreview.profile.flashAttn ? " · flash-attn" : ""} · backend {hwPreview.backend}
-            </div>
-            <div className="mono" style={{ fontSize: "0.85rem", marginTop: 6 }}>
-              чат: ctx {hwPreview.defaultParams.context} · maxTokens{" "}
-              {hwPreview.defaultParams.maxTokens} · агент {hwPreview.agentMaxSteps} шагов
-            </div>
+            <dl className="kv-list" style={{ marginTop: 10 }}>
+              <dt>железо</dt>
+              <dd>
+                {hwPreview.gpuName ? `GPU: ${hwPreview.gpuName}` : "GPU не обнаружен"}
+                {hwPreview.vramGb != null ? ` · VRAM ${hwPreview.vramGb.toFixed(1)} GB` : ""}
+                {` · RAM ${hwPreview.ramGb.toFixed(0)} GB`}
+              </dd>
+              <dt>загрузка</dt>
+              <dd>
+                ngl {hwPreview.profile.gpuLayers} · ctx {hwPreview.profile.context} · maxTokens{" "}
+                {hwPreview.profile.maxTokens ?? "—"}
+                {hwPreview.profile.flashAttn ? " · flash-attn" : ""} · backend {hwPreview.backend}
+              </dd>
+              <dt>чат</dt>
+              <dd>
+                ctx {hwPreview.defaultParams.context} · maxTokens {hwPreview.defaultParams.maxTokens}{" "}
+                · агент {hwPreview.agentMaxSteps} шагов
+              </dd>
+            </dl>
             <p style={{ margin: "8px 0 0", fontSize: "0.82rem" }}>{hwPreview.rationale}</p>
-            <div className="row" style={{ marginTop: 12, flexWrap: "wrap", gap: 8 }}>
+            <div className="toolbar-row" style={{ marginTop: 12 }}>
               <button
                 className="btn primary"
                 type="button"
@@ -408,12 +428,12 @@ export function ModelsPage(props: {
             </div>
           </div>
         )}
-        <div className="muted" style={{ fontSize: "0.78rem", marginTop: 10 }}>
-          <span className="badge fit-green">Подходит</span>{" "}
-          <span className="badge fit-yellow">Медленно</span>{" "}
+        <div className="toolbar-row">
+          <span className="badge fit-green">Подходит</span>
+          <span className="badge fit-yellow">Медленно</span>
           <span className="badge fit-red">Не пойдёт</span>
         </div>
-        <div className="recommend-grid" style={{ marginTop: 12 }}>
+        <div className="recommend-grid">
           {topRecs.map((item) => (
             <div key={item.id} className={`recommend-item fit-card-${tierGroup(item.tier)}`}>
               <div className="row" style={{ justifyContent: "space-between", gap: 8 }}>
@@ -455,16 +475,14 @@ export function ModelsPage(props: {
             <div className="muted">Нет подходящих вариантов в каталоге.</div>
           )}
         </div>
-      </section>
+      </SettingsSection>
 
-      <section className="card">
-        <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-          <div>
-            <strong>Уровень нагрузки</strong>
-            <p className="muted" style={{ margin: "4px 0 0", fontSize: "0.78rem" }}>
-              Быстро / Баланс / Качество — hardware-aware. «Под этот ПК» пересчитывает все уровни.
-            </p>
-          </div>
+      <SettingsSection
+        id="load-tier"
+        title="Уровень нагрузки"
+        description="Быстро / Баланс / Качество — hardware-aware. «Под этот ПК» пересчитывает все уровни."
+      >
+        <div className="toolbar-row">
           <button
             className="btn"
             type="button"
@@ -477,7 +495,7 @@ export function ModelsPage(props: {
             Параметры…
           </button>
         </div>
-        <div className="row" style={{ marginTop: 12, flexWrap: "wrap", gap: 8 }}>
+        <div className="choice-grid">
           {(tierProfiles.length
             ? tierProfiles
             : [
@@ -489,19 +507,20 @@ export function ModelsPage(props: {
             <button
               key={p.id}
               type="button"
-              className={`btn ${activeProfileId === p.id ? "primary" : ""}`}
-              style={{ minWidth: 110, padding: "12px 16px" }}
+              className={`choice-tile ${activeProfileId === p.id ? "on" : ""}`}
               disabled={working || hwBusy}
               onClick={() => void setProfile(p.id)}
               title={`ngl ${p.gpuLayers} · ctx ${p.context}${p.flashAttn ? " · flash" : ""}`}
             >
-              {p.name}
+              <span className="choice-tile-title">{p.name}</span>
+              <span className="choice-tile-sub">
+                ngl {p.gpuLayers} · ctx {p.context}
+              </span>
             </button>
           ))}
           <button
             type="button"
-            className={`btn ${activeProfileId === AUTO_PC_PROFILE_ID ? "primary" : "ghost"}`}
-            style={{ minWidth: 110, padding: "12px 16px" }}
+            className={`choice-tile ${activeProfileId === AUTO_PC_PROFILE_ID ? "on" : ""}`}
             disabled={working || hwBusy}
             onClick={() => void applyHardware()}
             title={
@@ -510,36 +529,44 @@ export function ModelsPage(props: {
                 : "Пересчитать под железо"
             }
           >
-            Под этот ПК
+            <span className="choice-tile-title">Под этот ПК</span>
+            <span className="choice-tile-sub">
+              {autoPc ? `ngl ${autoPc.gpuLayers} · ctx ${autoPc.context}` : "Автоподбор"}
+            </span>
           </button>
-          {otherProfiles.map((p) => (
-            <button
-              key={p.id}
-              type="button"
-              className={`btn ghost ${activeProfileId === p.id ? "primary" : ""}`}
-              disabled={working || hwBusy}
-              onClick={() => void setProfile(p.id)}
-              title={`ngl ${p.gpuLayers} · ctx ${p.context}`}
-            >
-              {p.name}
-            </button>
-          ))}
         </div>
-      </section>
+        {otherProfiles.length > 0 && (
+          <div className="toolbar-row">
+            {otherProfiles.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                className={`btn ghost ${activeProfileId === p.id ? "primary" : ""}`}
+                disabled={working || hwBusy}
+                onClick={() => void setProfile(p.id)}
+                title={`ngl ${p.gpuLayers} · ctx ${p.context}`}
+              >
+                {p.name}
+              </button>
+            ))}
+          </div>
+        )}
+      </SettingsSection>
 
       {hint && (
-        <div className="page-hint" role="status">
+        <div className="status-strip" role="status">
           {hint}
         </div>
       )}
 
       <div className="grid-2">
-        <section className="card elevated">
-          <h3>На этом компьютере</h3>
-          <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-            Зелёный — влезет в VRAM, жёлтый — offload/медленно, красный — битый или слишком тяжёлый.
-          </p>
-          <div className="stack" style={{ maxHeight: 420, marginTop: 10 }}>
+        <SettingsSection
+          id="local-models"
+          title="На этом компьютере"
+          description="Зелёный — влезет в VRAM, жёлтый — offload/медленно, красный — битый или слишком тяжёлый."
+          elevated
+        >
+          <div className="stack" style={{ maxHeight: 420 }}>
             {props.models.map((m) => {
               const loaded = props.loadedModelId === m.id;
               const fit = localFitGroup(m);
@@ -621,17 +648,20 @@ export function ModelsPage(props: {
               </div>
             )}
           </div>
-        </section>
+        </SettingsSection>
 
-        <section className="card elevated">
-          <h3>Скачать с Hugging Face</h3>
-          <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.78rem" }}>
-            {hfCli?.installing
+        <SettingsSection
+          id="hf-download"
+          title="Скачать с Hugging Face"
+          description={
+            hfCli?.installing
               ? "Устанавливается встроенный HF CLI…"
               : hfCli?.available
                 ? `${hfCli.bundled ? "Встроенный" : "Системный"} HF CLI${hfCli.version ? ` · ${hfCli.version}` : ""} · режим ${props.settings?.hfDownloadMethod || "auto"}`
-                : `Встроенный HF CLI ещё не установлен — поставится при скачивании (или кнопкой ниже). Режим: ${props.settings?.hfDownloadMethod || "auto"}`}
-          </p>
+                : `Встроенный HF CLI ещё не установлен — поставится при скачивании. Режим: ${props.settings?.hfDownloadMethod || "auto"}`
+          }
+          elevated
+        >
           <div className="row" style={{ marginTop: 10, flexWrap: "wrap", gap: 8 }}>
             <div className="muted mono" style={{ fontSize: "0.78rem", flex: "1 1 200px" }}>
               папка: {props.settings?.downloadDir || "не задана"}
@@ -758,7 +788,7 @@ export function ModelsPage(props: {
               })}
             </div>
           )}
-        </section>
+        </SettingsSection>
       </div>
 
       {props.settings && (
@@ -770,10 +800,11 @@ export function ModelsPage(props: {
           models={props.models}
           loadedModelId={props.loadedModelId}
           focusModelId={focusModelId}
+          activeSessionId={props.activeSessionId}
           setError={props.setError}
           onHint={setHint}
         />
       )}
-    </div>
+    </PageShell>
   );
 }

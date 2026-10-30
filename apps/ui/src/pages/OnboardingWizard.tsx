@@ -56,7 +56,7 @@ export function OnboardingWizard(props: {
     try {
       await savePartial({ runtimeBackendPreference: backend });
       await api.ensureLatestRuntime(backend, true);
-      setStatus("Runtime готов");
+      setStatus("Движок готов");
       setStep(1);
     } catch (e) {
       props.setError(e instanceof Error ? e.message : String(e));
@@ -80,7 +80,7 @@ export function OnboardingWizard(props: {
 
         {step === 0 && (
           <section className="wizard-step">
-            <h2>Runtime llama.cpp</h2>
+            <h2>Движок llama.cpp</h2>
             <p className="muted">Выберите бэкенд под ваше железо — скачаем свежий билд.</p>
             <label>
               Бэкенд

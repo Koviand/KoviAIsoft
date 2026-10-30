@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { AppSettings, McpHealthResult, McpServerConfig } from "@kovi/shared";
 import { MCP_PRESETS } from "@kovi/shared";
 import { api } from "../api";
+import { PageShell, SettingsSection } from "../components/PageShell";
 
 function splitArgs(raw: string): string[] {
   const out: string[] = [];
@@ -12,6 +13,12 @@ function splitArgs(raw: string): string[] {
   }
   return out.filter(Boolean);
 }
+
+const MCP_NAV = [
+  { id: "presets", label: "Пресеты", group: "Добавить" },
+  { id: "add-server", label: "Вручную", group: "Добавить" },
+  { id: "servers", label: "Список", group: "Управление" },
+] as const;
 
 export function McpPage(props: {
   settings: AppSettings | null;
@@ -93,45 +100,43 @@ export function McpPage(props: {
   }
 
   return (
-    <div className="stack-page">
-      <header className="page-header">
-        <div className="row" style={{ justifyContent: "space-between", width: "100%" }}>
-          <div>
-            <h1 className="h1">MCP-серверы</h1>
-            <p className="muted page-sub">
-              Внешние инструменты для режима «Агент». Пресеты и проверка «жив/не жив».
-            </p>
-          </div>
-          <button className="btn" type="button" disabled={saving} onClick={() => void runHealth()}>
-            Проверить все
-          </button>
-        </div>
-      </header>
-
-      <section className="card elevated">
-        <h3>Пресеты</h3>
-        <div className="stack" style={{ marginTop: 10 }}>
+    <PageShell
+      title="MCP-серверы"
+      subtitle="Внешние инструменты для режима «Агент». Пресеты и проверка «жив/не жив»."
+      actions={
+        <button className="btn" type="button" disabled={saving} onClick={() => void runHealth()}>
+          Проверить все
+        </button>
+      }
+      nav={[...MCP_NAV]}
+    >
+      <SettingsSection
+        id="presets"
+        title="Пресеты"
+        description="Готовые серверы — добавьте в один клик."
+        elevated
+      >
+        <div className="option-grid">
           {MCP_PRESETS.map((p) => (
-            <div key={p.id} className="row" style={{ justifyContent: "space-between" }}>
-              <div>
-                <strong>{p.name}</strong>
-                <div className="muted" style={{ fontSize: "0.8rem" }}>
-                  {p.blurb}
-                </div>
+            <div key={p.id} className="option-card">
+              <div className="option-card-title">{p.name}</div>
+              <div className="muted" style={{ fontSize: "0.8rem" }}>
+                {p.blurb}
               </div>
-              <button className="btn" type="button" disabled={saving} onClick={() => addPreset(p)}>
-                Добавить
-              </button>
+              <div className="toolbar-row">
+                <button className="btn" type="button" disabled={saving} onClick={() => addPreset(p)}>
+                  Добавить
+                </button>
+              </div>
             </div>
           ))}
         </div>
-      </section>
+      </SettingsSection>
 
-      <section className="card elevated">
-        <h3>Добавить сервер</h3>
-        <div className="grid-2" style={{ marginTop: 12 }}>
-          <label>
-            Имя
+      <SettingsSection id="add-server" title="Добавить сервер вручную" elevated>
+        <div className="grid-2">
+          <label className="field">
+            <span className="field-label">Имя</span>
             <input
               className="input"
               value={name}
@@ -139,8 +144,8 @@ export function McpPage(props: {
               placeholder="filesystem"
             />
           </label>
-          <label>
-            Команда
+          <label className="field">
+            <span className="field-label">Команда</span>
             <input
               className="input"
               value={command}
@@ -148,88 +153,101 @@ export function McpPage(props: {
               placeholder="npx"
             />
           </label>
-          <label className="full">
-            Аргументы (пути с пробелами — в кавычках)
+          <label className="field full">
+            <span className="field-label">Аргументы</span>
             <input
               className="input"
               value={args}
               onChange={(e) => setArgs(e.target.value)}
               placeholder='-y @modelcontextprotocol/server-filesystem "C:\\path"'
             />
+            <p className="field-hint">Пути с пробелами — в кавычках</p>
           </label>
         </div>
-        <div className="row" style={{ marginTop: 12 }}>
+        <div className="toolbar-row">
           <button className="btn primary" type="button" disabled={saving} onClick={addServer}>
             Добавить
           </button>
         </div>
-      </section>
+      </SettingsSection>
 
       {health.length > 0 && (
-        <section className="card">
-          <h3>Статус</h3>
+        <SettingsSection id="health" title="Статус проверки">
           {health.map((h) => (
-            <div key={h.serverId} className="row" style={{ marginTop: 8, justifyContent: "space-between" }}>
+            <div key={h.serverId} className="status-strip" style={{ justifyContent: "space-between" }}>
               <span>
                 <strong>{h.name}</strong>{" "}
-                <span className={h.ok ? "badge" : "badge badge-danger"}>{h.ok ? "OK" : "ошибка"}</span>
+                <span className={h.ok ? "badge" : "badge badge-danger"}>
+                  {h.ok ? "OK" : "ошибка"}
+                </span>
               </span>
               <span className="muted mono" style={{ fontSize: "0.78rem" }}>
                 {h.message}
               </span>
             </div>
           ))}
-        </section>
+        </SettingsSection>
       )}
 
-      {props.settings.mcpServers.length === 0 && (
-        <div className="muted">Пока нет MCP-серверов. Без них агент использует встроенные инструменты.</div>
-      )}
-
-      {props.settings.mcpServers.map((s) => (
-        <div key={s.id} className="card">
-          <div className="row" style={{ justifyContent: "space-between" }}>
-            <div>
-              <strong>{s.name}</strong>
-              <div className="muted mono" style={{ fontSize: "0.8rem", marginTop: 4 }}>
-                {s.transport} · {s.command} {(s.args || []).join(" ")}
+      <SettingsSection
+        id="servers"
+        title="Подключённые серверы"
+        description={
+          props.settings.mcpServers.length === 0
+            ? "Пока нет MCP-серверов. Без них агент использует встроенные инструменты."
+            : undefined
+        }
+      >
+        {props.settings.mcpServers.map((s) => (
+          <div key={s.id} className="option-card">
+            <div className="row" style={{ justifyContent: "space-between", width: "100%" }}>
+              <div style={{ minWidth: 0 }}>
+                <div className="option-card-title">{s.name}</div>
+                <div className="option-card-meta">
+                  {s.transport} · {s.command} {(s.args || []).join(" ")}
+                </div>
+              </div>
+              <div className="toolbar-row">
+                <button
+                  className="btn ghost"
+                  type="button"
+                  disabled={saving}
+                  onClick={() => void runHealth(s)}
+                >
+                  Проверить
+                </button>
+                <label className="row">
+                  <input
+                    type="checkbox"
+                    checked={s.enabled}
+                    disabled={saving}
+                    onChange={(e) => {
+                      const mcpServers = props.settings!.mcpServers.map((x) =>
+                        x.id === s.id ? { ...x, enabled: e.target.checked } : x,
+                      );
+                      void save({ ...props.settings!, mcpServers });
+                    }}
+                  />
+                  Включён
+                </label>
+                <button
+                  className="btn danger"
+                  type="button"
+                  disabled={saving}
+                  onClick={() =>
+                    void save({
+                      ...props.settings!,
+                      mcpServers: props.settings!.mcpServers.filter((x) => x.id !== s.id),
+                    })
+                  }
+                >
+                  Удалить
+                </button>
               </div>
             </div>
-            <div className="row">
-              <button className="btn ghost" type="button" disabled={saving} onClick={() => void runHealth(s)}>
-                Проверить
-              </button>
-              <label className="row">
-                <input
-                  type="checkbox"
-                  checked={s.enabled}
-                  disabled={saving}
-                  onChange={(e) => {
-                    const mcpServers = props.settings!.mcpServers.map((x) =>
-                      x.id === s.id ? { ...x, enabled: e.target.checked } : x,
-                    );
-                    void save({ ...props.settings!, mcpServers });
-                  }}
-                />
-                Включён
-              </label>
-              <button
-                className="btn danger"
-                type="button"
-                disabled={saving}
-                onClick={() =>
-                  void save({
-                    ...props.settings!,
-                    mcpServers: props.settings!.mcpServers.filter((x) => x.id !== s.id),
-                  })
-                }
-              >
-                Удалить
-              </button>
-            </div>
           </div>
-        </div>
-      ))}
-    </div>
+        ))}
+      </SettingsSection>
+    </PageShell>
   );
 }

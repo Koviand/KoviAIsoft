@@ -1,35 +1,23 @@
 import { useEffect, useRef, useState } from "react";
-import type {
-  AppSettings,
-  CodebaseIndexStatus,
-  EmbeddingModelId,
-  EmbeddingModelInfo,
-  HardwareLoadSuggestion,
-  LocalModel,
-} from "@kovi/shared";
+import type { AppSettings, HardwareLoadSuggestion, LocalModel } from "@kovi/shared";
 import { AUTO_PC_PROFILE_ID, THEME_PRESET_OPTIONS } from "@kovi/shared";
 import { api } from "../api";
+import { PageShell, SettingsSection } from "../components/PageShell";
 import { paramLabel } from "../lib/labels";
 import { ModelAdvancedSettings } from "../components/ModelAdvancedSettings";
 
 const TIER_IDS = ["fast", "balanced", "quality"] as const;
 
-const EMBED_OPTIONS: Array<{
-  id: EmbeddingModelId;
-  title: string;
-  blurb: string;
-}> = [
-  {
-    id: "minilm",
-    title: "MiniLM (all-MiniLM-L6-v2)",
-    blurb: "Лёгкая · dim 384 · CPU · быстрее индексирует",
-  },
-  {
-    id: "lfm25",
-    title: "LFM2.5-Embedding-350M",
-    blurb: "Качественнее · dim 1024 · GGUF · больше RAM",
-  },
-];
+const SETTINGS_NAV = [
+  { id: "appearance", label: "Внешний вид", group: "Интерфейс" },
+  { id: "agent-safety", label: "Безопасность", group: "Агент" },
+  { id: "project", label: "Проект", group: "Агент" },
+  { id: "web-search", label: "Веб-поиск", group: "Агент" },
+  { id: "load", label: "Нагрузка ПК", group: "Модели" },
+  { id: "hf-download", label: "Hugging Face", group: "Модели" },
+  { id: "model-folders", label: "Папки GGUF", group: "Модели" },
+  { id: "defaults", label: "Ответ по умолчанию", group: "Модели" },
+] as const;
 
 export function SettingsPage(props: {
   settings: AppSettings | null;
@@ -37,6 +25,7 @@ export function SettingsPage(props: {
   setError: (e: string | null) => void;
   models?: LocalModel[];
   loadedModelId?: string | null;
+  activeSessionId?: string | null;
 }) {
   const [draft, setDraft] = useState<AppSettings | null>(props.settings);
   const [saving, setSaving] = useState(false);
@@ -48,26 +37,7 @@ export function SettingsPage(props: {
     props.loadedModelId ?? null,
   );
   const [profileHint, setProfileHint] = useState<string | null>(null);
-  const [indexStatus, setIndexStatus] = useState<CodebaseIndexStatus | null>(null);
-  const [indexBusy, setIndexBusy] = useState(false);
-  const [embedModels, setEmbedModels] = useState<EmbeddingModelInfo[]>([]);
-  const [embedBusyId, setEmbedBusyId] = useState<EmbeddingModelId | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  function refreshEmbeddingStatus(): void {
-    void api
-      .getEmbeddingStatus()
-      .then((st) => setEmbedModels(st.models))
-      .catch(() => undefined);
-  }
-
-  useEffect(() => {
-    void api
-      .getCodebaseIndexStatus()
-      .then(setIndexStatus)
-      .catch(() => undefined);
-    refreshEmbeddingStatus();
-  }, [props.settings?.projectRoot, props.settings?.embeddingModelId]);
 
   useEffect(() => {
     if (props.models) setModels(props.models);
@@ -86,8 +56,9 @@ export function SettingsPage(props: {
       .catch(() => undefined);
   }, [props.models, props.loadedModelId]);
 
+  /** Only currently loaded model — do not use models[0] (skews «Под этот ПК»). */
   function preferModelId(): string | undefined {
-    return loadedModelId || models[0]?.id || undefined;
+    return loadedModelId || undefined;
   }
 
   useEffect(() => {
@@ -130,42 +101,37 @@ export function SettingsPage(props: {
   }
 
   const s = draft;
+  const activeProfile = (s.loadProfiles || []).find((p) => p.id === s.activeLoadProfileId);
 
   return (
-    <div className="stack-page">
-      <header className="page-header">
-        <div className="row" style={{ justifyContent: "space-between", width: "100%" }}>
-          <div>
-            <h1 className="h1">Настройки</h1>
-            <p className="muted page-sub">Тема, доступ агента, папки моделей и параметры по умолчанию</p>
-          </div>
-          <span className="muted" style={{ fontSize: "0.78rem" }}>
-            {saving ? "Сохранение…" : "Сохраняется автоматически"}
-          </span>
-        </div>
-      </header>
-
-      <section className="card elevated">
-        <h3>Тема</h3>
-        <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-          Готовые палитры и своя тема с ручным акцентом/фоном.
-        </p>
-        <div className="row" style={{ marginTop: 10, flexWrap: "wrap", gap: 8 }}>
+    <PageShell
+      title="Настройки"
+      subtitle="Интерфейс, агент и модели. Движок и @codebase — на вкладке «Движок»."
+      meta={<span>{saving ? "Сохранение…" : "Автосохранение"}</span>}
+      nav={[...SETTINGS_NAV]}
+    >
+      <SettingsSection
+        id="appearance"
+        title="Внешний вид"
+        description="Готовая палитра или своя тема (акцент и фон)."
+        elevated
+      >
+        <div className="choice-grid">
           {THEME_PRESET_OPTIONS.map(({ id, label }) => (
             <button
               key={id}
               type="button"
-              className={`btn ${s.themePreset === id ? "primary" : ""}`}
+              className={`choice-tile ${s.themePreset === id ? "on" : ""}`}
               onClick={() => void saveNow({ ...s, themePreset: id })}
             >
-              {label}
+              <span className="choice-tile-title">{label}</span>
             </button>
           ))}
         </div>
         {s.themePreset === "custom" && (
-          <div className="grid-2" style={{ marginTop: 12 }}>
-            <label>
-              Акцент
+          <div className="grid-2">
+            <label className="field">
+              <span className="field-label">Акцент</span>
               <input
                 className="input"
                 type="color"
@@ -175,8 +141,8 @@ export function SettingsPage(props: {
                 }
               />
             </label>
-            <label>
-              Фон
+            <label className="field">
+              <span className="field-label">Фон</span>
               <input
                 className="input"
                 type="color"
@@ -191,136 +157,147 @@ export function SettingsPage(props: {
             </label>
           </div>
         )}
-      </section>
+      </SettingsSection>
 
-      <section className="card">
-        <h3>Режим подтверждений агента</h3>
-        <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-          Ask — medium/high; Auto-safe — medium в проекте без спроса; Full — без medium, но shell/browser/high
-          всё равно спрашиваем.
-        </p>
-        <div className="row" style={{ marginTop: 10 }}>
+      <SettingsSection
+        id="agent-safety"
+        title="Безопасность агента"
+        description="Когда спрашивать разрешение перед опасными действиями (файлы, shell, браузер)."
+      >
+        <div className="choice-grid">
           {(
             [
-              ["ask", "Ask"],
-              ["auto-safe", "Auto-safe"],
-              ["full", "Full"],
+              [
+                "ask",
+                "Спрашивать всегда",
+                "Среднее и высокое — только с вашего ОК",
+              ],
+              [
+                "auto-safe",
+                "В проекте сам",
+                "В папке проекта средние без спроса; shell и высокое — спросит",
+              ],
+              [
+                "full",
+                "Минимум вопросов",
+                "Средние без спроса; shell, браузер и высокое — спросит",
+              ],
             ] as const
-          ).map(([id, label]) => (
+          ).map(([id, label, tip]) => (
             <button
               key={id}
               type="button"
-              className={`btn ${(s.agentRiskMode || "ask") === id ? "primary" : ""}`}
+              title={tip}
+              className={`choice-tile ${(s.agentRiskMode || "ask") === id ? "on" : ""}`}
               onClick={() => void saveNow({ ...s, agentRiskMode: id })}
             >
-              {label}
+              <span className="choice-tile-title">{label}</span>
+              <span className="choice-tile-sub">{tip}</span>
             </button>
           ))}
         </div>
-        <label style={{ display: "block", marginTop: 12 }}>
-          Лимит шагов агента
+        <label className="field">
+          <span className="field-label">Максимум шагов за один запуск</span>
           <input
             className="input"
             type="number"
             value={s.agentMaxSteps}
-            onChange={(e) => queueSave({ ...s, agentMaxSteps: Number(e.target.value) || 40 })}
+            onChange={(e) => {
+              const n = Number(e.target.value);
+              const clamped = Math.max(8, Math.min(128, Number.isFinite(n) ? Math.floor(n) : 40));
+              queueSave({ ...s, agentMaxSteps: clamped });
+            }}
+            min={8}
+            max={128}
           />
         </label>
-      </section>
+      </SettingsSection>
 
-      <section className="card">
-        <h3>Скачивание с Hugging Face</h3>
-        <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-          Скачивание через встроенный Hugging Face CLI (Python + huggingface_hub в{" "}
-          <span className="mono">tools/hf</span>). Если CLI недоступен — HTTP.
-        </p>
-        <label style={{ display: "block", marginTop: 12 }}>
-          Папка для загрузки моделей
-          <div className="row" style={{ marginTop: 6 }}>
-            <input
-              className="input mono"
-              style={{ flex: 1 }}
-              value={s.downloadDir}
-              onChange={(e) => queueSave({ ...s, downloadDir: e.target.value })}
-              placeholder="C:\\Models\\GGUF"
-            />
+      <SettingsSection
+        id="project"
+        title="Проект и доступ к файлам"
+        description={
+          <>
+            Корень проекта для агента и <code>@codebase</code>. Модель поиска — на вкладке «Движок».
+          </>
+        }
+      >
+        <div className="choice-grid">
+          <button
+            type="button"
+            className={`choice-tile ${s.fileAccessMode === "project" ? "on" : ""}`}
+            onClick={() => void saveNow({ ...s, fileAccessMode: "project" })}
+          >
+            <span className="choice-tile-title">Только папка проекта</span>
+            <span className="choice-tile-sub">Агент не выходит за выбранный корень</span>
+          </button>
+          <button
+            type="button"
+            className={`choice-tile ${s.fileAccessMode === "disk" ? "on" : ""}`}
+            onClick={() => void saveNow({ ...s, fileAccessMode: "disk" })}
+          >
+            <span className="choice-tile-title">Весь диск</span>
+            <span className="choice-tile-sub">Шире доступ — используйте осторожно</span>
+          </button>
+        </div>
+        <div className="field">
+          <span className="field-label">Папка проекта</span>
+          <div className="field-row">
+            <span className="path-chip">{s.projectRoot || "не задана"}</span>
             <button
               type="button"
               className="btn"
-              disabled={saving}
               onClick={async () => {
                 const dir = await api.pickDirectory();
-                if (dir) await saveNow({ ...s, downloadDir: dir });
+                if (dir) await saveNow({ ...s, projectRoot: dir });
               }}
             >
               Выбрать…
             </button>
           </div>
-        </label>
-        <div className="row" style={{ marginTop: 10 }}>
-          <button
-            type="button"
-            className="btn"
-            disabled={saving}
-            onClick={() => {
-              setSaving(true);
-              void api
-                .ensureHfCli()
-                .then((st) => {
-                  props.setError(
-                    st.available
-                      ? null
-                      : st.hint || "HF CLI не установился",
-                  );
-                  if (st.available) {
-                    // brief success via hint in Models; clear error
-                  }
-                })
-                .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
-                .finally(() => setSaving(false));
-            }}
-          >
-            Установить / проверить встроенный HF CLI
-          </button>
+          <p className="field-hint">
+            <code>AGENTS.md</code> в корне подхватывается автоматически. Индекс:{" "}
+            <code>.kovi/codebase-index/</code>
+          </p>
         </div>
-        <div className="row" style={{ marginTop: 10, flexWrap: "wrap" }}>
-          {(
-            [
-              ["auto", "Авто (CLI → HTTP)"],
-              ["cli", "Только HF CLI"],
-              ["http", "Только HTTP"],
-            ] as const
-          ).map(([id, label]) => (
-            <button
-              key={id}
-              type="button"
-              className={`btn ${(s.hfDownloadMethod || "auto") === id ? "primary" : ""}`}
-              onClick={() => void saveNow({ ...s, hfDownloadMethod: id })}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-        <label style={{ display: "block", marginTop: 12 }}>
-          HF Token (опционально, для gated-моделей)
-          <input
-            className="input"
-            type="password"
-            autoComplete="off"
-            placeholder="hf_…"
-            value={s.hfToken || ""}
-            onChange={(e) => queueSave({ ...s, hfToken: e.target.value })}
-          />
-        </label>
-      </section>
+      </SettingsSection>
 
-      <section className="card">
-        <h3>Уровень нагрузки</h3>
-        <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-          Быстро / Баланс / Качество подстраиваются под VRAM. «Под этот ПК» пересчитывает уровни и
-          активирует баланс. Смена профиля синхронизирует defaultParams.
-        </p>
-        <div className="row" style={{ marginTop: 10, flexWrap: "wrap", gap: 8 }}>
+      <SettingsSection id="web-search" title="Веб-поиск для агента">
+        <div className="grid-2">
+          <label className="field">
+            <span className="field-label">Провайдер</span>
+            <select
+              className="select"
+              value={s.webSearchProvider}
+              onChange={(e) =>
+                void saveNow({
+                  ...s,
+                  webSearchProvider: e.target.value as AppSettings["webSearchProvider"],
+                })
+              }
+            >
+              <option value="duckduckgo">DuckDuckGo</option>
+              <option value="searxng">SearXNG</option>
+            </select>
+          </label>
+          <label className="field">
+            <span className="field-label">URL SearXNG</span>
+            <input
+              className="input"
+              placeholder="если выбран SearXNG"
+              value={s.searxngUrl || ""}
+              onChange={(e) => queueSave({ ...s, searxngUrl: e.target.value })}
+            />
+          </label>
+        </div>
+      </SettingsSection>
+
+      <SettingsSection
+        id="load"
+        title="Нагрузка на ПК"
+        description="Быстро — легче по VRAM, Качество — тяжелее. После смены перезагрузите модель."
+      >
+        <div className="choice-grid">
           {TIER_IDS.map((id) => {
             const p = (s.loadProfiles || []).find((x) => x.id === id);
             const label =
@@ -329,8 +306,7 @@ export function SettingsPage(props: {
               <button
                 key={id}
                 type="button"
-                className={`btn ${s.activeLoadProfileId === id ? "primary" : ""}`}
-                style={{ minWidth: 110, padding: "12px 16px" }}
+                className={`choice-tile ${s.activeLoadProfileId === id ? "on" : ""}`}
                 disabled={hwBusy || saving}
                 title={p ? `ngl ${p.gpuLayers} · ctx ${p.context}` : undefined}
                 onClick={() => {
@@ -345,7 +321,7 @@ export function SettingsPage(props: {
                       setDraft(saved);
                       setProfileHint(
                         loadedModelId
-                          ? "Профиль применён. Перезагрузите модель, чтобы сменить ngl/ctx."
+                          ? "Профиль применён, модель перезагружена с новыми ngl/ctx."
                           : `Активен уровень «${label}»`,
                       );
                     })
@@ -353,14 +329,18 @@ export function SettingsPage(props: {
                     .finally(() => setHwBusy(false));
                 }}
               >
-                {label}
+                <span className="choice-tile-title">{label}</span>
+                {p && (
+                  <span className="choice-tile-sub">
+                    ngl {p.gpuLayers} · ctx {p.context}
+                  </span>
+                )}
               </button>
             );
           })}
           <button
             type="button"
-            className={`btn ${s.activeLoadProfileId === AUTO_PC_PROFILE_ID ? "primary" : "ghost"}`}
-            style={{ minWidth: 110, padding: "12px 16px" }}
+            className={`choice-tile ${s.activeLoadProfileId === AUTO_PC_PROFILE_ID ? "on" : ""}`}
             disabled={hwBusy || saving}
             onClick={() => {
               setHwBusy(true);
@@ -376,47 +356,62 @@ export function SettingsPage(props: {
                   setHwPreview(null);
                   setProfileHint(
                     loadedModelId
-                      ? "Под ПК применено. Перезагрузите модель."
-                      : "Настройки под этот ПК применены",
+                      ? "Под ПК применено, модель перезагружена."
+                      : preferModelId()
+                        ? "Настройки под этот ПК применены"
+                        : "Под ПК применено без размера модели — загрузите модель для точного ngl",
                   );
                 })
                 .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
                 .finally(() => setHwBusy(false));
             }}
           >
-            Под этот ПК
+            <span className="choice-tile-title">Под этот ПК</span>
+            <span className="choice-tile-sub">Автоподбор уровней под железо</span>
           </button>
-          {(s.loadProfiles || [])
-            .filter(
-              (p) =>
-                !TIER_IDS.includes(p.id as (typeof TIER_IDS)[number]) &&
-                p.id !== AUTO_PC_PROFILE_ID,
-            )
-            .map((p) => (
-              <button
-                key={p.id}
-                type="button"
-                className={`btn ghost ${s.activeLoadProfileId === p.id ? "primary" : ""}`}
-                disabled={hwBusy || saving}
-                onClick={() => {
-                  setHwBusy(true);
-                  void api
-                    .applyLoadProfileToSettings({
-                      profileId: p.id,
-                      modelId: preferModelId(),
-                    })
-                    .then((saved) => {
-                      props.setSettings(saved);
-                      setDraft(saved);
-                      setProfileHint(`Активен профиль «${p.name}»`);
-                    })
-                    .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
-                    .finally(() => setHwBusy(false));
-                }}
-              >
-                {p.name}
-              </button>
-            ))}
+        </div>
+
+        {(s.loadProfiles || []).some(
+          (p) =>
+            !TIER_IDS.includes(p.id as (typeof TIER_IDS)[number]) &&
+            p.id !== AUTO_PC_PROFILE_ID,
+        ) && (
+          <div className="toolbar-row">
+            {(s.loadProfiles || [])
+              .filter(
+                (p) =>
+                  !TIER_IDS.includes(p.id as (typeof TIER_IDS)[number]) &&
+                  p.id !== AUTO_PC_PROFILE_ID,
+              )
+              .map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  className={`btn ghost ${s.activeLoadProfileId === p.id ? "primary" : ""}`}
+                  disabled={hwBusy || saving}
+                  onClick={() => {
+                    setHwBusy(true);
+                    void api
+                      .applyLoadProfileToSettings({
+                        profileId: p.id,
+                        modelId: preferModelId(),
+                      })
+                      .then((saved) => {
+                        props.setSettings(saved);
+                        setDraft(saved);
+                        setProfileHint(`Активен профиль «${p.name}»`);
+                      })
+                      .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
+                      .finally(() => setHwBusy(false));
+                  }}
+                >
+                  {p.name}
+                </button>
+              ))}
+          </div>
+        )}
+
+        <div className="toolbar-row">
           <button
             type="button"
             className="btn"
@@ -441,41 +436,59 @@ export function SettingsPage(props: {
             Параметры…
           </button>
         </div>
+
         {profileHint && (
-          <div className="muted" style={{ marginTop: 8, fontSize: "0.82rem" }} role="status">
+          <div className="muted" style={{ fontSize: "0.82rem" }} role="status">
             {profileHint}
           </div>
         )}
-        {(() => {
-          const active = (s.loadProfiles || []).find((p) => p.id === s.activeLoadProfileId);
-          if (!active) return null;
-          return (
-            <div className="muted mono" style={{ marginTop: 10, fontSize: "0.8rem" }}>
-              ngl {active.gpuLayers} · ctx {active.context}
-              {active.flashAttn ? " · flash-attn" : ""}
-              {active.maxTokens != null ? ` · maxTokens ${active.maxTokens}` : ""}
-              {active.hardwareAware || active.id === AUTO_PC_PROFILE_ID
-                ? " · hardware-aware"
-                : ""}
-            </div>
-          );
-        })()}
+
+        {activeProfile && (
+          <dl className="kv-list">
+            <dt>ngl</dt>
+            <dd>{activeProfile.gpuLayers}</dd>
+            <dt>ctx</dt>
+            <dd>{activeProfile.context}</dd>
+            {activeProfile.maxTokens != null && (
+              <>
+                <dt>maxTokens</dt>
+                <dd>{activeProfile.maxTokens}</dd>
+              </>
+            )}
+            <dt>флаги</dt>
+            <dd>
+              {[
+                activeProfile.flashAttn ? "flash-attn" : null,
+                activeProfile.hardwareAware || activeProfile.id === AUTO_PC_PROFILE_ID
+                  ? "hardware-aware"
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(" · ") || "—"}
+            </dd>
+          </dl>
+        )}
+
         {hwPreview && (
-          <div className="card" style={{ marginTop: 12 }} role="dialog" aria-label="Превью под ПК">
+          <div className="card" role="dialog" aria-label="Превью под ПК">
             <strong>Превью: {hwPreview.profile.name}</strong>
-            <div className="mono" style={{ fontSize: "0.85rem", marginTop: 8 }}>
-              загрузка: ngl {hwPreview.profile.gpuLayers} · ctx {hwPreview.profile.context} ·
-              maxTokens {hwPreview.profile.maxTokens ?? "—"}
-              {hwPreview.profile.flashAttn ? " · flash-attn" : ""} · backend {hwPreview.backend}
-            </div>
-            <div className="mono" style={{ fontSize: "0.85rem", marginTop: 6 }}>
-              чат по умолчанию: ctx {hwPreview.defaultParams.context} · maxTokens{" "}
-              {hwPreview.defaultParams.maxTokens} · ngl {hwPreview.defaultParams.gpuLayers}
-              {hwPreview.defaultParams.flashAttn ? " · flash" : ""} · агент{" "}
-              {hwPreview.agentMaxSteps} шагов
-            </div>
+            <dl className="kv-list" style={{ marginTop: 10 }}>
+              <dt>загрузка</dt>
+              <dd>
+                ngl {hwPreview.profile.gpuLayers} · ctx {hwPreview.profile.context} · maxTokens{" "}
+                {hwPreview.profile.maxTokens ?? "—"}
+                {hwPreview.profile.flashAttn ? " · flash-attn" : ""} · backend {hwPreview.backend}
+              </dd>
+              <dt>чат</dt>
+              <dd>
+                ctx {hwPreview.defaultParams.context} · maxTokens {hwPreview.defaultParams.maxTokens}{" "}
+                · ngl {hwPreview.defaultParams.gpuLayers}
+                {hwPreview.defaultParams.flashAttn ? " · flash" : ""} · агент{" "}
+                {hwPreview.agentMaxSteps} шагов
+              </dd>
+            </dl>
             <p style={{ margin: "8px 0 0", fontSize: "0.82rem" }}>{hwPreview.rationale}</p>
-            <div className="row" style={{ marginTop: 12, flexWrap: "wrap", gap: 8 }}>
+            <div className="toolbar-row" style={{ marginTop: 12 }}>
               <button
                 className="btn primary"
                 type="button"
@@ -533,183 +546,92 @@ export function SettingsPage(props: {
             </div>
           </div>
         )}
-      </section>
+      </SettingsSection>
 
-      <section className="card">
-        <h3>Доступ к файлам для агента</h3>
-        <div className="row" style={{ marginTop: 10 }}>
-          <button
-            type="button"
-            className={`btn ${s.fileAccessMode === "project" ? "primary" : ""}`}
-            onClick={() => void saveNow({ ...s, fileAccessMode: "project" })}
-          >
-            Только папка проекта
-          </button>
-          <button
-            type="button"
-            className={`btn ${s.fileAccessMode === "disk" ? "primary" : ""}`}
-            onClick={() => void saveNow({ ...s, fileAccessMode: "disk" })}
-          >
-            Доступ к диску
-          </button>
-          <button
-            type="button"
-            className="btn"
-            onClick={async () => {
-              const dir = await api.pickDirectory();
-              if (dir) await saveNow({ ...s, projectRoot: dir });
-            }}
-          >
-            Выбрать папку проекта
-          </button>
-        </div>
-        <div className="muted mono" style={{ marginTop: 10 }}>
-          проект: {s.projectRoot || "не задан"}
-        </div>
-        <p className="muted" style={{ marginTop: 8, fontSize: "0.82rem" }}>
-          Файл <code>AGENTS.md</code> в корне проекта подхватывается агентом автоматически.
-          Семантический индекс <code>@codebase</code> лежит в{" "}
-          <code>.kovi/codebase-index/</code>.
-        </p>
-        <h4 style={{ marginTop: 16, marginBottom: 6 }}>Модель эмбеддингов (@codebase)</h4>
-        <p className="muted" style={{ margin: 0, fontSize: "0.82rem" }}>
-          Смена модели пересобирает индекс. LFM тяжелее по RAM; для чата нужен отдельный
-          llama-server runtime.
-        </p>
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
-            gap: 10,
-            marginTop: 10,
-          }}
-        >
-          {EMBED_OPTIONS.map((opt) => {
-            const info = embedModels.find((m) => m.id === opt.id);
-            const active = (s.embeddingModelId || "minilm") === opt.id;
-            const installed = Boolean(info?.installed);
-            const busy = embedBusyId === opt.id || (indexBusy && active);
-            return (
-              <div
-                key={opt.id}
-                style={{
-                  border: active ? "2px solid var(--accent, #2a4bff)" : "1px solid var(--border, #c8ced8)",
-                  borderRadius: 10,
-                  padding: "12px 14px",
-                  background: active ? "color-mix(in srgb, var(--accent, #2a4bff) 8%, transparent)" : "transparent",
-                }}
-              >
-                <div style={{ fontWeight: 600 }}>{opt.title}</div>
-                <div className="muted" style={{ fontSize: "0.78rem", marginTop: 4 }}>
-                  {opt.blurb}
-                </div>
-                <div className="muted mono" style={{ fontSize: "0.75rem", marginTop: 6 }}>
-                  {installed ? "скачана" : "не скачана"}
-                  {info?.ready === false && info?.error
-                    ? ` · ошибка: ${info.error}`
-                    : info?.error
-                      ? ` · ${info.error}`
-                      : ""}
-                  {active ? " · активна" : ""}
-                </div>
-                <div className="row" style={{ marginTop: 10, flexWrap: "wrap", gap: 8 }}>
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={installed || embedBusyId !== null}
-                    onClick={() => {
-                      setEmbedBusyId(opt.id);
-                      void api
-                        .downloadEmbeddingModel(opt.id)
-                        .then(() => {
-                          refreshEmbeddingStatus();
-                          setProfileHint(`Эмбеддинги: ${opt.title} скачана`);
-                        })
-                        .catch((e) =>
-                          props.setError(e instanceof Error ? e.message : String(e)),
-                        )
-                        .finally(() => setEmbedBusyId(null));
-                    }}
-                  >
-                    {busy && !active ? "Скачивание…" : installed ? "Уже скачана" : "Скачать"}
-                  </button>
-                  <button
-                    type="button"
-                    className={`btn ${active ? "primary" : ""}`}
-                    disabled={active || embedBusyId !== null || indexBusy}
-                    onClick={() => {
-                      setEmbedBusyId(opt.id);
-                      setIndexBusy(true);
-                      void api
-                        .setEmbeddingModel(opt.id)
-                        .then((res) => {
-                          props.setSettings(res.settings);
-                          setDraft(res.settings);
-                          setEmbedModels(res.status.models);
-                          setIndexStatus(res.index);
-                          setProfileHint(
-                            res.index.error
-                              ? `Индекс: ${res.index.error}`
-                              : `Эмбеддер ${opt.title} · индекс ${res.index.chunkCount} чанков`,
-                          );
-                        })
-                        .catch((e) =>
-                          props.setError(e instanceof Error ? e.message : String(e)),
-                        )
-                        .finally(() => {
-                          setEmbedBusyId(null);
-                          setIndexBusy(false);
-                        });
-                    }}
-                  >
-                    {busy && active ? "Активация…" : active ? "Выбрана" : "Выбрать"}
-                  </button>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-        <div className="row" style={{ marginTop: 12, flexWrap: "wrap", gap: 8 }}>
+      <SettingsSection
+        id="hf-download"
+        title="Скачивание с Hugging Face"
+        description="Куда сохранять GGUF и как качать: встроенный HF CLI или HTTP."
+      >
+        <label className="field">
+          <span className="field-label">Папка для новых загрузок</span>
+          <div className="field-row">
+            <input
+              className="input mono"
+              value={s.downloadDir}
+              onChange={(e) => queueSave({ ...s, downloadDir: e.target.value })}
+              placeholder="C:\\Models\\GGUF"
+            />
+            <button
+              type="button"
+              className="btn"
+              disabled={saving}
+              onClick={async () => {
+                const dir = await api.pickDirectory();
+                if (dir) await saveNow({ ...s, downloadDir: dir });
+              }}
+            >
+              Выбрать…
+            </button>
+          </div>
+        </label>
+        <div className="toolbar-row">
           <button
             type="button"
             className="btn"
-            disabled={!s.projectRoot || indexBusy}
+            disabled={saving}
             onClick={() => {
-              setIndexBusy(true);
+              setSaving(true);
               void api
-                .reindexCodebase()
+                .ensureHfCli()
                 .then((st) => {
-                  setIndexStatus(st);
-                  setProfileHint(
-                    st.error
-                      ? `Индекс: ${st.error}`
-                      : `Индекс @codebase: ${st.chunkCount} чанков`,
-                  );
+                  props.setError(st.available ? null : st.hint || "HF CLI не установился");
                 })
                 .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
-                .finally(() => setIndexBusy(false));
+                .finally(() => setSaving(false));
             }}
           >
-            {indexBusy ? "Индексация…" : "Переиндексировать @codebase"}
+            Проверить / установить HF CLI
           </button>
-          {indexStatus && (
-            <span className="muted mono" style={{ fontSize: "0.78rem" }}>
-              {indexStatus.indexing
-                ? "строится…"
-                : indexStatus.ready
-                  ? `готов · ${indexStatus.chunkCount} чанков`
-                  : indexStatus.error || "нет индекса"}
-            </span>
-          )}
         </div>
-      </section>
+        <div className="choice-grid">
+          {(
+            [
+              ["auto", "Авто", "CLI, иначе HTTP"],
+              ["cli", "Только CLI", "Hugging Face CLI"],
+              ["http", "Только HTTP", "Без CLI"],
+            ] as const
+          ).map(([id, label, tip]) => (
+            <button
+              key={id}
+              type="button"
+              className={`choice-tile ${(s.hfDownloadMethod || "auto") === id ? "on" : ""}`}
+              onClick={() => void saveNow({ ...s, hfDownloadMethod: id })}
+            >
+              <span className="choice-tile-title">{label}</span>
+              <span className="choice-tile-sub">{tip}</span>
+            </button>
+          ))}
+        </div>
+        <label className="field">
+          <span className="field-label">Токен Hugging Face</span>
+          <input
+            className="input"
+            type="password"
+            autoComplete="off"
+            placeholder="hf_… — для закрытых моделей"
+            value={s.hfToken || ""}
+            onChange={(e) => queueSave({ ...s, hfToken: e.target.value })}
+          />
+        </label>
+      </SettingsSection>
 
-      <section className="card">
-        <h3>Модели и runtime</h3>
-        <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-          Папки сканирования GGUF и отдельная папка, куда сохраняются новые загрузки с HF.
-        </p>
-        <div className="row" style={{ marginTop: 10, flexWrap: "wrap" }}>
+      <SettingsSection
+        id="model-folders"
+        title="Папки моделей GGUF"
+        description="Откуда приложение находит локальные модели. Папка загрузки — в блоке Hugging Face."
+      >
+        <div className="toolbar-row">
           <button
             type="button"
             className="btn"
@@ -718,98 +640,46 @@ export function SettingsPage(props: {
               if (dir) await saveNow({ ...s, modelRoots: [...new Set([...s.modelRoots, dir])] });
             }}
           >
-            Добавить папку моделей
-          </button>
-          <button
-            type="button"
-            className="btn"
-            onClick={async () => {
-              const dir = await api.pickDirectory();
-              if (dir) await saveNow({ ...s, downloadDir: dir });
-            }}
-          >
-            Папка загрузки…
+            Добавить папку для сканирования
           </button>
         </div>
-        <div className="muted mono" style={{ marginTop: 10 }}>
-          загрузка: {s.downloadDir || "не задана"}
+        <div className="field">
+          <span className="field-label">Сканирование</span>
+          <span className="path-chip">
+            {s.modelRoots.length ? s.modelRoots.join(" · ") : "папки не заданы"}
+          </span>
         </div>
-        <div className="muted mono" style={{ marginTop: 6 }}>
-          сканирование: {s.modelRoots.join(" | ") || "папки не заданы"}
-        </div>
-        <div className="section-block">
-          <label className="row">
-            <input
-              type="checkbox"
-              checked={s.autoUpdateRuntime !== false}
-              onChange={(e) => void saveNow({ ...s, autoUpdateRuntime: e.target.checked })}
-            />
-            Автообновление llama.cpp (тихо, не чаще раза в 24 часа)
-          </label>
-          <label style={{ display: "block", marginTop: 12 }}>
-            GitHub Token (необязательно — снимает лимит API)
-            <input
-              className="input"
-              type="password"
-              autoComplete="off"
-              placeholder="ghp_..."
-              value={s.githubToken || ""}
-              onChange={(e) => queueSave({ ...s, githubToken: e.target.value })}
-            />
-          </label>
-          <div className="row" style={{ marginTop: 12 }}>
-            <label className="row">
+        <div className="section-block" style={{ marginTop: 0 }}>
+          <label className="field">
+            <span className="field-label">OpenAI-прокси</span>
+            <div className="field-row">
+              <label className="row">
+                <input
+                  type="checkbox"
+                  checked={s.openaiProxyEnabled}
+                  onChange={(e) => void saveNow({ ...s, openaiProxyEnabled: e.target.checked })}
+                />
+                Включить для внешних клиентов
+              </label>
               <input
-                type="checkbox"
-                checked={s.openaiProxyEnabled}
-                onChange={(e) => void saveNow({ ...s, openaiProxyEnabled: e.target.checked })}
+                className="input"
+                style={{ width: 110 }}
+                type="number"
+                title="Порт прокси"
+                value={s.openaiProxyPort}
+                onChange={(e) => queueSave({ ...s, openaiProxyPort: Number(e.target.value) })}
               />
-              Прокси OpenAI-совместимый
-            </label>
-            <input
-              className="input"
-              style={{ width: 100 }}
-              type="number"
-              value={s.openaiProxyPort}
-              onChange={(e) => queueSave({ ...s, openaiProxyPort: Number(e.target.value) })}
-            />
-          </div>
+            </div>
+          </label>
         </div>
-      </section>
+      </SettingsSection>
 
-      <section className="card">
-        <h3>Веб-поиск</h3>
-        <div className="row" style={{ marginTop: 10 }}>
-          <select
-            className="select"
-            style={{ width: 200 }}
-            value={s.webSearchProvider}
-            onChange={(e) =>
-              void saveNow({
-                ...s,
-                webSearchProvider: e.target.value as AppSettings["webSearchProvider"],
-              })
-            }
-          >
-            <option value="duckduckgo">DuckDuckGo</option>
-            <option value="searxng">SearXNG</option>
-          </select>
-          <input
-            className="input"
-            placeholder="URL SearXNG (если выбран)"
-            value={s.searxngUrl || ""}
-            onChange={(e) => queueSave({ ...s, searxngUrl: e.target.value })}
-          />
-        </div>
-      </section>
-
-      <section className="card">
-        <h3>Параметры генерации по умолчанию</h3>
-        <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-          Используются для новых диалогов. В чате можно переопределить для сессии. Значения
-          context / maxTokens / ngl можно подобрать кнопкой «Подобрать под мой ПК» выше.
-        </p>
-        <div className="grid-2" style={{ marginTop: 10 }}>
+      <SettingsSection
+        id="defaults"
+        title="Ответ модели по умолчанию"
+        description="Для новых чатов. Context / max tokens / GPU layers удобнее задать в блоке нагрузки."
+      >
+        <div className="grid-2">
           {(
             [
               ["temperature", s.defaultParams.temperature],
@@ -820,8 +690,8 @@ export function SettingsPage(props: {
               ["gpuLayers", s.defaultParams.gpuLayers],
             ] as const
           ).map(([key, value]) => (
-            <label key={key}>
-              {paramLabel(key)}
+            <label key={key} className="field">
+              <span className="field-label">{paramLabel(key)}</span>
               <input
                 className="input"
                 type="number"
@@ -839,21 +709,21 @@ export function SettingsPage(props: {
               />
             </label>
           ))}
-          <label className="row" style={{ alignItems: "center", marginTop: 8 }}>
-            <input
-              type="checkbox"
-              checked={Boolean(s.defaultParams.flashAttn)}
-              onChange={(e) =>
-                queueSave({
-                  ...s,
-                  defaultParams: { ...s.defaultParams, flashAttn: e.target.checked },
-                })
-              }
-            />
-            Flash Attention по умолчанию
-          </label>
         </div>
-      </section>
+        <label className="row">
+          <input
+            type="checkbox"
+            checked={Boolean(s.defaultParams.flashAttn)}
+            onChange={(e) =>
+              queueSave({
+                ...s,
+                defaultParams: { ...s.defaultParams, flashAttn: e.target.checked },
+              })
+            }
+          />
+          Flash Attention по умолчанию
+        </label>
+      </SettingsSection>
 
       <ModelAdvancedSettings
         open={advancedOpen}
@@ -866,9 +736,10 @@ export function SettingsPage(props: {
         models={models}
         loadedModelId={loadedModelId}
         focusModelId={preferModelId() || null}
+        activeSessionId={props.activeSessionId}
         setError={props.setError}
         onHint={setProfileHint}
       />
-    </div>
+    </PageShell>
   );
 }
