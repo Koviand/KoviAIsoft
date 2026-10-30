@@ -1,127 +1,77 @@
 # KoviAIsoft
 
-Локальный desktop-чат и агент для Windows: свои GGUF-модели через `llama.cpp`, без облака.
+Локальное Windows-приложение для работы с языковыми моделями **на своём ПК**: чат, загрузка GGUF и агент, который может править файлы и запускать команды — без отправки данных в облако.
 
-Стек: Electron + React + TypeScript (pnpm monorepo). Агент — Hermes-подобный JSON tool-loop с планом, подтверждениями и Windows-песочницей.
-
-**Репозиторий:** https://github.com/Koviand/KoviAIsoft
+Репозиторий: [github.com/Koviand/KoviAIsoft](https://github.com/Koviand/KoviAIsoft)
 
 ---
 
-## Возможности
+## Зачем это
 
-| Область | Что умеет |
-|--------|-----------|
-| **Runtime** | Автоопределение GPU/CPU, установка/обновление `llama.cpp` (CUDA / Vulkan / CPU), в т.ч. архитектуры вроде LFM3 |
-| **Модели** | Скан локальных GGUF, рекомендации под VRAM/RAM, скачивание с Hugging Face (встроенный HF CLI в portable), выбор папки загрузки, удаление с диска |
-| **Чат** | Стриминг, параметры генерации, system prompt, сжатие истории / working memory |
-| **Агент** | План, инструменты (файлы, терминал, поиск, браузер), `@agent` / авто-intent, подтверждение опасных действий, force-write для coding-задач |
-| **Безопасность** | Path sandbox + junctions, cwd shell ⊆ project/modelRoots, deny `cd` вне roots, SSRF в браузере, таймаут подтверждений |
-| **Прочее** | MCP, OpenAI-совместимый локальный proxy, монитор VRAM/tok/s, темы UI, онбординг |
+Нужен свой «LM Studio + Cursor-подобный агент» в одной portable-папке: поставил EXE, скачал модель, загрузил в память и работаешь офлайн (сеть нужна только для загрузки моделей/runtime и web-инструментов агента).
 
 ---
 
-## Требования
+## Что умеет программа
 
-- Windows x64
-- Node.js 20+
-- pnpm 9+
-- GPU NVIDIA/AMD или CPU — по железу
+### Runtime и железо
+Автоопределение системы и установка подходящего билда **llama.cpp** (CUDA / Vulkan / CPU), в том числе под архитектуры вроде LFM3. Тихое обновление runtime, монитор VRAM / tok/s / контекста.
 
----
+### Модели
+- Сканирование локальных `.gguf`
+- Рекомендации квантов под ваш VRAM/RAM
+- Скачивание с **Hugging Face** (в portable уже лежит встроенный HF CLI)
+- Выбор папки загрузки, проверка целостности GGUF, удаление модели с диска
+- Профили загрузки (баланс / мало VRAM / CPU / подбор под ПК)
 
-## Быстрый старт (portable)
+### Чат
+Стриминг ответов, параметры генерации, system prompt, сжатие длинной истории и удержание цели/плана (working memory), чтобы модель реже «теряла» задачу.
 
-Сборка одной папки, которую можно копировать на другой ПК:
+### Агент
+Гермес-подобный цикл с планом и инструментами:
+- чтение/запись файлов, патчи, поиск по проекту
+- терминал (адаптация команд под Windows)
+- веб-поиск, браузер (Playwright), MCP
+- `@agent …` или автоопределение coding/tool-задач
+- подтверждение опасных действий (Ask / Auto-safe / Full), таймаут ожидания ответа
 
-```bash
-pnpm install
-pnpm pack
-```
+### Безопасность и локальность
+Доступ к диску ограничен папкой проекта и корнями моделей; shell не уходит `cd` за пределы разрешённых путей; браузер блокирует SSRF (в т.ч. redirect на приватные IP). Токены HF/GitHub — по желанию, для gated-репозиториев и лимитов API.
 
-Результат: `release\KoviAIsoft-Portable\`
-
-| Путь | Назначение |
-|------|------------|
-| `KoviAIsoft.exe` | Запуск |
-| `data\` | Настройки, чаты, runtime |
-| `tools\hf\` | Встроенный Hugging Face CLI (preseed при pack) |
-| `playwright-browsers\` | Chromium для агента |
-| `resources\ui\` | UI |
-
-Также появляется single-file portable в `release\builder-out\`.
-
-`pnpm pack` перед сборкой делает `taskkill` для `KoviAIsoft.exe`, чтобы разблокировать папку release.
+### Интерфейс
+Онбординг при первом запуске, несколько цветовых тем, единый чат с timeline процесса агента, настройки доступа и MCP.
 
 ---
 
-## Разработка
+## Как пользоваться (кратко)
 
-```bash
-git clone https://github.com/Koviand/KoviAIsoft.git
-cd KoviAIsoft
-pnpm install
-```
+1. Установить runtime (экран **Runtime**).
+2. На **Моделях** указать папку, скачать или найти GGUF → **Загрузить в память**.
+3. В **Настройках** выбрать папку проекта (и при желании `AGENTS.md` в корне проекта).
+4. В **Чате** общаться как обычно; для кода и правок файлов — `@agent …`.
+5. Открыть **Монитор**, если нужны метрики во время работы.
 
-Браузерные инструменты агента (один раз):
-
-```bash
-pnpm playwright:install
-```
-
-Два терминала:
-
-```bash
-pnpm dev:ui
-pnpm dev:desktop
-```
-
-Проверки:
-
-```bash
-pnpm typecheck
-pnpm test
-```
-
-CI: `.github/workflows/ci.yml` (Windows: typecheck + test).
-
-Данные в dev: обычно `%APPDATA%\KoviAIsoft\` (в portable — `data\` рядом с EXE).
+Остановка генерации — **Stop** в верхней панели.
 
 ---
 
-## Сценарий использования
+## Для разработчиков
 
-1. **Runtime** → установить llama.cpp (или дождаться тихого автообновления).
-2. **Модели** → выбрать папку загрузки / сканирования → скачать GGUF с HF или указать локальные файлы → **Загрузить в память**.
-3. **Настройки** → папка проекта (для агента и `AGENTS.md`), режим подтверждений (Ask / Auto-safe / Full), тема.
-4. **Чат** → обычный диалог; для кода и файлов — `@agent …` или включённые tools у сессии (intent routing тоже может включить агента).
-5. **Монитор** → VRAM, tok/s, контекст.
+Установка зависимостей, сборка portable EXE, dev-режим и тесты — в **[INSTALL.md](INSTALL.md)**.
 
-Остановка генерации — кнопка Stop в topbar.
-
----
-
-## Структура репозитория
+Структура кода:
 
 ```
-apps/ui          — React UI
-apps/desktop     — Electron main / preload
-packages/core    — агент, чат, runtime, tools, HF, store
-packages/shared  — типы и IPC-контракт
-scripts/         — pack-portable и smoke
-tests/           — vitest
+apps/ui          UI (React)
+apps/desktop     Electron
+packages/core    агент, чат, runtime, tools
+packages/shared  типы и IPC
+scripts/         pack и smoke
+tests/           vitest
 ```
 
 ---
 
-## Заметки
+## Статус
 
-- Только локальные модели; токены HF/GitHub опциональны (gated-репо / rate limit).
-- Агент адаптирует Unix-команды под Windows (`cmd` / PowerShell); запись кода через heredoc запрещена — используйте `write_file`.
-- Если `git push` просит credentials: `gh auth login` или SSH/PAT.
-
----
-
-## Лицензия / статус
-
-Проект в активной разработке (`0.1.0`). Issues и PR — в GitHub-репозитории выше.
+Версия `0.1.0`, активная разработка. Issues и PR — на GitHub.
