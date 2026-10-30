@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   formatLlmFetchError,
+  isLlmTruncatedError,
+  LlmTruncatedError,
   pickCompletionText,
 } from "../packages/core/src/chat/llmErrors";
 
@@ -20,6 +22,14 @@ describe("formatLlmFetchError", () => {
     const abort = new Error("aborted");
     abort.name = "AbortError";
     expect(formatLlmFetchError(abort, null).message).toBe("Отменено");
+  });
+
+  it("keeps truncation as soft LlmTruncatedError", () => {
+    const t = new LlmTruncatedError();
+    expect(isLlmTruncatedError(t)).toBe(true);
+    const mapped = formatLlmFetchError(t, null);
+    expect(isLlmTruncatedError(mapped)).toBe(true);
+    expect(mapped.message).toMatch(/обрезан|max_tokens/i);
   });
 });
 

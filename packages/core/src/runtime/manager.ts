@@ -69,6 +69,12 @@ export class RuntimeManager {
   /** Ring buffer of recent llama-server stdout/stderr for diagnostics. */
   private serverLog = "";
   private updateInfo: RuntimeUpdateInfo | null = null;
+  /**
+   * Cached llama-server constraint support for agent JSON
+   * (null = unknown, try; false = failed previously this process).
+   */
+  jsonSchemaOk: boolean | null = null;
+  grammarOk: boolean | null = null;
   private onProgress?: ProgressFn;
   private ensurePromise: Promise<{
     updated: boolean;
@@ -587,6 +593,8 @@ export class RuntimeManager {
   }
 
   async stopServer(): Promise<void> {
+    this.jsonSchemaOk = null;
+    this.grammarOk = null;
     if (!this.process) {
       this.port = null;
       this.loadedModelId = null;

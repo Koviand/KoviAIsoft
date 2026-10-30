@@ -206,8 +206,14 @@ export async function downloadHfFile(
   ensureDir(modelDir);
   const dest = path.join(modelDir, path.basename(filePath));
   const url = `https://huggingface.co/${modelId}/resolve/main/${filePath}`;
-  // Token is primarily for HF CLI gated repos; HTTP path uses public resolve URL.
-  await downloadFile(url, dest, onProgress);
+  const headers: Record<string, string> = {
+    "User-Agent": "KoviAIsoft",
+    Accept: "application/octet-stream",
+  };
+  if (opts.token?.trim()) {
+    headers.Authorization = `Bearer ${opts.token.trim()}`;
+  }
+  await downloadFile(url, dest, onProgress, undefined, undefined, headers);
   return { path: dest, via: "http" };
 }
 

@@ -226,6 +226,8 @@ export function App() {
             settings={state.settings}
             setSettings={state.setSettings}
             setError={state.setError}
+            models={state.models}
+            loadedModelId={state.runtime?.loadedModelId ?? null}
           />
         )}
       </main>

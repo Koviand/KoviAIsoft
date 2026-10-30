@@ -68,6 +68,21 @@ async function bundleMain() {
       "chromium-bidi",
       "@modelcontextprotocol/sdk",
       "@modelcontextprotocol/sdk/*",
+      // Native ONNX bindings — must stay outside the esbuild bundle.
+      "@huggingface/transformers",
+      "onnxruntime-node",
+      "sharp",
+    ],
+    plugins: [
+      {
+        name: "external-native-node",
+        setup(build) {
+          build.onResolve({ filter: /\.node$/ }, (args) => ({
+            path: args.path,
+            external: true,
+          }));
+        },
+      },
     ],
     sourcemap: false,
     logLevel: "info",
@@ -101,19 +116,29 @@ async function bundleMain() {
 function resolveLockedVersion(pkgName) {
   try {
     const lock = JSON.parse(fs.readFileSync(path.join(root, "pnpm-lock.yaml"), "utf8"));
-    // pnpm lock v9: packages["/@scope/name@version"] — fall back to desktop package.json
+    // pnpm lock v9: packages["/@scope/name@version"] — fall back to package.json
     void lock;
   } catch {
     // ignore
   }
+  const pkgFiles = [
+    path.join(desktop, "package.json"),
+    path.join(root, "packages", "core", "package.json"),
+    path.join(root, "package.json"),
+  ];
+  for (const file of pkgFiles) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+      const raw = pkg.devDependencies?.[pkgName] || pkg.dependencies?.[pkgName];
+      if (typeof raw === "string") return raw.replace(/^\^/, "");
+    } catch {
+      // try next
+    }
+  }
   try {
-    const desktopPkg = JSON.parse(
-      fs.readFileSync(path.join(desktop, "package.json"), "utf8"),
-    );
-    const fromDev = desktopPkg.devDependencies?.[pkgName];
-    const fromDep = desktopPkg.dependencies?.[pkgName];
-    const raw = fromDev || fromDep;
-    if (typeof raw === "string") return raw.replace(/^\^/, "");
+    const resolved = path.join(root, "node_modules", ...pkgName.split("/"), "package.json");
+    const installed = JSON.parse(fs.readFileSync(resolved, "utf8"));
+    if (typeof installed.version === "string") return installed.version;
   } catch {
     // ignore
   }
@@ -122,6 +147,7 @@ function resolveLockedVersion(pkgName) {
     "electron-builder": "25.1.8",
     playwright: "1.50.1",
     "@modelcontextprotocol/sdk": "1.6.1",
+    "@huggingface/transformers": "3.8.1",
   };
   return fallback[pkgName] || "0.0.0";
 }
@@ -131,6 +157,7 @@ function stagePackageJson() {
   const builderVer = resolveLockedVersion("electron-builder");
   const playwrightVer = resolveLockedVersion("playwright");
   const mcpVer = resolveLockedVersion("@modelcontextprotocol/sdk");
+  const transformersVer = resolveLockedVersion("@huggingface/transformers");
   const rootPkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
   writeJson(path.join(stage, "package.json"), {
     name: "kovi-ai-soft",
@@ -140,8 +167,13 @@ function stagePackageJson() {
     description: "KoviAIsoft portable",
     author: "Kovi",
     dependencies: {
+      "@huggingface/transformers": transformersVer,
       "@modelcontextprotocol/sdk": mcpVer,
       "extract-zip": "2.0.1",
+      "onnxruntime-node":
+        resolveLockedVersion("onnxruntime-node") !== "0.0.0"
+          ? resolveLockedVersion("onnxruntime-node")
+          : "1.21.0",
       playwright: playwrightVer,
       uuid: "11.0.5",
       zod: "3.24.1",
@@ -168,7 +200,12 @@ function stagePackageJson() {
         "!**/node_modules/*/{test,tests,__tests__}/**",
       ],
       asar: true,
-      asarUnpack: ["**/node_modules/playwright/**", "**/node_modules/playwright-core/**"],
+      asarUnpack: [
+        "**/node_modules/playwright/**",
+        "**/node_modules/playwright-core/**",
+        "**/node_modules/onnxruntime-node/**",
+        "**/node_modules/@huggingface/transformers/**",
+      ],
       extraResources: [
         {
           from: path.join(root, "apps", "ui", "dist"),

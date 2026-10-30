@@ -134,11 +134,16 @@ export function ProcessTimeline(props: {
 
         {props.plan.length > 0 ? (
           <div className="process-block plan-list">
-            <strong>План</strong>
+            <strong>План · чеклист</strong>
             {props.plan.map((p) => (
               <div key={p.id} className={`plan-item status-${p.status}`}>
                 <span className="plan-status">{statusRu(p.status)}</span>
-                <span>{p.title}</span>
+                <span>
+                  <span className="muted mono" style={{ marginRight: 6 }}>
+                    {p.id}.
+                  </span>
+                  {p.title}
+                </span>
                 {p.detail ? <span className="muted process-detail">{p.detail}</span> : null}
               </div>
             ))}

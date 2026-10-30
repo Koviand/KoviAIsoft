@@ -13,6 +13,26 @@ import {
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_BUFFER = 4 * 1024 * 1024;
 
+/** Active shell child PIDs (for AgentLoop.cancel → kill process tree). */
+const activeShellPids = new Set<number>();
+
+function trackShellPid(pid: number | undefined): void {
+  if (typeof pid === "number" && pid > 0) activeShellPids.add(pid);
+}
+
+function untrackShellPid(pid: number | undefined): void {
+  if (typeof pid === "number") activeShellPids.delete(pid);
+}
+
+/** Kill all in-flight run_terminal process trees (best-effort). */
+export function cancelActiveTerminals(): void {
+  const pids = [...activeShellPids];
+  activeShellPids.clear();
+  for (const pid of pids) {
+    killProcessTree(pid);
+  }
+}
+
 function killProcessTree(pid: number): void {
   try {
     if (process.platform === "win32") {
@@ -353,6 +373,7 @@ function execCapture(
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
+    trackShellPid(child.pid);
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -362,6 +383,7 @@ function execCapture(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      untrackShellPid(child.pid);
       fn();
     };
 
@@ -426,19 +448,26 @@ async function runViaPowerShell(command: string, cwd: string): Promise<ShellResu
     .trim();
 
   // Model already used -File / -EncodedCommand — pass through without wrapping -Command.
+  if (/^-EncodedCommand\b/i.test(body) || /^-enc\b/i.test(body)) {
+    return {
+      code: 1,
+      stdout: "",
+      stderr:
+        "PowerShell -EncodedCommand запрещён (обход sandbox). Используйте обычную команду.",
+    };
+  }
   const fileM = body.match(/^-File\s+(.+)$/i);
   if (fileM) {
     return execCapture(
       exe,
-      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", fileM[1]!.trim().replace(/^["']|["']$/g, "")],
-      cwd,
-    );
-  }
-  const encM = body.match(/^-EncodedCommand\s+(\S+)$/i);
-  if (encM) {
-    return execCapture(
-      exe,
-      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encM[1]!],
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        fileM[1]!.trim().replace(/^["']|["']$/g, ""),
+      ],
       cwd,
     );
   }

@@ -1,7 +1,31 @@
+/** Soft failure: completion hit max_tokens — agent loop should nudge and continue. */
+export class LlmTruncatedError extends Error {
+  readonly truncated = true as const;
+  constructor(message?: string) {
+    super(
+      message ||
+        "Ответ LLM обрезан по max_tokens (finish_reason=length). Разбейте код на несколько write_file или увеличьте maxTokens/context.",
+    );
+    this.name = "LlmTruncatedError";
+  }
+}
+
+export function isLlmTruncatedError(err: unknown): boolean {
+  return (
+    err instanceof LlmTruncatedError ||
+    (err instanceof Error &&
+      (/finish_reason=length|обрезан по max_tokens|LlmTruncatedError/i.test(err.message) ||
+        err.name === "LlmTruncatedError"))
+  );
+}
+
 /** Map opaque Node/Electron fetch failures to actionable Russian errors. */
 export function formatLlmFetchError(err: unknown, baseUrl: string | null): Error {
   if (err instanceof Error && err.name === "AbortError") {
     return new Error("Отменено");
+  }
+  if (isLlmTruncatedError(err)) {
+    return err instanceof Error ? err : new LlmTruncatedError(String(err));
   }
   const raw = err instanceof Error ? err.message : String(err);
   // Keep our own already-localized diagnostics.

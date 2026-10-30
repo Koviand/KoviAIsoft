@@ -5,6 +5,10 @@ import type {
   AppView,
   ChatMessage,
   ChatSession,
+  CodebaseIndexStatus,
+  EmbeddingModelId,
+  EmbeddingModelInfo,
+  EmbeddingStatus,
   GenerationParams,
   HfFile,
   HfSearchResult,
@@ -38,6 +42,7 @@ export const IPC = {
   getModelRecommendations: "kovi:getModelRecommendations",
   suggestHardwareLoadSettings: "kovi:suggestHardwareLoadSettings",
   applyHardwareLoadSettings: "kovi:applyHardwareLoadSettings",
+  applyLoadProfileToSettings: "kovi:applyLoadProfileToSettings",
   searchHf: "kovi:searchHf",
   listHfFiles: "kovi:listHfFiles",
   downloadHfFile: "kovi:downloadHfFile",
@@ -68,6 +73,12 @@ export const IPC = {
   checkMcpHealth: "kovi:checkMcpHealth",
   verifyGguf: "kovi:verifyGguf",
   previewFileDiff: "kovi:previewFileDiff",
+  getCodebaseIndexStatus: "kovi:getCodebaseIndexStatus",
+  reindexCodebase: "kovi:reindexCodebase",
+  listEmbeddingModels: "kovi:listEmbeddingModels",
+  getEmbeddingStatus: "kovi:getEmbeddingStatus",
+  downloadEmbeddingModel: "kovi:downloadEmbeddingModel",
+  setEmbeddingModel: "kovi:setEmbeddingModel",
   runtimeProgress: "kovi:runtimeProgress",
   downloadProgress: "kovi:downloadProgress",
   chatToken: "kovi:chatToken",
@@ -171,11 +182,17 @@ export interface KoviApi {
   getModelRecommendations(): Promise<ModelRecommendationsReport>;
   suggestHardwareLoadSettings(opts?: {
     modelId?: string;
+    tier?: "fast" | "balanced" | "quality";
   }): Promise<HardwareLoadSuggestion>;
   applyHardwareLoadSettings(opts?: {
     modelId?: string;
     applyBackend?: boolean;
     applyDefaultParams?: boolean;
+  }): Promise<AppSettings>;
+  /** Activate a load profile and sync defaultParams (context/ngl/maxTokens/flash). */
+  applyLoadProfileToSettings(opts: {
+    profileId: string;
+    modelId?: string;
   }): Promise<AppSettings>;
   searchHf(query: string): Promise<HfSearchResult[]>;
   listHfFiles(modelId: string): Promise<HfFile[]>;
@@ -211,6 +228,16 @@ export interface KoviApi {
   checkMcpHealth(server?: McpServerConfig): Promise<McpHealthResult[]>;
   verifyGguf(modelId: string): Promise<LocalModel>;
   previewFileDiff(path: string, content: string): Promise<string>;
+  getCodebaseIndexStatus(): Promise<CodebaseIndexStatus>;
+  reindexCodebase(): Promise<CodebaseIndexStatus>;
+  listEmbeddingModels(): Promise<EmbeddingModelInfo[]>;
+  getEmbeddingStatus(): Promise<EmbeddingStatus>;
+  downloadEmbeddingModel(id: EmbeddingModelId): Promise<EmbeddingModelInfo>;
+  setEmbeddingModel(id: EmbeddingModelId): Promise<{
+    settings: AppSettings;
+    status: EmbeddingStatus;
+    index: CodebaseIndexStatus;
+  }>;
   onRuntimeProgress(cb: (p: { progress: number; label: string }) => void): () => void;
   onDownloadProgress(cb: (p: { progress: number; label: string }) => void): () => void;
   onChatToken(cb: (p: { sessionId: string; text: string; thinking?: boolean }) => void): () => void;

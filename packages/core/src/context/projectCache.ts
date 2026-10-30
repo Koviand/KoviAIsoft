@@ -44,7 +44,7 @@ export class ProjectContextCache {
     query: string,
     opts: RetrieveOptions = {},
   ): Promise<RetrievedSnippet[]> {
-    const key = `${projectRoot}|${query}|${opts.maxFiles ?? 8}|${opts.maxBytesPerFile ?? 4500}|${opts.maxTotalBytes ?? 20_000}`;
+    const key = `${projectRoot}|${query}|${opts.maxFiles ?? 8}|${opts.maxBytesPerFile ?? 4500}|${opts.maxTotalBytes ?? 20_000}|sem=${opts.forceSemantic ? 1 : 0}`;
     const hit = this.retrieveCache.get(key);
     if (hit && hit.expiresAt > Date.now()) return hit.value;
     const value = await retrieveProjectContext(projectRoot, query, opts);

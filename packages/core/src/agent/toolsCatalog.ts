@@ -169,8 +169,8 @@ export function toolsPromptBlock(
     ...extras.map((t) => `- ${t.name}: ${t.description || "MCP tool"}`),
   ];
   const rules = opts?.compact
-    ? `Формат: JSON {"thought","tool":{"name","args"}|null,"final"|null}. Код только write_file. Windows/cmd: dir, type, call npm, python; пути C:/… или relative. Без bash/export/<<EOF.`
-    : `Формат ответа на каждом шаге — строго JSON в обычном тексте ответа (не в reasoning/thinking):
+    ? `Строго JSON {"thought","plan?","tool"|null,"final"|null}. Сначала plan (3–7, tool=null), потом один tool/шаг; plan не переписывать. Код — write_file кусками. Windows/cmd без bash.`
+    : `Формат ответа на каждом шаге — строго один JSON-объект (сервер может требовать schema):
 {
   "thought": "краткие рассуждения",
   "plan": [{"id":"1","title":"..."}],
@@ -179,12 +179,16 @@ export function toolsPromptBlock(
 }
 Запрещены XML/Hermes tool_call и bash-heredoc — только JSON с tool.name из списка ниже.
 
-Правила:
-- Если нужно создать/изменить код или файлы — ОБЯЗАТЕЛЬНО вызывай write_file / apply_patch. Не клади длинный код в final.
-- После plan сразу вызови write_file с ПОЛНЫМ кодом в args.content (не skeleton из 5–10 строк).
-- list_dir / read_file не считаются выполнением задачи. final/finish только после реальной записи рабочих файлов.
+Двухфазный режим:
+1) ФАЗА ПЛАНА (первый ответ): только plan из 3–7 коротких пунктов, tool=null, final=null.
+2) ФАЗА ИСПОЛНЕНИЯ: план УЖЕ зафиксирован системой — НЕ меняй plan. Один tool за шаг по current_step. final только когда пункты сделаны (или остался «итог»).
+
+Правила исполнения:
+- Если нужно создать/изменить код или файлы — ОБЯЗАТЕЛЬНО write_file / apply_patch. Не клади длинный код в final.
+- Не пихай всю игру/приложение в один JSON-шаг: ~80–150 строк за write_file, дальше модули отдельными шагами.
+- list_dir / read_file не считаются выполнением кодинг-задачи. final/finish только после реальной записи рабочих файлов.
 - Не выдумывай, что файл уже создан: сначала write_file, потом final с путём и командой запуска.
-- final — короткий итог (пути, как запустить), без огромных листингов.
+- final — короткий итог (пути, как запустить), без огромных листингов. thought — 1–2 предложения, без кода.
 - Если нужен инструмент — заполни tool и оставь final=null.
 - ОС Windows (cmd.exe по умолчанию):
   • OK: dir, type, del, copy, mkdir, call npm test, call npx …, python main.py, git status, set "VAR=1" && call npm test
@@ -194,6 +198,6 @@ export function toolsPromptBlock(
 - Пути в args: относительно проекта или C:/Users/Name/proj (слэш /). В JSON один \\ = "\\\\". Не учетверяй слэши. Unix-пути в command не исправляются — используй relative или C:/.
 - Пустой cwd = папка проекта. Не удаляй корень проекта.
 - Код пиши только через write_file/apply_patch, не через echo/cat/heredoc в shell.
-- В system уже есть карта проекта и автоподобранные фрагменты (как @codebase в Cursor). Уточняй через search/read_file; можно опираться на пути из карты.`;
+- В system уже есть карта проекта и семантический @codebase (CPU-эмбеддинги) + keyword/rg. Пиши @codebase в запросе пользователя или опирайся на retrieved. Уточняй через search/read_file.`;
   return `Доступные инструменты:\n${all.join("\n")}\n\n${rules}`;
 }

@@ -1,4 +1,4 @@
-node_modules/
+﻿node_modules/
 dist/
 out/
 release/
@@ -15,3 +15,6 @@ playwright/.cache/
 apps/desktop/dist-electron/
 apps/ui/dist/
 packages/*/dist/
+*.tgz
+.tmp-*
+/monitorPreload.js

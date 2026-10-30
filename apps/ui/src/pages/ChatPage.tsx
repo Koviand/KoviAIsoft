@@ -10,7 +10,7 @@ import { paramLabel } from "../lib/labels";
 
 const PROMPT_CHIPS = [
   "Кратко объясни, что умеет этот чат",
-  "Помоги настроить локальную модель",
+  "@codebase где точка входа приложения?",
   "@agent проверь runtime и статус сервера",
 ];
 
@@ -646,14 +646,14 @@ export function ChatPage(props: {
           <div className="composer">
             <div className="composer-toolbar">
               <span className="muted composer-hint">
-                Один чат: ответы и действия с инструментами. Для явного запуска tools — префикс
-                @agent. Enter — отправить, Shift+Enter — новая строка.
+                Один чат: ответы и действия. @codebase — семантический поиск по проекту, @agent —
+                tools. Enter — отправить, Shift+Enter — новая строка.
               </span>
             </div>
             <textarea
               className="textarea composer-input"
               value={input}
-              placeholder="Спросите или попросите сделать…"
+              placeholder="Спросите… или @codebase / @agent …"
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
@@ -663,6 +663,17 @@ export function ChatPage(props: {
               }}
             />
             <div className="composer-actions">
+              <button
+                className="btn ghost"
+                type="button"
+                disabled={props.busy}
+                title="Вставить @codebase"
+                onClick={() =>
+                  setInput((v) => (v.includes("@codebase") ? v : `@codebase ${v}`.trim()))
+                }
+              >
+                @codebase
+              </button>
               <button
                 className="btn primary"
                 type="button"

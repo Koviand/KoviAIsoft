@@ -1,19 +1,94 @@
 import { useEffect, useRef, useState } from "react";
-import type { AppSettings, HardwareLoadSuggestion } from "@kovi/shared";
+import type {
+  AppSettings,
+  CodebaseIndexStatus,
+  EmbeddingModelId,
+  EmbeddingModelInfo,
+  HardwareLoadSuggestion,
+  LocalModel,
+} from "@kovi/shared";
 import { AUTO_PC_PROFILE_ID, THEME_PRESET_OPTIONS } from "@kovi/shared";
 import { api } from "../api";
 import { paramLabel } from "../lib/labels";
+import { ModelAdvancedSettings } from "../components/ModelAdvancedSettings";
+
+const TIER_IDS = ["fast", "balanced", "quality"] as const;
+
+const EMBED_OPTIONS: Array<{
+  id: EmbeddingModelId;
+  title: string;
+  blurb: string;
+}> = [
+  {
+    id: "minilm",
+    title: "MiniLM (all-MiniLM-L6-v2)",
+    blurb: "Лёгкая · dim 384 · CPU · быстрее индексирует",
+  },
+  {
+    id: "lfm25",
+    title: "LFM2.5-Embedding-350M",
+    blurb: "Качественнее · dim 1024 · GGUF · больше RAM",
+  },
+];
 
 export function SettingsPage(props: {
   settings: AppSettings | null;
   setSettings: (s: AppSettings) => void;
   setError: (e: string | null) => void;
+  models?: LocalModel[];
+  loadedModelId?: string | null;
 }) {
   const [draft, setDraft] = useState<AppSettings | null>(props.settings);
   const [saving, setSaving] = useState(false);
   const [hwPreview, setHwPreview] = useState<HardwareLoadSuggestion | null>(null);
   const [hwBusy, setHwBusy] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [models, setModels] = useState<LocalModel[]>(props.models || []);
+  const [loadedModelId, setLoadedModelId] = useState<string | null>(
+    props.loadedModelId ?? null,
+  );
+  const [profileHint, setProfileHint] = useState<string | null>(null);
+  const [indexStatus, setIndexStatus] = useState<CodebaseIndexStatus | null>(null);
+  const [indexBusy, setIndexBusy] = useState(false);
+  const [embedModels, setEmbedModels] = useState<EmbeddingModelInfo[]>([]);
+  const [embedBusyId, setEmbedBusyId] = useState<EmbeddingModelId | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function refreshEmbeddingStatus(): void {
+    void api
+      .getEmbeddingStatus()
+      .then((st) => setEmbedModels(st.models))
+      .catch(() => undefined);
+  }
+
+  useEffect(() => {
+    void api
+      .getCodebaseIndexStatus()
+      .then(setIndexStatus)
+      .catch(() => undefined);
+    refreshEmbeddingStatus();
+  }, [props.settings?.projectRoot, props.settings?.embeddingModelId]);
+
+  useEffect(() => {
+    if (props.models) setModels(props.models);
+  }, [props.models]);
+
+  useEffect(() => {
+    if (props.loadedModelId !== undefined) setLoadedModelId(props.loadedModelId);
+  }, [props.loadedModelId]);
+
+  useEffect(() => {
+    if (props.models && props.loadedModelId !== undefined) return;
+    void api.listModels().then(setModels).catch(() => undefined);
+    void api
+      .getRuntimeStatus()
+      .then((r) => setLoadedModelId(r.loadedModelId))
+      .catch(() => undefined);
+  }, [props.models, props.loadedModelId]);
+
+  function preferModelId(): string | undefined {
+    return loadedModelId || models[0]?.id || undefined;
+  }
 
   useEffect(() => {
     setDraft(props.settings);
@@ -121,7 +196,8 @@ export function SettingsPage(props: {
       <section className="card">
         <h3>Режим подтверждений агента</h3>
         <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-          Ask — спрашивать medium/high; Auto-safe — тихо в папке проекта; Full — почти без диалогов.
+          Ask — medium/high; Auto-safe — medium в проекте без спроса; Full — без medium, но shell/browser/high
+          всё равно спрашиваем.
         </p>
         <div className="row" style={{ marginTop: 10 }}>
           {(
@@ -239,22 +315,108 @@ export function SettingsPage(props: {
       </section>
 
       <section className="card">
-        <h3>Профили загрузки модели</h3>
+        <h3>Уровень нагрузки</h3>
         <p className="muted" style={{ margin: "6px 0 0", fontSize: "0.82rem" }}>
-          GPU layers / context / flash-attn при «Загрузить в память». Кнопка ниже также предложит
-          параметры чата (ctx, maxTokens) и лимит шагов агента под VRAM/RAM — без автоприменения.
+          Быстро / Баланс / Качество подстраиваются под VRAM. «Под этот ПК» пересчитывает уровни и
+          активирует баланс. Смена профиля синхронизирует defaultParams.
         </p>
-        <div className="row" style={{ marginTop: 10, flexWrap: "wrap" }}>
-          {(s.loadProfiles || []).map((p) => (
-            <button
-              key={p.id}
-              type="button"
-              className={`btn ${s.activeLoadProfileId === p.id ? "primary" : ""}`}
-              onClick={() => void saveNow({ ...s, activeLoadProfileId: p.id })}
-            >
-              {p.name}
-            </button>
-          ))}
+        <div className="row" style={{ marginTop: 10, flexWrap: "wrap", gap: 8 }}>
+          {TIER_IDS.map((id) => {
+            const p = (s.loadProfiles || []).find((x) => x.id === id);
+            const label =
+              id === "fast" ? "Быстро" : id === "quality" ? "Качество" : "Баланс";
+            return (
+              <button
+                key={id}
+                type="button"
+                className={`btn ${s.activeLoadProfileId === id ? "primary" : ""}`}
+                style={{ minWidth: 110, padding: "12px 16px" }}
+                disabled={hwBusy || saving}
+                title={p ? `ngl ${p.gpuLayers} · ctx ${p.context}` : undefined}
+                onClick={() => {
+                  setHwBusy(true);
+                  void api
+                    .applyLoadProfileToSettings({
+                      profileId: id,
+                      modelId: preferModelId(),
+                    })
+                    .then((saved) => {
+                      props.setSettings(saved);
+                      setDraft(saved);
+                      setProfileHint(
+                        loadedModelId
+                          ? "Профиль применён. Перезагрузите модель, чтобы сменить ngl/ctx."
+                          : `Активен уровень «${label}»`,
+                      );
+                    })
+                    .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
+                    .finally(() => setHwBusy(false));
+                }}
+              >
+                {label}
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            className={`btn ${s.activeLoadProfileId === AUTO_PC_PROFILE_ID ? "primary" : "ghost"}`}
+            style={{ minWidth: 110, padding: "12px 16px" }}
+            disabled={hwBusy || saving}
+            onClick={() => {
+              setHwBusy(true);
+              void api
+                .applyHardwareLoadSettings({
+                  modelId: preferModelId(),
+                  applyBackend: true,
+                  applyDefaultParams: true,
+                })
+                .then((saved) => {
+                  props.setSettings(saved);
+                  setDraft(saved);
+                  setHwPreview(null);
+                  setProfileHint(
+                    loadedModelId
+                      ? "Под ПК применено. Перезагрузите модель."
+                      : "Настройки под этот ПК применены",
+                  );
+                })
+                .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
+                .finally(() => setHwBusy(false));
+            }}
+          >
+            Под этот ПК
+          </button>
+          {(s.loadProfiles || [])
+            .filter(
+              (p) =>
+                !TIER_IDS.includes(p.id as (typeof TIER_IDS)[number]) &&
+                p.id !== AUTO_PC_PROFILE_ID,
+            )
+            .map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                className={`btn ghost ${s.activeLoadProfileId === p.id ? "primary" : ""}`}
+                disabled={hwBusy || saving}
+                onClick={() => {
+                  setHwBusy(true);
+                  void api
+                    .applyLoadProfileToSettings({
+                      profileId: p.id,
+                      modelId: preferModelId(),
+                    })
+                    .then((saved) => {
+                      props.setSettings(saved);
+                      setDraft(saved);
+                      setProfileHint(`Активен профиль «${p.name}»`);
+                    })
+                    .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
+                    .finally(() => setHwBusy(false));
+                }}
+              >
+                {p.name}
+              </button>
+            ))}
           <button
             type="button"
             className="btn"
@@ -262,15 +424,28 @@ export function SettingsPage(props: {
             onClick={() => {
               setHwBusy(true);
               void api
-                .suggestHardwareLoadSettings()
+                .suggestHardwareLoadSettings({ modelId: preferModelId() })
                 .then(setHwPreview)
                 .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
                 .finally(() => setHwBusy(false));
             }}
           >
-            Подобрать под мой ПК
+            Превью под ПК
+          </button>
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={saving}
+            onClick={() => setAdvancedOpen(true)}
+          >
+            Параметры…
           </button>
         </div>
+        {profileHint && (
+          <div className="muted" style={{ marginTop: 8, fontSize: "0.82rem" }} role="status">
+            {profileHint}
+          </div>
+        )}
         {(() => {
           const active = (s.loadProfiles || []).find((p) => p.id === s.activeLoadProfileId);
           if (!active) return null;
@@ -279,7 +454,9 @@ export function SettingsPage(props: {
               ngl {active.gpuLayers} · ctx {active.context}
               {active.flashAttn ? " · flash-attn" : ""}
               {active.maxTokens != null ? ` · maxTokens ${active.maxTokens}` : ""}
-              {active.id === AUTO_PC_PROFILE_ID ? " · hardware-aware" : ""}
+              {active.hardwareAware || active.id === AUTO_PC_PROFILE_ID
+                ? " · hardware-aware"
+                : ""}
             </div>
           );
         })()}
@@ -307,6 +484,7 @@ export function SettingsPage(props: {
                   setHwBusy(true);
                   void api
                     .applyHardwareLoadSettings({
+                      modelId: preferModelId(),
                       applyBackend: true,
                       applyDefaultParams: true,
                     })
@@ -329,6 +507,7 @@ export function SettingsPage(props: {
                   setHwBusy(true);
                   void api
                     .applyHardwareLoadSettings({
+                      modelId: preferModelId(),
                       applyBackend: true,
                       applyDefaultParams: false,
                     })
@@ -389,7 +568,140 @@ export function SettingsPage(props: {
         </div>
         <p className="muted" style={{ marginTop: 8, fontSize: "0.82rem" }}>
           Файл <code>AGENTS.md</code> в корне проекта подхватывается агентом автоматически.
+          Семантический индекс <code>@codebase</code> лежит в{" "}
+          <code>.kovi/codebase-index/</code>.
         </p>
+        <h4 style={{ marginTop: 16, marginBottom: 6 }}>Модель эмбеддингов (@codebase)</h4>
+        <p className="muted" style={{ margin: 0, fontSize: "0.82rem" }}>
+          Смена модели пересобирает индекс. LFM тяжелее по RAM; для чата нужен отдельный
+          llama-server runtime.
+        </p>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
+            gap: 10,
+            marginTop: 10,
+          }}
+        >
+          {EMBED_OPTIONS.map((opt) => {
+            const info = embedModels.find((m) => m.id === opt.id);
+            const active = (s.embeddingModelId || "minilm") === opt.id;
+            const installed = Boolean(info?.installed);
+            const busy = embedBusyId === opt.id || (indexBusy && active);
+            return (
+              <div
+                key={opt.id}
+                style={{
+                  border: active ? "2px solid var(--accent, #2a4bff)" : "1px solid var(--border, #c8ced8)",
+                  borderRadius: 10,
+                  padding: "12px 14px",
+                  background: active ? "color-mix(in srgb, var(--accent, #2a4bff) 8%, transparent)" : "transparent",
+                }}
+              >
+                <div style={{ fontWeight: 600 }}>{opt.title}</div>
+                <div className="muted" style={{ fontSize: "0.78rem", marginTop: 4 }}>
+                  {opt.blurb}
+                </div>
+                <div className="muted mono" style={{ fontSize: "0.75rem", marginTop: 6 }}>
+                  {installed ? "скачана" : "не скачана"}
+                  {info?.ready === false && info?.error
+                    ? ` · ошибка: ${info.error}`
+                    : info?.error
+                      ? ` · ${info.error}`
+                      : ""}
+                  {active ? " · активна" : ""}
+                </div>
+                <div className="row" style={{ marginTop: 10, flexWrap: "wrap", gap: 8 }}>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={installed || embedBusyId !== null}
+                    onClick={() => {
+                      setEmbedBusyId(opt.id);
+                      void api
+                        .downloadEmbeddingModel(opt.id)
+                        .then(() => {
+                          refreshEmbeddingStatus();
+                          setProfileHint(`Эмбеддинги: ${opt.title} скачана`);
+                        })
+                        .catch((e) =>
+                          props.setError(e instanceof Error ? e.message : String(e)),
+                        )
+                        .finally(() => setEmbedBusyId(null));
+                    }}
+                  >
+                    {busy && !active ? "Скачивание…" : installed ? "Уже скачана" : "Скачать"}
+                  </button>
+                  <button
+                    type="button"
+                    className={`btn ${active ? "primary" : ""}`}
+                    disabled={active || embedBusyId !== null || indexBusy}
+                    onClick={() => {
+                      setEmbedBusyId(opt.id);
+                      setIndexBusy(true);
+                      void api
+                        .setEmbeddingModel(opt.id)
+                        .then((res) => {
+                          props.setSettings(res.settings);
+                          setDraft(res.settings);
+                          setEmbedModels(res.status.models);
+                          setIndexStatus(res.index);
+                          setProfileHint(
+                            res.index.error
+                              ? `Индекс: ${res.index.error}`
+                              : `Эмбеддер ${opt.title} · индекс ${res.index.chunkCount} чанков`,
+                          );
+                        })
+                        .catch((e) =>
+                          props.setError(e instanceof Error ? e.message : String(e)),
+                        )
+                        .finally(() => {
+                          setEmbedBusyId(null);
+                          setIndexBusy(false);
+                        });
+                    }}
+                  >
+                    {busy && active ? "Активация…" : active ? "Выбрана" : "Выбрать"}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="row" style={{ marginTop: 12, flexWrap: "wrap", gap: 8 }}>
+          <button
+            type="button"
+            className="btn"
+            disabled={!s.projectRoot || indexBusy}
+            onClick={() => {
+              setIndexBusy(true);
+              void api
+                .reindexCodebase()
+                .then((st) => {
+                  setIndexStatus(st);
+                  setProfileHint(
+                    st.error
+                      ? `Индекс: ${st.error}`
+                      : `Индекс @codebase: ${st.chunkCount} чанков`,
+                  );
+                })
+                .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
+                .finally(() => setIndexBusy(false));
+            }}
+          >
+            {indexBusy ? "Индексация…" : "Переиндексировать @codebase"}
+          </button>
+          {indexStatus && (
+            <span className="muted mono" style={{ fontSize: "0.78rem" }}>
+              {indexStatus.indexing
+                ? "строится…"
+                : indexStatus.ready
+                  ? `готов · ${indexStatus.chunkCount} чанков`
+                  : indexStatus.error || "нет индекса"}
+            </span>
+          )}
+        </div>
       </section>
 
       <section className="card">
@@ -542,6 +854,21 @@ export function SettingsPage(props: {
           </label>
         </div>
       </section>
+
+      <ModelAdvancedSettings
+        open={advancedOpen}
+        onClose={() => setAdvancedOpen(false)}
+        settings={s}
+        setSettings={(saved) => {
+          props.setSettings(saved);
+          setDraft(saved);
+        }}
+        models={models}
+        loadedModelId={loadedModelId}
+        focusModelId={preferModelId() || null}
+        setError={props.setError}
+        onHint={setProfileHint}
+      />
     </div>
   );
 }

@@ -25,6 +25,7 @@ export async function downloadFile(
   onProgress?: ProgressFn,
   expectedSha?: string,
   expectedSize?: number,
+  extraHeaders?: Record<string, string>,
 ): Promise<void> {
   ensureDir(path.dirname(destPath));
   // Remove partial leftovers from previous failed attempts.
@@ -34,6 +35,7 @@ export async function downloadFile(
     headers: {
       "User-Agent": "KoviAIsoft",
       Accept: "application/octet-stream",
+      ...extraHeaders,
     },
     redirect: "follow",
   });

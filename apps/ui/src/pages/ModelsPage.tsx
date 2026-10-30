@@ -12,6 +12,9 @@ import type {
 } from "@kovi/shared";
 import { AUTO_PC_PROFILE_ID } from "@kovi/shared";
 import { api } from "../api";
+import { ModelAdvancedSettings } from "../components/ModelAdvancedSettings";
+
+const TIER_PROFILE_IDS = ["fast", "balanced", "quality"] as const;
 
 function fmtGb(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
@@ -73,6 +76,12 @@ export function ModelsPage(props: {
   const [hwPreview, setHwPreview] = useState<HardwareLoadSuggestion | null>(null);
   const [hwBusy, setHwBusy] = useState(false);
   const [hfCli, setHfCli] = useState<HfCliStatus | null>(null);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [focusModelId, setFocusModelId] = useState<string | null>(null);
+
+  function preferModelId(): string | undefined {
+    return props.loadedModelId || focusModelId || props.models[0]?.id || undefined;
+  }
 
   async function loadRecommendations(): Promise<void> {
     setRecsLoading(true);
@@ -166,6 +175,14 @@ export function ModelsPage(props: {
     setWorking(true);
     setHint(`Загрузка «${name}» в llama-server…`);
     try {
+      try {
+        const bar = await api.getStatusBar();
+        if (bar.busy) {
+          throw new Error("Сначала остановите генерацию или агента, затем загрузите модель");
+        }
+      } catch (e) {
+        if (e instanceof Error && /остановите/i.test(e.message)) throw e;
+      }
       await api.loadModel(modelId);
       await props.refresh();
       setHint(`«${name}» загружена — можно писать в чате`);
@@ -218,8 +235,16 @@ export function ModelsPage(props: {
   async function setProfile(id: string): Promise<void> {
     if (!props.settings) return;
     try {
-      const saved = await api.saveSettings({ ...props.settings, activeLoadProfileId: id });
+      const saved = await api.applyLoadProfileToSettings({
+        profileId: id,
+        modelId: preferModelId(),
+      });
       props.setSettings(saved);
+      if (props.loadedModelId) {
+        setHint("Профиль применён. Перезагрузите модель, чтобы сменить ngl/ctx.");
+      } else {
+        setHint(`Профиль «${saved.loadProfiles.find((p) => p.id === id)?.name || id}» активен`);
+      }
     } catch (e) {
       props.setError(e instanceof Error ? e.message : String(e));
     }
@@ -242,7 +267,9 @@ export function ModelsPage(props: {
     setHwBusy(true);
     setHint(null);
     try {
-      setHwPreview(await api.suggestHardwareLoadSettings());
+      setHwPreview(
+        await api.suggestHardwareLoadSettings({ modelId: preferModelId() }),
+      );
     } catch (e) {
       props.setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -254,13 +281,16 @@ export function ModelsPage(props: {
     setHwBusy(true);
     try {
       const saved = await api.applyHardwareLoadSettings({
+        modelId: preferModelId(),
         applyBackend: true,
         applyDefaultParams: true,
       });
       props.setSettings(saved);
       setHwPreview(null);
       setHint(
-        `Под ПК: ngl ${saved.loadProfiles.find((p) => p.id === AUTO_PC_PROFILE_ID)?.gpuLayers}, ctx ${saved.defaultParams.context}, maxTokens ${saved.defaultParams.maxTokens}, агент ${saved.agentMaxSteps} шагов.`,
+        `Под ПК: ngl ${saved.loadProfiles.find((p) => p.id === AUTO_PC_PROFILE_ID)?.gpuLayers}, ctx ${saved.defaultParams.context}, maxTokens ${saved.defaultParams.maxTokens}, агент ${saved.agentMaxSteps} шагов.${
+          props.loadedModelId ? " Перезагрузите модель." : ""
+        }`,
       );
     } catch (e) {
       props.setError(e instanceof Error ? e.message : String(e));
@@ -271,6 +301,15 @@ export function ModelsPage(props: {
 
   const profiles = props.settings?.loadProfiles || [];
   const activeProfileId = props.settings?.activeLoadProfileId;
+  const tierProfiles = TIER_PROFILE_IDS.map(
+    (id) => profiles.find((p) => p.id === id) || null,
+  ).filter(Boolean) as typeof profiles;
+  const otherProfiles = profiles.filter(
+    (p) =>
+      !TIER_PROFILE_IDS.includes(p.id as (typeof TIER_PROFILE_IDS)[number]) &&
+      p.id !== AUTO_PC_PROFILE_ID,
+  );
+  const autoPc = profiles.find((p) => p.id === AUTO_PC_PROFILE_ID);
   // Show greens/yellows first, keep a few reds so «не пойдёт» видно.
   const topRecs = (recs?.items || []).slice(0, 12);
 
@@ -418,31 +457,75 @@ export function ModelsPage(props: {
         </div>
       </section>
 
-      {profiles.length > 0 && (
-        <section className="card">
-          <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap" }}>
-            <strong>Профиль загрузки</strong>
-            <div className="row" style={{ flexWrap: "wrap" }}>
-              {profiles.map((p) => (
-                <button
-                  key={p.id}
-                  type="button"
-                  className={`btn ${activeProfileId === p.id ? "primary" : "ghost"}`}
-                  disabled={working}
-                  onClick={() => void setProfile(p.id)}
-                  title={
-                    p.id === AUTO_PC_PROFILE_ID
-                      ? `ngl ${p.gpuLayers} · ctx ${p.context}${p.flashAttn ? " · flash" : ""}`
-                      : undefined
-                  }
-                >
-                  {p.name}
-                </button>
-              ))}
-            </div>
+      <section className="card">
+        <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <strong>Уровень нагрузки</strong>
+            <p className="muted" style={{ margin: "4px 0 0", fontSize: "0.78rem" }}>
+              Быстро / Баланс / Качество — hardware-aware. «Под этот ПК» пересчитывает все уровни.
+            </p>
           </div>
-        </section>
-      )}
+          <button
+            className="btn"
+            type="button"
+            disabled={!props.settings || working}
+            onClick={() => {
+              setFocusModelId(preferModelId() || null);
+              setAdvancedOpen(true);
+            }}
+          >
+            Параметры…
+          </button>
+        </div>
+        <div className="row" style={{ marginTop: 12, flexWrap: "wrap", gap: 8 }}>
+          {(tierProfiles.length
+            ? tierProfiles
+            : [
+                { id: "fast", name: "Быстро", gpuLayers: 99, context: 4096, flashAttn: true },
+                { id: "balanced", name: "Баланс", gpuLayers: 99, context: 8192, flashAttn: false },
+                { id: "quality", name: "Качество", gpuLayers: 99, context: 16384, flashAttn: true },
+              ]
+          ).map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              className={`btn ${activeProfileId === p.id ? "primary" : ""}`}
+              style={{ minWidth: 110, padding: "12px 16px" }}
+              disabled={working || hwBusy}
+              onClick={() => void setProfile(p.id)}
+              title={`ngl ${p.gpuLayers} · ctx ${p.context}${p.flashAttn ? " · flash" : ""}`}
+            >
+              {p.name}
+            </button>
+          ))}
+          <button
+            type="button"
+            className={`btn ${activeProfileId === AUTO_PC_PROFILE_ID ? "primary" : "ghost"}`}
+            style={{ minWidth: 110, padding: "12px 16px" }}
+            disabled={working || hwBusy}
+            onClick={() => void applyHardware()}
+            title={
+              autoPc
+                ? `ngl ${autoPc.gpuLayers} · ctx ${autoPc.context}`
+                : "Пересчитать под железо"
+            }
+          >
+            Под этот ПК
+          </button>
+          {otherProfiles.map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              className={`btn ghost ${activeProfileId === p.id ? "primary" : ""}`}
+              disabled={working || hwBusy}
+              onClick={() => void setProfile(p.id)}
+              title={`ngl ${p.gpuLayers} · ctx ${p.context}`}
+            >
+              {p.name}
+            </button>
+          ))}
+        </div>
+      </section>
 
       {hint && (
         <div className="page-hint" role="status">
@@ -499,6 +582,17 @@ export function ModelsPage(props: {
                       onClick={() => void load(m.id, m.name)}
                     >
                       {loaded ? "Перезагрузить" : "Загрузить в память"}
+                    </button>
+                    <button
+                      className="btn ghost"
+                      type="button"
+                      disabled={working || !props.settings}
+                      onClick={() => {
+                        setFocusModelId(m.id);
+                        setAdvancedOpen(true);
+                      }}
+                    >
+                      Параметры…
                     </button>
                     <button
                       className="btn ghost"
@@ -666,6 +760,20 @@ export function ModelsPage(props: {
           )}
         </section>
       </div>
+
+      {props.settings && (
+        <ModelAdvancedSettings
+          open={advancedOpen}
+          onClose={() => setAdvancedOpen(false)}
+          settings={props.settings}
+          setSettings={props.setSettings}
+          models={props.models}
+          loadedModelId={props.loadedModelId}
+          focusModelId={focusModelId}
+          setError={props.setError}
+          onHint={setHint}
+        />
+      )}
     </div>
   );
 }

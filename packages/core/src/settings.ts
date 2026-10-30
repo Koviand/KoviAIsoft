@@ -1,9 +1,51 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { AppSettings, LoadProfile } from "@kovi/shared";
-import { createDefaultSettings, DEFAULT_LOAD_PROFILES, isThemePreset } from "@kovi/shared";
+import {
+  createDefaultSettings,
+  DEFAULT_LOAD_PROFILES,
+  isThemePreset,
+  migrateLoadProfileId,
+} from "@kovi/shared";
 import { writeFileAtomic, writeFileAtomicSync } from "./fsAtomic.js";
 import { getSettingsPath, ensureDir, getModelsDir } from "./paths.js";
+
+const LEGACY_PROFILE_IDS = new Set(["max-quality", "low-vram"]);
+
+function migrateLoadProfiles(profiles: LoadProfile[]): LoadProfile[] {
+  const mapped = profiles.map((p) => {
+    const id = migrateLoadProfileId(p.id) || p.id;
+    if (id === p.id) return p;
+    const name =
+      id === "quality" ? "Качество" : id === "fast" ? "Быстро" : p.name;
+    return { ...p, id, name, hardwareAware: p.hardwareAware ?? true };
+  });
+  const byId = new Map<string, LoadProfile>();
+  for (const p of mapped) {
+    if (!byId.has(p.id)) byId.set(p.id, p);
+  }
+  // If user still only has legacy set without new defaults, ensure core tiers exist.
+  const hasLegacyOnly =
+    profiles.some((p) => LEGACY_PROFILE_IDS.has(p.id)) &&
+    !profiles.some((p) => p.id === "fast" || p.id === "quality");
+  if (hasLegacyOnly || !byId.has("fast") || !byId.has("balanced") || !byId.has("quality")) {
+    for (const d of DEFAULT_LOAD_PROFILES) {
+      if (!byId.has(d.id)) byId.set(d.id, { ...d });
+    }
+  }
+  // Prefer canonical order: fast, balanced, quality, then others (cpu, auto-pc, custom).
+  const order = ["fast", "balanced", "quality", "cpu", "auto-pc"];
+  const ordered: LoadProfile[] = [];
+  for (const id of order) {
+    const p = byId.get(id);
+    if (p) {
+      ordered.push(p);
+      byId.delete(id);
+    }
+  }
+  for (const p of byId.values()) ordered.push(p);
+  return ordered;
+}
 
 export class SettingsStore {
   private appData: string;
@@ -29,10 +71,16 @@ export class SettingsStore {
   }
 
   private mergePartial(defaults: AppSettings, parsed: Partial<AppSettings>): AppSettings {
-    const loadProfiles: LoadProfile[] =
+    const loadProfiles: LoadProfile[] = migrateLoadProfiles(
       parsed.loadProfiles?.length
         ? parsed.loadProfiles
-        : DEFAULT_LOAD_PROFILES.map((p) => ({ ...p }));
+        : DEFAULT_LOAD_PROFILES.map((p) => ({ ...p })),
+    );
+    const rawActive =
+      typeof parsed.activeLoadProfileId === "string" || parsed.activeLoadProfileId === null
+        ? parsed.activeLoadProfileId ?? null
+        : defaults.activeLoadProfileId;
+    const activeLoadProfileId = migrateLoadProfileId(rawActive);
     return {
       ...defaults,
       ...parsed,
@@ -76,13 +124,14 @@ export class SettingsStore {
           ? parsed.agentRiskMode
           : defaults.agentRiskMode,
       loadProfiles,
-      activeLoadProfileId:
-        typeof parsed.activeLoadProfileId === "string" || parsed.activeLoadProfileId === null
-          ? parsed.activeLoadProfileId ?? null
-          : defaults.activeLoadProfileId,
+      activeLoadProfileId,
       sessionFolders: Array.isArray(parsed.sessionFolders)
         ? parsed.sessionFolders.filter((f) => typeof f === "string")
         : [],
+      embeddingModelId:
+        parsed.embeddingModelId === "minilm" || parsed.embeddingModelId === "lfm25"
+          ? parsed.embeddingModelId
+          : defaults.embeddingModelId,
     };
   }
 

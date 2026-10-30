@@ -354,6 +354,9 @@ function registerIpc(svc: AppService): void {
   ipcMain.handle(IPC.applyHardwareLoadSettings, (_e, opts) =>
     svc.applyHardwareLoadSettings(opts),
   );
+  ipcMain.handle(IPC.applyLoadProfileToSettings, (_e, opts) =>
+    svc.applyLoadProfileToSettings(opts),
+  );
   ipcMain.handle(IPC.searchHf, (_e, query) => svc.searchHf(query));
   ipcMain.handle(IPC.listHfFiles, (_e, modelId) => svc.listHfFiles(modelId));
   ipcMain.handle(IPC.downloadHfFile, (_e, modelId, filePath) =>
@@ -442,6 +445,12 @@ function registerIpc(svc: AppService): void {
   ipcMain.handle(IPC.getErrorLog, () => svc.getErrorLog());
   ipcMain.handle(IPC.checkMcpHealth, (_e, server) => svc.checkMcpHealth(assertMcpServer(server)));
   ipcMain.handle(IPC.verifyGguf, (_e, modelId: string) => svc.verifyGguf(modelId));
+  ipcMain.handle(IPC.getCodebaseIndexStatus, () => svc.getCodebaseIndexStatus());
+  ipcMain.handle(IPC.reindexCodebase, () => svc.reindexCodebase());
+  ipcMain.handle(IPC.listEmbeddingModels, () => svc.listEmbeddingModels());
+  ipcMain.handle(IPC.getEmbeddingStatus, () => svc.getEmbeddingStatus());
+  ipcMain.handle(IPC.downloadEmbeddingModel, (_e, id) => svc.downloadEmbeddingModel(id));
+  ipcMain.handle(IPC.setEmbeddingModel, (_e, id) => svc.setEmbeddingModel(id));
   ipcMain.handle(IPC.previewFileDiff, (_e, filePath: string, content: string) => {
     if (typeof filePath !== "string" || !filePath.trim()) {
       throw new Error("filePath обязателен");

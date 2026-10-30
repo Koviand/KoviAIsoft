@@ -3,6 +3,7 @@ import {
   estimateTokens,
   truncateToTokens,
 } from "../chat/contextBudget.js";
+import { detectCodingTask } from "../agent/intent.js";
 import { loadProjectMemory } from "../agent/projectMemory.js";
 import { projectContextCache } from "./projectCache.js";
 import { formatRetrievedSnippets } from "./retrieve.js";
@@ -127,7 +128,10 @@ export async function buildProjectContext(
   let filesMapped = 0;
 
   if (projectRoot) {
+    const forceSemantic =
+      /@codebase\b/i.test(input.userQuery) || detectCodingTask(input.userQuery);
     const snippets = await projectContextCache.getRetrieved(projectRoot, input.userQuery, {
+      forceSemantic,
       maxFiles: ctx >= 12000 ? 8 : 5,
       maxBytesPerFile: ctx >= 12000 ? 4500 : 2800,
       maxTotalBytes: ctx >= 12000 ? 20_000 : 12_000,

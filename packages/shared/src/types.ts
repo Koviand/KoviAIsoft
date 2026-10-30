@@ -297,6 +297,17 @@ export interface HardwareLoadSuggestion {
   agentMaxSteps: number;
 }
 
+/** Status of the local semantic @codebase index. */
+export interface CodebaseIndexStatus {
+  ready: boolean;
+  indexing: boolean;
+  root: string | null;
+  chunkCount: number;
+  modelId: string;
+  updatedAt: string | null;
+  error: string | null;
+}
+
 /** How to download GGUF from Hugging Face. */
 export type HfDownloadMethod = "auto" | "cli" | "http";
 
@@ -385,6 +396,30 @@ export interface SessionExportBundle {
   messages: ChatMessage[];
 }
 
+/** Local embedding backends for semantic @codebase index. */
+export type EmbeddingModelId = "minilm" | "lfm25";
+
+export type EmbeddingBackend = "transformers" | "llama-embeddings";
+
+export interface EmbeddingModelInfo {
+  id: EmbeddingModelId;
+  label: string;
+  dim: number;
+  backend: EmbeddingBackend;
+  /** Weights / GGUF present on disk. */
+  installed: boolean;
+  /** Can run embedTexts (installed + runtime deps). */
+  ready: boolean;
+  sizeHint: string;
+  error: string | null;
+  hfId: string;
+}
+
+export interface EmbeddingStatus {
+  activeId: EmbeddingModelId;
+  models: EmbeddingModelInfo[];
+}
+
 export interface AppSettings {
   language: "ru" | "en";
   themePreset: ThemePreset;
@@ -424,6 +459,8 @@ export interface AppSettings {
   activeLoadProfileId: string | null;
   /** Known session folder labels (UI catalog). */
   sessionFolders: string[];
+  /** Active local embedding model for @codebase. */
+  embeddingModelId: EmbeddingModelId;
 }
 
 export const DEFAULT_GENERATION_PARAMS: GenerationParams = {
@@ -440,28 +477,31 @@ export const DEFAULT_GENERATION_PARAMS: GenerationParams = {
 
 export const DEFAULT_LOAD_PROFILES: LoadProfile[] = [
   {
+    id: "fast",
+    name: "Быстро",
+    gpuLayers: 99,
+    context: 4096,
+    flashAttn: true,
+    maxTokens: 1024,
+    hardwareAware: true,
+  },
+  {
     id: "balanced",
     name: "Баланс",
     gpuLayers: 99,
     context: 8192,
     flashAttn: false,
     maxTokens: 2048,
+    hardwareAware: true,
   },
   {
-    id: "max-quality",
-    name: "Макс. качество",
+    id: "quality",
+    name: "Качество",
     gpuLayers: 99,
     context: 16384,
     flashAttn: true,
     maxTokens: 4096,
-  },
-  {
-    id: "low-vram",
-    name: "Мало VRAM",
-    gpuLayers: 20,
-    context: 4096,
-    flashAttn: false,
-    maxTokens: 1024,
+    hardwareAware: true,
   },
   {
     id: "cpu",
@@ -472,6 +512,14 @@ export const DEFAULT_LOAD_PROFILES: LoadProfile[] = [
     maxTokens: 1024,
   },
 ];
+
+/** Map legacy profile ids after DEFAULT_LOAD_PROFILES rename. */
+export function migrateLoadProfileId(id: string | null | undefined): string | null {
+  if (id == null) return null;
+  if (id === "max-quality") return "quality";
+  if (id === "low-vram") return "fast";
+  return id;
+}
 
 export const DEFAULT_THEME_CUSTOM: ThemeCustom = {
   accent: "#2a4bff",
@@ -539,5 +587,6 @@ export function createDefaultSettings(appData: string): AppSettings {
     loadProfiles: DEFAULT_LOAD_PROFILES.map((p) => ({ ...p })),
     activeLoadProfileId: "balanced",
     sessionFolders: [],
+    embeddingModelId: "minilm",
   };
 }

@@ -11,7 +11,10 @@ export async function verifyGgufFile(filePath: string): Promise<{
   try {
     const st = await fsp.stat(filePath);
     if (!st.isFile()) return { ok: false, error: "Путь не является файлом" };
-    if (st.size < 24) return { ok: false, error: "Файл слишком маленький для GGUF" };
+    // Real GGUF weights are megabytes+; tiny files are HTML/error pages or stubs.
+    if (st.size < 64 * 1024) {
+      return { ok: false, error: `Файл слишком маленький для GGUF (${st.size} байт)` };
+    }
     const fh = await fsp.open(filePath, "r");
     try {
       const buf = Buffer.alloc(4);
@@ -32,7 +35,9 @@ export function verifyGgufSync(filePath: string): { ok: boolean; error?: string 
   try {
     const st = fs.statSync(filePath);
     if (!st.isFile()) return { ok: false, error: "Путь не является файлом" };
-    if (st.size < 24) return { ok: false, error: "Файл слишком маленький для GGUF" };
+    if (st.size < 64 * 1024) {
+      return { ok: false, error: `Файл слишком маленький для GGUF (${st.size} байт)` };
+    }
     const fd = fs.openSync(filePath, "r");
     try {
       const buf = Buffer.alloc(4);

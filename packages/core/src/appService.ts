@@ -5,6 +5,10 @@ import type {
   AppSettings,
   ChatMessage,
   ChatSession,
+  CodebaseIndexStatus,
+  EmbeddingModelId,
+  EmbeddingModelInfo,
+  EmbeddingStatus,
   GenerationParams,
   HfFile,
   HfSearchResult,
@@ -31,11 +35,27 @@ import { detectAgentTask } from "./agent/intent.js";
 import { AgentLoop } from "./agent/loop.js";
 import { ChatEngine } from "./chat/engine.js";
 import { buildProjectContext } from "./context/packer.js";
+import {
+  downloadEmbeddingModel,
+  getEmbeddingStatus,
+  listEmbeddingModelsInfo,
+  resetEmbedder,
+  setEmbeddingRuntimeConfig,
+} from "./context/embedder.js";
+import { stopSharedEmbeddingServer } from "./context/embeddingServer.js";
+import {
+  ensureProjectIndex,
+  getCodebaseIndexStatus,
+  reindexCodebase,
+} from "./context/semanticIndex.js";
 import { Store } from "./db/store.js";
 import { McpManager } from "./mcp/manager.js";
 import {
+  buildHardwareTierProfiles,
   isAutoPcProfile,
+  mergeProfileIntoDefaultParams,
   suggestHardwareLoadProfile,
+  type LoadTier,
 } from "./models/hardwareProfile.js";
 import {
   annotateHfFilesWithFit,
@@ -197,9 +217,26 @@ export class AppService {
     });
   }
 
+  private applyEmbeddingConfig(s = this.settings.get()): void {
+    setEmbeddingRuntimeConfig({
+      modelId: s.embeddingModelId || "minilm",
+      appData: this.appData,
+      getServerPath: () => {
+        const st = this.runtime.getStatus();
+        return st.installed?.serverPath ?? null;
+      },
+      getHfToken: () => this.settings.get().hfToken?.trim() || undefined,
+      getDownloadMethod: () => this.settings.get().hfDownloadMethod || "auto",
+      onProgress: (progress, label) => {
+        this.onDownloadProgress?.({ progress, label });
+      },
+    });
+  }
+
   async init(): Promise<void> {
     const s = this.settings.get();
     this.applyRuntimeFetcherConfig(s);
+    this.applyEmbeddingConfig(s);
     await this.mcp.sync(s.mcpServers);
     if (s.openaiProxyEnabled) {
       await this.proxy.start(s.openaiProxyPort).catch(() => undefined);
@@ -214,12 +251,14 @@ export class AppService {
     } else {
       void this.runtime.checkUpdate(s.runtimeBackendPreference).catch(() => undefined);
     }
+    this.warmCodebaseIndex();
   }
 
   async dispose(): Promise<void> {
     await this.agent.dispose();
     await this.mcp.closeAll();
     await this.proxy.stop();
+    await stopSharedEmbeddingServer();
     await this.runtime.stopServer();
     this.store.close();
   }
@@ -251,6 +290,7 @@ export class AppService {
     const normalized: AppSettings = { ...next, downloadDir, modelRoots };
     const saved = await this.settings.save(normalized);
     this.applyRuntimeFetcherConfig(saved);
+    this.applyEmbeddingConfig(saved);
     if (JSON.stringify(prev.mcpServers) !== JSON.stringify(saved.mcpServers)) {
       await this.mcp.sync(saved.mcpServers);
     }
@@ -265,6 +305,9 @@ export class AppService {
       await this.proxy.start(saved.openaiProxyPort);
     }
     this.systemCache = null;
+    if (saved.projectRoot && saved.projectRoot !== prev.projectRoot) {
+      this.warmCodebaseIndex();
+    }
     return saved;
   }
 
@@ -346,18 +389,24 @@ export class AppService {
     return buildModelRecommendations(sys);
   }
 
+  private async resolveModelSizeGb(modelId?: string): Promise<number | undefined> {
+    if (!modelId) return undefined;
+    const model =
+      this.modelsCache.find((m) => m.id === modelId) ||
+      (await this.scanModels()).find((m) => m.id === modelId);
+    return model ? model.sizeBytes / 1024 ** 3 : undefined;
+  }
+
   async suggestHardwareLoadSettings(opts?: {
     modelId?: string;
+    tier?: LoadTier;
   }): Promise<HardwareLoadSuggestion> {
     const sys = await this.getSystemInfo();
-    let modelSizeGb: number | undefined;
-    if (opts?.modelId) {
-      const model =
-        this.modelsCache.find((m) => m.id === opts.modelId) ||
-        (await this.scanModels()).find((m) => m.id === opts.modelId);
-      if (model) modelSizeGb = model.sizeBytes / 1024 ** 3;
-    }
-    return suggestHardwareLoadProfile(sys, { modelSizeGb });
+    const modelSizeGb = await this.resolveModelSizeGb(opts?.modelId);
+    return suggestHardwareLoadProfile(sys, {
+      modelSizeGb,
+      tier: opts?.tier,
+    });
   }
 
   async applyHardwareLoadSettings(opts?: {
@@ -367,13 +416,30 @@ export class AppService {
   }): Promise<AppSettings> {
     const suggestion = await this.suggestHardwareLoadSettings({
       modelId: opts?.modelId,
+      tier: "balanced",
     });
+    // auto-pc profile uses balanced numbers but keeps the dedicated id/name.
+    const autoProfile = {
+      ...suggestion.profile,
+      id: AUTO_PC_PROFILE_ID,
+      name: "Под этот ПК",
+      hardwareAware: true,
+    };
+    const sys = await this.getSystemInfo();
+    const modelSizeGb = await this.resolveModelSizeGb(opts?.modelId);
+    const tiers = buildHardwareTierProfiles(sys, { modelSizeGb });
     const cur = this.settings.get();
-    const others = (cur.loadProfiles || []).filter((p) => p.id !== AUTO_PC_PROFILE_ID);
+    const keep = (cur.loadProfiles || []).filter(
+      (p) =>
+        p.id !== AUTO_PC_PROFILE_ID &&
+        p.id !== "fast" &&
+        p.id !== "balanced" &&
+        p.id !== "quality",
+    );
     const applyParams = opts?.applyDefaultParams !== false;
     const next: AppSettings = {
       ...cur,
-      loadProfiles: [...others, suggestion.profile],
+      loadProfiles: [...tiers, ...keep, autoProfile],
       activeLoadProfileId: AUTO_PC_PROFILE_ID,
       runtimeBackendPreference:
         opts?.applyBackend === false
@@ -390,6 +456,83 @@ export class AppService {
         : {}),
     };
     return this.settings.save(next);
+  }
+
+  /**
+   * Activate a named load profile and sync defaultParams load fields from it.
+   * Tier ids (fast/balanced/quality) are refreshed from current hardware.
+   */
+  async applyLoadProfileToSettings(opts: {
+    profileId: string;
+    modelId?: string;
+  }): Promise<AppSettings> {
+    const cur = this.settings.get();
+    const tierIds = new Set(["fast", "balanced", "quality"]);
+    let profiles = [...(cur.loadProfiles || [])];
+    let profile = profiles.find((p) => p.id === opts.profileId);
+    let agentMaxSteps = cur.agentMaxSteps;
+    let defaultParams = { ...cur.defaultParams };
+
+    if (tierIds.has(opts.profileId) || isAutoPcProfile(opts.profileId)) {
+      const tier: LoadTier =
+        opts.profileId === "fast" || opts.profileId === "quality"
+          ? opts.profileId
+          : "balanced";
+      const suggestion = await this.suggestHardwareLoadSettings({
+        modelId: opts.modelId,
+        tier,
+      });
+      if (isAutoPcProfile(opts.profileId)) {
+        profile = {
+          ...suggestion.profile,
+          id: AUTO_PC_PROFILE_ID,
+          name: "Под этот ПК",
+          hardwareAware: true,
+        };
+      } else {
+        profile = {
+          ...suggestion.profile,
+          id: opts.profileId,
+          name:
+            opts.profileId === "fast"
+              ? "Быстро"
+              : opts.profileId === "quality"
+                ? "Качество"
+                : "Баланс",
+          hardwareAware: true,
+        };
+      }
+      profiles = profiles.filter((p) => p.id !== profile!.id);
+      profiles.push(profile);
+      // Keep sibling tiers in sync when activating any hardware-aware tier.
+      if (tierIds.has(opts.profileId)) {
+        const sys = await this.getSystemInfo();
+        const modelSizeGb = await this.resolveModelSizeGb(opts.modelId);
+        const tiers = buildHardwareTierProfiles(sys, { modelSizeGb });
+        const keep = profiles.filter(
+          (p) => p.id !== "fast" && p.id !== "balanced" && p.id !== "quality",
+        );
+        profiles = [...tiers, ...keep];
+        profile = profiles.find((p) => p.id === opts.profileId) || profile;
+      }
+      defaultParams = {
+        ...defaultParams,
+        ...suggestion.defaultParams,
+      };
+      agentMaxSteps = suggestion.agentMaxSteps;
+    } else if (profile) {
+      defaultParams = mergeProfileIntoDefaultParams(defaultParams, profile);
+    } else {
+      throw new Error(`Профиль загрузки не найден: ${opts.profileId}`);
+    }
+
+    return this.settings.save({
+      ...cur,
+      loadProfiles: profiles,
+      activeLoadProfileId: opts.profileId,
+      defaultParams,
+      agentMaxSteps,
+    });
   }
 
   getHfCliStatus() {
@@ -476,6 +619,9 @@ export class AppService {
 
   async loadModel(modelId: string, params?: Partial<GenerationParams>): Promise<void> {
     const run = async (): Promise<void> => {
+      if (this.chat.isBusy() || this.agent.isRunning()) {
+        throw new Error("Сначала остановите генерацию или агента, затем загрузите модель");
+      }
       const model = this.modelsCache.find((m) => m.id === modelId);
       if (!model) throw new Error("Модель не найдена. Выполните сканирование.");
       if (model.integrityOk === false) {
@@ -485,28 +631,17 @@ export class AppService {
       }
       const settings = this.settings.get();
       const profile = settings.loadProfiles.find((p) => p.id === settings.activeLoadProfileId);
-      const hardwareAware =
-        Boolean(profile?.hardwareAware) || isAutoPcProfile(settings.activeLoadProfileId);
       let profileParams: Partial<GenerationParams> = {};
       if (profile) {
-        if (hardwareAware) {
-          // Respect per-model fit: take the safer (lower) of profile vs model estimate.
-          const nglModel = model.recommendedNgl ?? profile.gpuLayers;
-          const ctxModel = model.recommendedContext ?? profile.context;
-          profileParams = {
-            gpuLayers: Math.min(profile.gpuLayers, nglModel),
-            context: Math.min(profile.context, ctxModel),
-            flashAttn: profile.flashAttn,
-            maxTokens: profile.maxTokens ?? settings.defaultParams.maxTokens,
-          };
-        } else {
-          profileParams = {
-            gpuLayers: profile.gpuLayers,
-            context: profile.context,
-            flashAttn: profile.flashAttn,
-            maxTokens: profile.maxTokens ?? settings.defaultParams.maxTokens,
-          };
-        }
+        // B5: always clamp ngl/ctx to min(profile, model estimate) to reduce OOM.
+        const nglModel = model.recommendedNgl ?? profile.gpuLayers;
+        const ctxModel = model.recommendedContext ?? profile.context;
+        profileParams = {
+          gpuLayers: Math.min(profile.gpuLayers, nglModel),
+          context: Math.min(profile.context, ctxModel),
+          flashAttn: profile.flashAttn,
+          maxTokens: profile.maxTokens ?? settings.defaultParams.maxTokens,
+        };
       }
       const merged: GenerationParams = {
         ...DEFAULT_GENERATION_PARAMS,
@@ -516,7 +651,20 @@ export class AppService {
         ...profileParams,
         ...params,
       };
-      if (model.fitsInVram === false && merged.gpuLayers > 32) {
+      // Re-clamp after Advanced/IPC overrides (anti-OOM).
+      if (profile) {
+        merged.gpuLayers = Math.min(
+          merged.gpuLayers,
+          profile.gpuLayers,
+          model.recommendedNgl ?? merged.gpuLayers,
+        );
+        merged.context = Math.min(
+          merged.context,
+          profile.context,
+          model.recommendedContext ?? merged.context,
+        );
+      }
+      if (model.fitsInVram === false && merged.gpuLayers > 0) {
         this.pushErrorLog(
           "vram",
           `Модель ${model.name} может не влезть в VRAM (ngl=${merged.gpuLayers}, ctx=${merged.context}).`,
@@ -545,8 +693,19 @@ export class AppService {
     await next;
   }
 
-  unloadModel(): Promise<void> {
-    return this.runtime.stopServer();
+  async unloadModel(): Promise<void> {
+    const run = async () => {
+      if (this.chat.isBusy() || this.agent.isRunning()) {
+        throw new Error("Сначала остановите генерацию или агента");
+      }
+      await this.runtime.stopServer();
+    };
+    const next = this.loadModelChain.then(run, run);
+    this.loadModelChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    await next;
   }
 
   listSessions(): ChatSession[] {
@@ -658,7 +817,13 @@ export class AppService {
       }
       this.pushErrorLog(`chat:${sessionId}`, message);
       this.emitGeneration(sessionId, { type: "error", message });
-      throw err;
+      // Do not rethrow — IPC sendMessage.catch would duplicate the error event.
+      return {
+        id: `error-${Date.now()}`,
+        role: "assistant",
+        content: `(ошибка) ${message}`,
+        createdAt: new Date().toISOString(),
+      };
     }
   }
 
@@ -701,6 +866,21 @@ export class AppService {
   }
 
   async startAgent(sessionId: string, content: string): Promise<void> {
+    if (this.agent.isRunning() || this.agentStartLock) {
+      throw new Error("Агент уже выполняется");
+    }
+    const run = async () => {
+      await this.startAgentInner(sessionId, content);
+    };
+    const next = this.loadModelChain.then(run, run);
+    this.loadModelChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    await next;
+  }
+
+  private async startAgentInner(sessionId: string, content: string): Promise<void> {
     if (this.agent.isRunning() || this.agentStartLock) {
       throw new Error("Агент уже выполняется");
     }
@@ -815,6 +995,98 @@ export class AppService {
 
   previewFileDiff(filePath: string, content: string): string {
     return previewWriteDiff(filePath, content, this.getSettings());
+  }
+
+  getCodebaseIndexStatus(): CodebaseIndexStatus {
+    return getCodebaseIndexStatus();
+  }
+
+  listEmbeddingModels(): EmbeddingModelInfo[] {
+    this.applyEmbeddingConfig();
+    return listEmbeddingModelsInfo();
+  }
+
+  getEmbeddingStatus(): EmbeddingStatus {
+    this.applyEmbeddingConfig();
+    return getEmbeddingStatus();
+  }
+
+  async downloadEmbeddingModel(id: EmbeddingModelId): Promise<EmbeddingModelInfo> {
+    this.applyEmbeddingConfig();
+    return downloadEmbeddingModel(id);
+  }
+
+  async setEmbeddingModel(id: EmbeddingModelId): Promise<{
+    settings: AppSettings;
+    status: EmbeddingStatus;
+    index: CodebaseIndexStatus;
+  }> {
+    if (id !== "minilm" && id !== "lfm25") {
+      throw new Error(`Unknown embedding model: ${id}`);
+    }
+    const prev = this.settings.get();
+    const next = await this.settings.save({ ...prev, embeddingModelId: id });
+    this.applyEmbeddingConfig(next);
+    await resetEmbedder();
+    this.applyEmbeddingConfig(next);
+    const models = listEmbeddingModelsInfo();
+    const info = models.find((m) => m.id === id);
+    if (!info?.installed) {
+      await downloadEmbeddingModel(id);
+    }
+    const index = await this.reindexCodebase();
+    return {
+      settings: this.settings.get(),
+      status: getEmbeddingStatus(),
+      index,
+    };
+  }
+
+  async reindexCodebase(): Promise<CodebaseIndexStatus> {
+    const root = this.settings.get().projectRoot;
+    if (!root) {
+      return {
+        ready: false,
+        indexing: false,
+        root: null,
+        chunkCount: 0,
+        modelId: "",
+        updatedAt: null,
+        error: "Сначала укажите папку проекта в настройках",
+      };
+    }
+    this.onDownloadProgress?.({ progress: 5, label: "Индексация @codebase…" });
+    try {
+      const status = await reindexCodebase(root, (msg) => {
+        this.onDownloadProgress?.({ progress: 40, label: msg });
+      });
+      this.onDownloadProgress?.({
+        progress: 100,
+        label: status.error
+          ? `Индекс: ${status.error}`
+          : `Индекс готов · ${status.chunkCount} чанков`,
+      });
+      return status;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.onDownloadProgress?.({ progress: 100, label: `Индекс: ${message}` });
+      return {
+        ready: false,
+        indexing: false,
+        root,
+        chunkCount: 0,
+        modelId: "",
+        updatedAt: null,
+        error: message,
+      };
+    }
+  }
+
+  /** Warm semantic index in background after project root is set. */
+  warmCodebaseIndex(): void {
+    const root = this.settings.get().projectRoot;
+    if (!root) return;
+    void ensureProjectIndex(root).catch(() => undefined);
   }
 
   async getMonitorSnapshot(): Promise<MonitorSnapshot> {

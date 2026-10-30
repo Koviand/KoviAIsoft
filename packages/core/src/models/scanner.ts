@@ -31,19 +31,25 @@ function findMmproj(dir: string, baseName: string): string | undefined {
   return path.join(dir, related || mmprojs[0]);
 }
 
+function pickMaxVram(sys?: SystemInfo): number | undefined {
+  const vals = (sys?.gpus || [])
+    .map((g) => g.vramGb)
+    .filter((x): x is number => typeof x === "number" && x > 0);
+  if (!vals.length) return undefined;
+  return Math.max(...vals);
+}
+
 function estimateFit(
   sizeBytes: number,
-  context: number,
   sys?: SystemInfo,
 ): { recommendedNgl: number; recommendedContext: number; fitsInVram?: boolean } {
   const sizeGb = sizeBytes / 1024 ** 3;
-  const vram = sys?.gpus.find((g) => g.vramGb)?.vramGb;
+  const vram = pickMaxVram(sys);
   let recommendedContext = 8192;
-  if (vram && vram < 8) recommendedContext = 4096;
-  if (vram && vram >= 16) recommendedContext = 16384;
-  if (context) recommendedContext = Math.min(recommendedContext, context);
+  if (vram != null && vram < 8) recommendedContext = 4096;
+  if (vram != null && vram >= 16) recommendedContext = 16384;
 
-  if (!vram) {
+  if (vram == null) {
     return { recommendedNgl: 0, recommendedContext, fitsInVram: undefined };
   }
   // rough KV overhead ~ context * 0.0002 GB for mid models
@@ -104,7 +110,7 @@ export function scanLocalModels(roots: string[], sys?: SystemInfo): LocalModel[]
     const name = path.basename(filePath);
     const dir = path.dirname(filePath);
     const quant = detectQuant(name);
-    const est = estimateFit(st.size, 8192, sys);
+    const est = estimateFit(st.size, sys);
     models.push(
       withIntegrity({
         id: modelIdFor(filePath),

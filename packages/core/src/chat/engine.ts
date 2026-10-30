@@ -7,7 +7,20 @@ import {
   fitMessagesToContext,
   isContextOverflowError,
 } from "./contextBudget.js";
-import { formatLlmFetchError, pickCompletionText, stripThinkTags } from "./llmErrors.js";
+import {
+  buildAgentActionGbnf,
+  nextConstraintModeAfterFailure,
+  pickConstraintMode,
+  responseFormatJsonSchema,
+  type ConstraintMode,
+} from "../agent/actionSchema.js";
+import {
+  formatLlmFetchError,
+  isLlmTruncatedError,
+  LlmTruncatedError,
+  pickCompletionText,
+  stripThinkTags,
+} from "./llmErrors.js";
 
 export type TokenHandler = (p: {
   sessionId: string;
@@ -34,6 +47,10 @@ export class ChatEngine {
   constructor(runtime: RuntimeManager, store: Store) {
     this.runtime = runtime;
     this.store = store;
+  }
+
+  getRuntime(): RuntimeManager {
+    return this.runtime;
   }
 
   setTokenHandler(fn: TokenHandler): void {
@@ -115,6 +132,8 @@ export class ChatEngine {
           messages,
           temperature: params.temperature,
           top_p: params.topP,
+          top_k: params.topK,
+          min_p: params.minP,
           max_tokens: maxTokens,
           stream: true,
           seed: params.seed ?? undefined,
@@ -282,6 +301,7 @@ export class ChatEngine {
     messages: OpenAiMessage[],
     params: GenerationParams,
     sessionId?: string,
+    opts?: { extraToolNames?: string[] },
   ): Promise<string> {
     let base: string;
     try {
@@ -290,39 +310,59 @@ export class ChatEngine {
       throw formatLlmFetchError(err, this.runtime.getOpenAiBaseUrl());
     }
 
-    // Keep completion within context headroom — requesting 8k with ctx 8k hangs/resets Vulkan.
+    // Keep completion within context headroom — leave ≥512 for prompt packing.
     const ctx = Math.max(512, params.context || 4096);
-    const maxTokens = Math.max(
-      256,
-      Math.min(params.maxTokens || 1024, Math.floor(ctx * 0.45), 4096),
-    );
+    const hardCap = Math.max(1024, Math.min(6144, ctx - 512));
+    const requested = Math.max(256, params.maxTokens || 1024);
+    let maxTokens = Math.max(256, Math.min(requested, Math.floor(ctx * 0.55), hardCap));
+
+    const buildBody = (
+      packed: OpenAiMessage[],
+      tokenBudget: number,
+      mode: ConstraintMode,
+      stream: boolean,
+    ): Record<string, unknown> => {
+      const body: Record<string, unknown> = {
+        model: "local",
+        messages: packed,
+        temperature: params.temperature,
+        top_p: params.topP,
+        top_k: params.topK,
+        min_p: params.minP,
+        max_tokens: tokenBudget,
+        stream,
+      };
+      if (mode === "json_schema") {
+        body.response_format = responseFormatJsonSchema(opts?.extraToolNames || []);
+      } else if (mode === "grammar") {
+        body.grammar = buildAgentActionGbnf();
+      }
+      return body;
+    };
 
     const attemptOnce = async (
       signal: AbortSignal,
       msgs: OpenAiMessage[],
-    ): Promise<string> => {
-      const packed = fitMessagesToContext(msgs, ctx, maxTokens);
+      tokenBudget: number,
+      mode: ConstraintMode,
+    ): Promise<{ content: string; truncated: boolean; mode: ConstraintMode }> => {
+      const packed = fitMessagesToContext(msgs, ctx, tokenBudget);
       let res: Response;
       try {
         res = await fetch(`${base}/chat/completions`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           signal,
-          body: JSON.stringify({
-            model: "local",
-            messages: packed,
-            temperature: params.temperature,
-            top_p: params.topP,
-            max_tokens: maxTokens,
-            stream: true,
-          }),
+          body: JSON.stringify(buildBody(packed, tokenBudget, mode, true)),
         });
       } catch (err) {
         throw formatLlmFetchError(err, base);
       }
       if (!res.ok || !res.body) {
         const text = await res.text().catch(() => "");
-        throw new Error(`Ошибка LLM: ${res.status} ${text}`);
+        const err = new Error(`Ошибка LLM: ${res.status} ${text}`);
+        (err as Error & { status?: number }).status = res.status;
+        throw err;
       }
 
       let content = "";
@@ -377,37 +417,26 @@ export class ChatEngine {
       if (signal.aborted) {
         throw new Error("Отменено");
       }
-      if (truncated && !content.trim()) {
-        throw new Error(
-          "Ответ LLM обрезан по max_tokens (finish_reason=length). Упростите шаг: пишите один файл целиком через write_file или увеличьте лимит токенов.",
-        );
-      }
-      // Fallback if server ignored stream and returned empty (rare).
+      // Fallback if stream content empty — try reasoning, then non-stream once.
       if (!content.trim()) {
-        // Some local models put the whole JSON only in reasoning_content.
         if (reasoning.trim()) {
           content = reasoning;
           if (sessionId) {
             this.onToken?.({ sessionId, text: content, draft: true });
           }
         } else {
-          const packed2 = fitMessagesToContext(msgs, ctx, maxTokens);
+          const packed2 = fitMessagesToContext(msgs, ctx, tokenBudget);
           const res2 = await fetch(`${base}/chat/completions`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             signal,
-            body: JSON.stringify({
-              model: "local",
-              messages: packed2,
-              temperature: params.temperature,
-              top_p: params.topP,
-              max_tokens: maxTokens,
-              stream: false,
-            }),
+            body: JSON.stringify(buildBody(packed2, tokenBudget, mode, false)),
           });
           if (!res2.ok) {
             const text = await res2.text();
-            throw new Error(`Ошибка LLM: ${res2.status} ${text}`);
+            const err = new Error(`Ошибка LLM: ${res2.status} ${text}`);
+            (err as Error & { status?: number }).status = res2.status;
+            throw err;
           }
           const json = (await res2.json()) as {
             choices?: Array<{
@@ -421,18 +450,100 @@ export class ChatEngine {
           };
           const choice = json.choices?.[0];
           content = pickCompletionText(choice?.message);
-          if (choice?.finish_reason === "length" && !content.trim()) {
-            throw new Error(
-              "Ответ LLM обрезан по max_tokens (finish_reason=length). Упростите шаг: пишите один файл целиком через write_file или увеличьте лимит токенов.",
-            );
-          }
+          if (choice?.finish_reason === "length") truncated = true;
           if (sessionId && content) {
             this.onToken?.({ sessionId, text: content, draft: true });
           }
         }
       }
-      // Strip <think> blocks that some models embed in content (breaks extractJson).
-      return stripThinkTags(content);
+      const cleaned = stripThinkTags(content);
+      if (truncated && !cleaned.trim()) {
+        throw new LlmTruncatedError();
+      }
+      // Truncated incomplete JSON — force repair path instead of silent parse fail.
+      if (truncated && cleaned.trim()) {
+        const open = (cleaned.match(/\{/g) || []).length;
+        const close = (cleaned.match(/\}/g) || []).length;
+        const looksBroken =
+          open !== close ||
+          /["']\s*$/.test(cleaned.trim()) ||
+          /,\s*$/.test(cleaned.trim());
+        if (looksBroken) throw new LlmTruncatedError();
+      }
+      // Reject prose-only reasoning mistaken for JSON action.
+      if (
+        !cleaned.trim().startsWith("{") &&
+        !/<tool_call\b/i.test(cleaned) &&
+        cleaned.length > 40
+      ) {
+        // Keep returning — parseAgentAction will fail and repair; but avoid
+        // treating empty JSON-looking stubs as success upstream.
+      }
+      return { content: cleaned, truncated, mode };
+    };
+
+    const markConstraintFailure = (mode: ConstraintMode): void => {
+      if (mode === "json_schema") this.runtime.jsonSchemaOk = false;
+      if (mode === "grammar") this.runtime.grammarOk = false;
+    };
+
+    const markConstraintSuccess = (mode: ConstraintMode): void => {
+      if (mode === "json_schema") this.runtime.jsonSchemaOk = true;
+      if (mode === "grammar") this.runtime.grammarOk = true;
+    };
+
+    const isConstraintReject = (err: unknown): boolean => {
+      const status = (err as { status?: number })?.status;
+      if (status === 400 || status === 422) return true;
+      const msg = err instanceof Error ? err.message : String(err);
+      return /json_schema|response_format|grammar|unknown field|invalid.*schema/i.test(msg);
+    };
+
+    const resolveAttempt = async (
+      signal: AbortSignal,
+      msgs: OpenAiMessage[],
+    ): Promise<string> => {
+      let mode = pickConstraintMode({
+        jsonSchemaOk: this.runtime.jsonSchemaOk,
+        grammarOk: this.runtime.grammarOk,
+      });
+
+      const runWithMode = async (m: ConstraintMode) => {
+        let result = await attemptOnce(signal, msgs, maxTokens, m);
+        if (result.truncated) {
+          const boosted = Math.min(
+            hardCap,
+            Math.max(maxTokens + 1024, Math.floor(ctx * 0.55)),
+          );
+          if (boosted > maxTokens) {
+            maxTokens = boosted;
+            result = await attemptOnce(signal, msgs, maxTokens, m);
+          }
+        }
+        return result;
+      };
+
+      // Walk json_schema → grammar → none on 4xx / unsupported.
+      for (;;) {
+        try {
+          const result = await runWithMode(mode);
+          markConstraintSuccess(mode);
+          if (result.truncated && !result.content.trim()) {
+            throw new LlmTruncatedError();
+          }
+          return result.content;
+        } catch (err) {
+          if (signal.aborted || (err instanceof Error && err.name === "AbortError")) {
+            throw err;
+          }
+          if (isLlmTruncatedError(err)) throw err;
+          if (!isConstraintReject(err)) throw err;
+          markConstraintFailure(mode);
+          const next = nextConstraintModeAfterFailure(mode);
+          if (!next) throw err;
+          mode = next;
+        }
+      }
     };
 
     // Reuse / replace abort so agent cancel (chat.stop) interrupts JSON calls too.
@@ -443,11 +554,12 @@ export class ChatEngine {
 
     try {
       try {
-        return await attemptOnce(signal, messages);
+        return await resolveAttempt(signal, messages);
       } catch (err) {
         if (signal.aborted || (err instanceof Error && err.name === "AbortError")) {
           throw err;
         }
+        if (isLlmTruncatedError(err)) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         if (isContextOverflowError(err)) {
           // Keep system (includes working memory) + last 3 turns — avoid wiping plan/goal.
@@ -455,7 +567,7 @@ export class ChatEngine {
           const rest = messages.filter((m) => m.role !== "system");
           const tail = rest.slice(-3);
           const emergency = system ? [system, ...tail] : tail;
-          return await attemptOnce(signal, emergency);
+          return await resolveAttempt(signal, emergency);
         }
         if (!/fetch failed|econnreset|socket|network/i.test(msg)) {
           throw err;
@@ -463,7 +575,7 @@ export class ChatEngine {
         await new Promise((r) => setTimeout(r, 750));
         base = await this.runtime.assertLlmReady();
         if (signal.aborted) throw err;
-        return await attemptOnce(signal, messages);
+        return await resolveAttempt(signal, messages);
       }
     } catch (err) {
       throw formatLlmFetchError(err, base);

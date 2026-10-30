@@ -38,13 +38,16 @@ export {
 } from "./models/recommend.js";
 export {
   AUTO_PC_PROFILE_ID,
+  buildHardwareTierProfiles,
   isAutoPcProfile,
+  mergeProfileIntoDefaultParams,
   suggestHardwareLoadProfile,
 } from "./models/hardwareProfile.js";
-export type { HardwareLoadSuggestion } from "./models/hardwareProfile.js";
+export type { HardwareLoadSuggestion, LoadTier } from "./models/hardwareProfile.js";
 export * from "./tools/sandbox.js";
 export {
   adaptCommandForWindows,
+  cancelActiveTerminals,
   isBlankCwd,
   isShellFileWriteAttempt,
   resolveTerminalCwd,
@@ -56,6 +59,28 @@ export {
   detectCodingTask,
   detectToolAction,
 } from "./agent/intent.js";
+export {
+  currentPlanStep,
+  defaultCodingPlan,
+  defaultGenericPlan,
+  defaultPlanForTask,
+  markCurrentPlanDone,
+  normalizePlanDraft,
+  PLAN_MAX_STEPS,
+  PLAN_MIN_STEPS,
+  skipRemainingPlan,
+} from "./agent/planner.js";
+export {
+  buildAgentActionGbnf,
+  buildAgentActionJsonSchema,
+  nextConstraintModeAfterFailure,
+  pickConstraintMode,
+} from "./agent/actionSchema.js";
+export {
+  parseAgentAction,
+  sanitizeJsonCandidate,
+  validateToolArgs,
+} from "./agent/parseAction.js";
 export { applyTextReplace } from "./tools/textReplace.js";
 export { writeFileAtomic, writeFileAtomicSync } from "./fsAtomic.js";
 // resolveAgentPath exported via sandbox *

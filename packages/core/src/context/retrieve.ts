@@ -4,8 +4,16 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { isPathInside, normalizePath } from "../tools/sandbox.js";
 import { isProbablyBinaryPath, isTextSourcePath, shouldIgnoreDirName } from "./ignore.js";
+import { semanticSearch } from "./semanticIndex.js";
 
 const execFileAsync = promisify(execFile);
+
+let lastSemanticError: string | null = null;
+
+/** Last semantic/@codebase embed failure (null if ok / skipped). */
+export function getLastSemanticError(): string | null {
+  return lastSemanticError;
+}
 
 export interface RetrievedSnippet {
   path: string; // relative
@@ -20,6 +28,18 @@ export interface RetrieveOptions {
   maxFiles?: number;
   maxBytesPerFile?: number;
   maxTotalBytes?: number;
+  /** Force semantic layer even without @codebase (agent coding tasks). */
+  forceSemantic?: boolean;
+}
+
+/** True when user explicitly asked for @codebase. */
+export function hasCodebaseMention(query: string): boolean {
+  return /@codebase\b/i.test(query);
+}
+
+/** Strip @codebase tokens so they don't pollute keyword extraction. */
+export function stripCodebaseMention(query: string): string {
+  return query.replace(/@codebase\b/gi, " ").replace(/\s+/g, " ").trim();
 }
 
 const STOP = new Set(
@@ -264,7 +284,7 @@ function walkMatchFiles(projectRoot: string, keywords: string[], limit: number):
 }
 
 /**
- * Cursor-like retrieval: @mentions + keyword/filename/rg hits → scored snippets.
+ * Cursor-like retrieval: @mentions + semantic @codebase + keyword/rg → scored snippets.
  */
 export async function retrieveProjectContext(
   projectRoot: string | null,
@@ -275,33 +295,50 @@ export async function retrieveProjectContext(
   const maxFiles = opts.maxFiles ?? 6;
   const maxBytesPerFile = opts.maxBytesPerFile ?? 3_500;
   const maxTotalBytes = opts.maxTotalBytes ?? 14_000;
+  const wantSemantic = opts.forceSemantic === true || hasCodebaseMention(query);
+  const cleanQuery = stripCodebaseMention(query);
 
-  const scores = new Map<string, { score: number; reason: string }>();
-  const bump = (abs: string, score: number, reason: string) => {
+  const scores = new Map<string, { score: number; reason: string; excerpt?: string; startLine?: number }>();
+  const bump = (
+    abs: string,
+    score: number,
+    reason: string,
+    extra?: { excerpt?: string; startLine?: number },
+  ) => {
     try {
       const n = normalizePath(abs);
       if (!isPathInside(n, projectRoot)) return;
       if (!fs.existsSync(n) || !fs.statSync(n).isFile()) return;
       if (isProbablyBinaryPath(n)) return;
       const cur = scores.get(n);
-      if (!cur || score > cur.score) scores.set(n, { score, reason });
-      else if (cur && reason && !cur.reason.includes(reason)) {
-        scores.set(n, { score: cur.score + Math.max(1, Math.floor(score / 3)), reason: `${cur.reason}+${reason}` });
+      if (!cur || score > cur.score) {
+        scores.set(n, {
+          score,
+          reason,
+          excerpt: extra?.excerpt ?? cur?.excerpt,
+          startLine: extra?.startLine ?? cur?.startLine,
+        });
+      } else if (cur && reason && !cur.reason.includes(reason)) {
+        scores.set(n, {
+          score: cur.score + Math.max(1, Math.floor(score / 3)),
+          reason: `${cur.reason}+${reason}`,
+          excerpt: cur.excerpt || extra?.excerpt,
+          startLine: cur.startLine ?? extra?.startLine,
+        });
       }
     } catch {
       // skip
     }
   };
 
-  for (const mention of extractPathMentions(query, projectRoot)) {
+  for (const mention of extractPathMentions(cleanQuery, projectRoot)) {
     const abs = path.isAbsolute(mention)
       ? normalizePath(mention)
       : normalizePath(path.join(projectRoot, mention));
     bump(abs, 100, "mention");
-    // If directory, pick a few source files inside
     try {
       if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) {
-        const inner = walkMatchFiles(abs, extractKeywords(query), 4);
+        const inner = walkMatchFiles(abs, extractKeywords(cleanQuery), 4);
         for (const f of inner) bump(f, 70, "mention-dir");
       }
     } catch {
@@ -309,17 +346,39 @@ export async function retrieveProjectContext(
     }
   }
 
-  const keywords = extractKeywords(query);
-  for (const kw of keywords) {
-    for (const f of walkMatchFiles(projectRoot, [kw], 20)) {
-      bump(f, 20 + languageBoost(query, f), `name:${kw}`);
-    }
-    for (const f of await rgFiles(projectRoot, kw, 15)) {
-      bump(f, 25 + languageBoost(query, f), `rg:${kw}`);
+  lastSemanticError = null;
+  if (wantSemantic && cleanQuery.trim()) {
+    try {
+      const hits = await semanticSearch(projectRoot, cleanQuery, Math.max(8, maxFiles));
+      for (const h of hits) {
+        // Map cosine ~0..1 → score 40..90
+        const mapped = 40 + Math.round(Math.max(0, Math.min(1, h.score)) * 50);
+        bump(h.absPath, mapped, h.reason, {
+          excerpt: h.excerpt
+            .split("\n")
+            .map((line, i) => `${h.startLine + i}| ${line}`)
+            .join("\n")
+            .slice(0, maxBytesPerFile),
+          startLine: h.startLine,
+        });
+      }
+    } catch (err) {
+      // Lexical still runs; surface embedder failure for UI/agent thinking.
+      lastSemanticError = err instanceof Error ? err.message : String(err);
+      console.warn("[retrieve] semantic failed:", lastSemanticError);
     }
   }
 
-  // Always consider common entrypoints lightly
+  const keywords = extractKeywords(cleanQuery);
+  for (const kw of keywords) {
+    for (const f of walkMatchFiles(projectRoot, [kw], 20)) {
+      bump(f, 20 + languageBoost(cleanQuery, f), `name:${kw}`);
+    }
+    for (const f of await rgFiles(projectRoot, kw, 15)) {
+      bump(f, 25 + languageBoost(cleanQuery, f), `rg:${kw}`);
+    }
+  }
+
   for (const name of ["README.md", "readme.md", "package.json", "pyproject.toml", "main.py", "index.ts", "index.tsx", "App.tsx"]) {
     const abs = path.join(projectRoot, name);
     if (fs.existsSync(abs)) bump(abs, 8, "entrypoint");
@@ -334,7 +393,15 @@ export async function retrieveProjectContext(
   for (const [abs, meta] of ranked) {
     if (total >= maxTotalBytes) break;
     const room = Math.min(maxBytesPerFile, maxTotalBytes - total);
-    const { text, startLine } = readExcerpt(abs, room, query);
+    let text = meta.excerpt || "";
+    let startLine = meta.startLine || 1;
+    if (!text) {
+      const ex = readExcerpt(abs, room, cleanQuery);
+      text = ex.text;
+      startLine = ex.startLine;
+    } else if (Buffer.byteLength(text, "utf8") > room) {
+      text = text.slice(0, room);
+    }
     if (!text) continue;
     total += Buffer.byteLength(text, "utf8");
     snippets.push({

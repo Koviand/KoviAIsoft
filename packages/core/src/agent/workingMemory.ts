@@ -4,6 +4,8 @@ import type { AgentPlanStep } from "@kovi/shared";
 export interface AgentWorkingMemory {
   goal: string;
   plan: Array<{ id: string; title: string; status: string }>;
+  /** After plan phase, titles/ids are frozen; only statuses update. */
+  planFrozen?: boolean;
   filesTouched: string[];
   lastTool: string | null;
   lastResult: string | null;
@@ -17,6 +19,7 @@ export function createWorkingMemory(goal: string): AgentWorkingMemory {
   return {
     goal: goal.replace(/\s+/g, " ").trim().slice(0, 400),
     plan: [],
+    planFrozen: false,
     filesTouched: [],
     lastTool: null,
     lastResult: null,
@@ -28,9 +31,13 @@ export function createWorkingMemory(goal: string): AgentWorkingMemory {
 export function formatWorkingMemory(wm: AgentWorkingMemory): string {
   const lines: string[] = [WM_MARKER, `goal: ${wm.goal || "(не задано)"}`];
   if (wm.plan.length) {
-    lines.push("plan:");
+    lines.push(`plan${wm.planFrozen ? " (зафиксирован)" : " (черновик)"}:`);
     for (const p of wm.plan.slice(0, 12)) {
       lines.push(`  - [${p.status}] ${p.id}: ${p.title}`);
+    }
+    const next = wm.plan.find((p) => p.status === "pending");
+    if (next && wm.planFrozen) {
+      lines.push(`current_step: ${next.id} — ${next.title}`);
     }
   }
   if (wm.filesTouched.length) {
@@ -50,7 +57,9 @@ export function formatWorkingMemory(wm: AgentWorkingMemory): string {
     for (const n of wm.notes.slice(-8)) lines.push(`  - ${n}`);
   }
   lines.push(
-    "Правило: после сжатия истории опирайся на этот блок; не повторяй уже сделанное.",
+    wm.planFrozen
+      ? "Правило: план зафиксирован — выполняй current_step одним tool; не переписывай plan; не повторяй сделанное."
+      : "Правило: сначала составь plan (3–7 шагов), без tool/final; после фиксации плана — исполнение.",
   );
   return lines.join("\n");
 }
@@ -105,9 +114,15 @@ export function parseWorkingMemory(raw: unknown): AgentWorkingMemory | null {
   try {
     const j = JSON.parse(raw) as AgentWorkingMemory;
     if (!j || typeof j.goal !== "string") return null;
+    const plan = Array.isArray(j.plan) ? j.plan : [];
     return {
       goal: j.goal,
-      plan: Array.isArray(j.plan) ? j.plan : [],
+      plan,
+      planFrozen:
+        typeof j.planFrozen === "boolean"
+          ? j.planFrozen
+          : // Legacy scratchpads with a plan were already mid-run — treat as frozen.
+            plan.length > 0,
       filesTouched: Array.isArray(j.filesTouched) ? j.filesTouched : [],
       lastTool: j.lastTool ?? null,
       lastResult: j.lastResult ?? null,

@@ -19,6 +19,8 @@ const api: KoviApi = {
     ipcRenderer.invoke(IPC.suggestHardwareLoadSettings, opts),
   applyHardwareLoadSettings: (opts) =>
     ipcRenderer.invoke(IPC.applyHardwareLoadSettings, opts),
+  applyLoadProfileToSettings: (opts) =>
+    ipcRenderer.invoke(IPC.applyLoadProfileToSettings, opts),
   searchHf: (query) => ipcRenderer.invoke(IPC.searchHf, query),
   listHfFiles: (modelId) => ipcRenderer.invoke(IPC.listHfFiles, modelId),
   downloadHfFile: (modelId, filePath) =>
@@ -51,6 +53,12 @@ const api: KoviApi = {
   verifyGguf: (modelId) => ipcRenderer.invoke(IPC.verifyGguf, modelId),
   previewFileDiff: (filePath, content) =>
     ipcRenderer.invoke(IPC.previewFileDiff, filePath, content),
+  getCodebaseIndexStatus: () => ipcRenderer.invoke(IPC.getCodebaseIndexStatus),
+  reindexCodebase: () => ipcRenderer.invoke(IPC.reindexCodebase),
+  listEmbeddingModels: () => ipcRenderer.invoke(IPC.listEmbeddingModels),
+  getEmbeddingStatus: () => ipcRenderer.invoke(IPC.getEmbeddingStatus),
+  downloadEmbeddingModel: (id) => ipcRenderer.invoke(IPC.downloadEmbeddingModel, id),
+  setEmbeddingModel: (id) => ipcRenderer.invoke(IPC.setEmbeddingModel, id),
   onRuntimeProgress: (cb) => {
     const listener = (_: Electron.IpcRendererEvent, p: { progress: number; label: string }) =>
       cb(p);

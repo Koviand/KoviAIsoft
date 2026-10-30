@@ -16,6 +16,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@huggingface/transformers": "^3.0.0",
     "@kovi/shared": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.6.1",
     "extract-zip": "^2.0.1",

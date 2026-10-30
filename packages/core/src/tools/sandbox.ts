@@ -328,8 +328,72 @@ export function assertShellCommandPolicy(
     );
   }
 
+  if (
+    /-\s*EncodedCommand\b/i.test(cmd) ||
+    /\s-enc\s+/i.test(cmd)
+  ) {
+    throw new Error(
+      "PowerShell -EncodedCommand запрещён (обход sandbox). Используйте обычную команду.",
+    );
+  }
+
   const roots = allowedRoots.filter(Boolean).map((r) => normalizePath(r));
   if (roots.length === 0) return;
+
+  const assertAbsInside = (rawPath: string, label: string): void => {
+    const candidate = collapseOverEscapedWinPath(rawPath.trim());
+    const isAbs =
+      /^[a-zA-Z]:[\\/]/.test(candidate) ||
+      candidate.startsWith("\\\\") ||
+      candidate.startsWith("//") ||
+      /^\/[a-zA-Z]\//.test(candidate);
+    if (!isAbs) return;
+    let resolved: string;
+    try {
+      resolved = normalizePath(candidate.replace(/^\/([a-zA-Z])\//, "$1:/"));
+    } catch {
+      return;
+    }
+    const ok = roots.some(
+      (root) =>
+        isPathInside(resolved, root) ||
+        isPathInside(realPathSafe(resolved), realPathSafe(root)),
+    );
+    if (!ok) {
+      throw new Error(`${label} вне разрешённых папок: ${resolved}`);
+    }
+  };
+
+  // Absolute redirects / file writes outside sandbox roots.
+  const redirectRe =
+    /(?:^|[\s;|&])(?:>>?|1>>?|2>>?)\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z]:[^\s|&;]+|\\\\[^\s|&;]+|\/\/[^\s|&;]+))/g;
+  let rm: RegExpExecArray | null;
+  while ((rm = redirectRe.exec(cmd)) !== null) {
+    assertAbsInside(rm[1] || rm[2] || rm[3] || "", "Redirect");
+  }
+
+  const writeCmdRe =
+    /(?:Out-File|Set-Content|Add-Content|Tee-Object)\s+(?:-[A-Za-z]+\s+(?:"[^"]*"|'[^']*'|\S+)\s+)*-?(?:FilePath|Path)?\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z]:[^\s|&;]+|\\\\[^\s|&;]+))/gi;
+  while ((rm = writeCmdRe.exec(cmd)) !== null) {
+    assertAbsInside(rm[1] || rm[2] || rm[3] || "", "Запись файла");
+  }
+
+  const curlOutRe =
+    /(?:curl|wget)(?:\.exe)?[\s\S]{0,200}(?:-o|--output|-O)\s+(?:"([^"]+)"|'([^']+)'|([A-Za-z]:[^\s|&;]+|\\\\[^\s|&;]+|\S+))/gi;
+  while ((rm = curlOutRe.exec(cmd)) !== null) {
+    assertAbsInside(rm[1] || rm[2] || rm[3] || "", "Скачивание в файл");
+  }
+
+  const copyRe =
+    /(?:^|[\n;&|]\s*)(?:copy|xcopy|robocopy|Move-Item|Copy-Item|mi|cpi)\b[\s\S]{0,160}?([A-Za-z]:[^\s|&;"']+|\\\\[^\s|&;"']+)/gi;
+  while ((rm = copyRe.exec(cmd)) !== null) {
+    assertAbsInside(rm[1] || "", "Copy/Move");
+  }
+
+  const psFileRe = /-\s*File\s+(?:"([^"]+)"|'([^']+)'|(\S+))/gi;
+  while ((rm = psFileRe.exec(cmd)) !== null) {
+    assertAbsInside(rm[1] || rm[2] || rm[3] || "", "PowerShell -File");
+  }
 
   const cdRe =
     /(?:^|[\n;&|]\s*)(?:cd(?:\s+\/[dD])?|chdir|Set-Location|\bsl)\s+(?:"([^"]+)"|'([^']+)'|([^\n;&|]+))/gi;
@@ -464,7 +528,7 @@ export function riskForTool(
 /**
  * - ask: confirm medium + high
  * - auto-safe: auto-approve medium files inside project; always confirm high (incl. shell)
- * - full: skip medium; ALWAYS confirm high (shell / dangerous deletes)
+ * - full: skip medium confirms; high (shell / browser mutate / dangerous deletes) ALWAYS ask
  */
 export function shouldConfirmRisk(
   risk: "low" | "medium" | "high",

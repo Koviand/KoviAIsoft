@@ -19,7 +19,7 @@ import {
   searchFiles,
   writeFileTool,
 } from "../tools/files.js";
-import { runTerminal } from "../tools/terminal.js";
+import { cancelActiveTerminals, runTerminal } from "../tools/terminal.js";
 import { previewPatchDiff, previewWriteDiff } from "../tools/diff.js";
 import {
   approvalRememberKey,
@@ -33,11 +33,34 @@ import {
   fitMessagesToContext,
   isContextOverflowError,
 } from "../chat/contextBudget.js";
+import { isLlmTruncatedError } from "../chat/llmErrors.js";
 import { projectContextCache } from "../context/projectCache.js";
 import { buildProjectContext } from "../context/packer.js";
+import { getLastSemanticError } from "../context/retrieve.js";
 import { formatRetrievedSnippets } from "../context/retrieve.js";
+import { invalidateIndexPaths } from "../context/semanticIndex.js";
 import { condenseTranscript, summarizeTranscript } from "../context/summarize.js";
 import { detectCodingTask } from "./intent.js";
+import {
+  agentTuningForFamily,
+  detectModelFamily,
+} from "../models/modelFamily.js";
+import {
+  currentPlanStep,
+  defaultPlanForTask,
+  executePhaseHint,
+  markCurrentPlanDone,
+  markCurrentPlanFailed,
+  normalizePlanDraft,
+  PLAN_PHASE_MAX_ATTEMPTS,
+  planPhaseInstruction,
+  skipRemainingPlan,
+} from "./planner.js";
+import {
+  parseAgentAction,
+  PLAN_ADVANCING_TOOLS,
+  validateToolArgs,
+} from "./parseAction.js";
 import { toolsPromptBlock } from "./toolsCatalog.js";
 import {
   applyWorkingMemoryToSystem,
@@ -140,63 +163,6 @@ function minWriteCharsForPath(filePath: string): number {
 
 type EventFn = (sessionId: string, event: AgentEvent) => void;
 
-interface ParsedAction {
-  thought?: string;
-  plan?: Array<{ id: string; title: string }>;
-  tool?: { name: string; args?: Record<string, unknown> } | null;
-  final?: string | null;
-}
-
-function extractBalancedObject(raw: string): string | null {
-  const start = raw.indexOf("{");
-  if (start < 0) return null;
-  let depth = 0;
-  let inStr = false;
-  let esc = false;
-  for (let i = start; i < raw.length; i++) {
-    const ch = raw[i]!;
-    if (inStr) {
-      if (esc) {
-        esc = false;
-      } else if (ch === "\\") {
-        esc = true;
-      } else if (ch === '"') {
-        inStr = false;
-      }
-      continue;
-    }
-    if (ch === '"') {
-      inStr = true;
-      continue;
-    }
-    if (ch === "{") depth += 1;
-    else if (ch === "}") {
-      depth -= 1;
-      if (depth === 0) return raw.slice(start, i + 1);
-    }
-  }
-  return null;
-}
-
-function extractJson(text: string): ParsedAction | null {
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const raw = fence?.[1] || text;
-  const candidates = [extractBalancedObject(raw), (() => {
-    const start = raw.indexOf("{");
-    const end = raw.lastIndexOf("}");
-    if (start < 0 || end <= start) return null;
-    return raw.slice(start, end + 1);
-  })()].filter(Boolean) as string[];
-  for (const piece of candidates) {
-    try {
-      return JSON.parse(piece) as ParsedAction;
-    } catch {
-      // try next
-    }
-  }
-  return null;
-}
-
 export class AgentLoop {
   private chat: ChatEngine;
   private store: Store;
@@ -234,6 +200,8 @@ export class AgentLoop {
     this.cancelled = true;
     // Interrupt in-flight LLM JSON completion used by the agent loop.
     this.chat.stop();
+    // Kill active run_terminal process trees (B7).
+    cancelActiveTerminals();
     for (const [id, p] of this.pendingConfirm) {
       if (p.timer) clearTimeout(p.timer);
       p.resolve(false);
@@ -420,10 +388,12 @@ export class AgentLoop {
       this.store.addMessage(sessionId, { role: "user", content: userContent });
       const ctxWindow = params.context || 8192;
       const compactTools = ctxWindow < 8192;
-      const toolBlock = toolsPromptBlock(
-        this.mcp.listTools().map((t) => ({ name: t.name, description: t.description })),
-        { compact: compactTools },
-      );
+      const mcpTools = this.mcp.listTools().map((t) => ({
+        name: t.name,
+        description: t.description,
+      }));
+      const extraToolNames = mcpTools.map((t) => t.name);
+      const toolBlock = toolsPromptBlock(mcpTools, { compact: compactTools });
 
       // Cursor-like layered context: tools + rules + retrieval + project map (budgeted).
       const projectCtx = await buildProjectContext({
@@ -438,12 +408,14 @@ export class AgentLoop {
           ctxWindow < 8192 ? 1800 : 3500,
         ),
       });
+      const semanticErr = getLastSemanticError();
       this.emit(sessionId, {
         type: "thinking",
         text: `Контекст: map=${projectCtx.stats.filesMapped} файлов, retrieved=${projectCtx.stats.filesRetrieved}, ~${projectCtx.stats.usedTokens} tok` +
           (projectCtx.stats.truncatedLayers.length
             ? ` (урезано: ${projectCtx.stats.truncatedLayers.join(",")})`
-            : ""),
+            : "") +
+          (semanticErr ? ` · @codebase: ${semanticErr.slice(0, 160)}` : ""),
       });
 
       let baseSystem = projectCtx.systemPrompt;
@@ -459,10 +431,24 @@ export class AgentLoop {
             ...restored,
             goal: freshGoal,
             ...(goalChanged
-              ? { plan: [], notes: [], lastError: null, lastTool: null, lastResult: null }
+              ? {
+                  plan: [],
+                  planFrozen: false,
+                  notes: [],
+                  lastError: null,
+                  lastTool: null,
+                  lastResult: null,
+                }
               : {}),
           }
         : createWorkingMemory(userContent);
+      // Resume: existing plan counts as frozen.
+      if (workingMemory.plan.length > 0 && workingMemory.planFrozen !== false) {
+        workingMemory.planFrozen = true;
+      }
+      if (!workingMemory.plan.length) {
+        workingMemory.planFrozen = false;
+      }
 
       let transcript: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
         {
@@ -507,9 +493,10 @@ export class AgentLoop {
             title: p.title,
             status: (p.status as AgentPlanStep["status"]) || "pending",
           }));
-      if (steps.length) {
+      if (steps.length && workingMemory.planFrozen) {
         this.emit(sessionId, { type: "plan", steps });
       }
+      let planAttempts = 0;
       let toolsUsed = 0;
       let filesWritten = workingMemory.filesTouched?.length
         ? workingMemory.filesTouched.filter((f) =>
@@ -550,6 +537,7 @@ export class AgentLoop {
               maxFiles: 6,
               maxBytesPerFile: 3500,
               maxTotalBytes: 14_000,
+              forceSemantic: true,
             },
           );
           const block = formatRetrievedSnippets(snippets);
@@ -577,30 +565,64 @@ export class AgentLoop {
         }
       };
 
+      let lastPhaseKind: "plan" | "exec" | null = null;
+      let repairAttempts = 0;
+
       for (let i = 0; i < settings.agentMaxSteps; i++) {
         if (this.cancelled) {
           this.emit(sessionId, { type: "cancelled" });
           return;
         }
-        const stepId = `step-${i + 1}`;
+        const planFrozen = Boolean(workingMemory.planFrozen) && steps.length > 0;
+        const curPlan = currentPlanStep(steps);
+        // Match plan step ids ("1","2",…) so ChatPage checklist updates.
+        const stepId = planFrozen && curPlan ? curPlan.id : `p${i + 1}`;
         this.emit(sessionId, { type: "step_start", stepId });
         this.emit(sessionId, {
           type: "thinking",
-          text: `Шаг ${i + 1}/${settings.agentMaxSteps}: жду ответ модели…`,
+          text: planFrozen
+            ? `Шаг ${i + 1}/${settings.agentMaxSteps}: исполнение плана…`
+            : `Шаг ${i + 1}/${settings.agentMaxSteps}: составление плана…`,
         });
+
+        // Inject phase instruction once per phase (not every tool turn).
+        syncSystem();
+        const phaseKind = planFrozen ? "exec" : "plan";
+        if (lastPhaseKind !== phaseKind) {
+          const phaseHint = planFrozen
+            ? executePhaseHint(curPlan, steps)
+            : planPhaseInstruction(wantsFiles);
+          transcript.push({ role: "user", content: phaseHint });
+          lastPhaseKind = phaseKind;
+        }
 
         let raw: string;
         try {
-          // Cap vs context — leave headroom; never request completion that can't fit.
+          // Coding writes need a large completion budget (JSON + full file content).
+          // Plan-only phase can use a smaller budget.
           const ctx = params.context || 8192;
-          const want = wantsFiles
-            ? Math.max(params.maxTokens || 0, 2048)
-            : Math.max(params.maxTokens || 0, 1536);
-          const maxTokens = Math.min(want, Math.max(512, Math.floor(ctx * 0.32)), 3072);
+          const hardCap = Math.max(
+            1024,
+            Math.min(planFrozen ? 6144 : 2048, ctx - 512),
+          );
+          const want = !planFrozen
+            ? 1024
+            : wantsFiles
+              ? Math.max(params.maxTokens || 0, 4096)
+              : Math.max(params.maxTokens || 0, 2048);
+          const maxTokens = Math.min(
+            want,
+            Math.max(512, Math.floor(ctx * (!planFrozen ? 0.2 : wantsFiles ? 0.5 : 0.4))),
+            hardCap,
+          );
+          const loadedId = this.chat.getRuntime().getStatus().loadedModelId || "";
+          const family = detectModelFamily(loadedId);
+          const tuning = agentTuningForFamily(family);
           const callParams = {
             ...params,
             maxTokens,
-            temperature: Math.min(params.temperature, 0.4),
+            temperature: Math.min(params.temperature, tuning.temperatureCap),
+            minP: Math.max(params.minP ?? 0, tuning.minP),
           };
           syncSystem();
           const beforeLen = transcript.length;
@@ -629,9 +651,26 @@ export class AgentLoop {
             text: `Шаг ${i + 1}/${settings.agentMaxSteps}: контекст ~${usedTok}/${ctx} tok · жду модель…`,
           });
           try {
-            raw = await this.chat.completeJson(packed, callParams, sessionId);
+            raw = await this.chat.completeJson(packed, callParams, sessionId, {
+              extraToolNames,
+            });
           } catch (err) {
-            if (!isContextOverflowError(err) || this.cancelled) throw err;
+            if (this.cancelled) throw err;
+            if (isLlmTruncatedError(err)) {
+              this.emit(sessionId, {
+                type: "thinking",
+                text: `Ответ обрезан по max_tokens — прошу модель разбить код на несколько write_file`,
+              });
+              transcript.push({
+                role: "user",
+                content:
+                  "Предыдущий ответ обрезан (finish_reason=length). НЕ пытайся уместить всю игру в один write_file. " +
+                  "Сделай несколько коротких шагов: сначала минимальный запускаемый файл (~80–150 строк), " +
+                  "затем отдельные write_file для модулей (pieces, board, ui). thought короткий. Верни один tool JSON.",
+              });
+              continue;
+            }
+            if (!isContextOverflowError(err)) throw err;
             // Emergency: keep system+working memory + summary of dropped + recent tail.
             transcript = emergencyShrinkTranscript(transcript, 4, (old) =>
               summarizeTranscript(
@@ -648,12 +687,26 @@ export class AgentLoop {
               type: "thinking",
               text: `Шаг ${i + 1}: контекст переполнен — сжимаю историю, цель и план сохранены… (~${estimateMessagesTokens(packed)}/${ctx} tok)`,
             });
-            raw = await this.chat.completeJson(packed, callParams, sessionId);
+            raw = await this.chat.completeJson(packed, callParams, sessionId, {
+              extraToolNames,
+            });
           }
         } catch (err) {
           if (this.cancelled || (err instanceof Error && /отмен/i.test(err.message))) {
             this.emit(sessionId, { type: "cancelled" });
             return;
+          }
+          if (isLlmTruncatedError(err)) {
+            this.emit(sessionId, {
+              type: "thinking",
+              text: `Обрезка ответа — продолжаю со следующим шагом (меньше кода за раз)`,
+            });
+            transcript.push({
+              role: "user",
+              content:
+                "Ответ снова обрезан. Пиши МЕНЬШЕ за шаг: один небольшой write_file (один модуль). Без длинного thought.",
+            });
+            continue;
           }
           throw err;
         }
@@ -662,41 +715,102 @@ export class AgentLoop {
           return;
         }
 
-        const parsed = extractJson(raw);
+        const parsed = parseAgentAction(raw, planFrozen ? "execute" : "plan");
         if (!parsed) {
+          repairAttempts += 1;
           const looksTruncated =
             /["']\s*$/.test(raw.trim()) ||
             /,\s*$/.test(raw.trim()) ||
             (raw.includes("{") && !raw.includes("}")) ||
             raw.length > 1500;
           transcript.push({ role: "assistant", content: raw.slice(0, 4000) });
-          transcript.push({
-            role: "user",
-            content: looksTruncated
-              ? "Ответ обрезан или невалидный JSON. Упрости шаг: один write_file с умеренным content, без кода в thought/final. Верни строго JSON по схеме."
-              : "Ответ не JSON. Верни строго JSON по схеме (tool или final).",
-          });
+          const loadedId = this.chat.getRuntime().getStatus().loadedModelId || "";
+          const familyNudge = agentTuningForFamily(detectModelFamily(loadedId)).jsonNudge;
+          const repair =
+            repairAttempts <= 2
+              ? looksTruncated
+                ? `Ответ обрезан. Верни ТОЛЬКО JSON: {"thought":"…","tool":{"name":"write_file","args":{…}}|null,"final":null}. Один короткий write_file.\n${familyNudge}`
+                : `Невалидный ответ. ${familyNudge}`
+              : looksTruncated
+                ? "Снова обрезка. Ещё короче: thought 1 фраза, один tool, без final."
+                : `Снова не JSON. ${familyNudge}`;
+          transcript.push({ role: "user", content: repair });
           continue;
         }
+        repairAttempts = 0;
 
         if (parsed.thought) {
           this.emit(sessionId, { type: "thinking", text: parsed.thought });
         }
 
-        if (parsed.plan?.length) {
-          const prevById = new Map(steps.map((s) => [s.id, s]));
-          steps = parsed.plan.map((p) => {
-            const prev = prevById.get(p.id);
-            return {
-              id: p.id,
-              title: p.title,
-              status: prev?.status === "done" ? ("done" as const) : ("pending" as const),
-              detail: prev?.detail,
-            };
+        // ——— Plan phase: freeze checklist, do not execute tools on this turn ———
+        if (!planFrozen) {
+          planAttempts += 1;
+          const normalized = normalizePlanDraft(parsed.plan, wantsFiles);
+          if (normalized) {
+            steps = normalized;
+            workingMemory.planFrozen = true;
+            updatePlanMemory(workingMemory, steps);
+            persistScratchpad();
+            syncSystem();
+            this.emit(sessionId, { type: "plan", steps });
+            this.emit(sessionId, {
+              type: "step_done",
+              stepId,
+              detail: `План: ${steps.length} шагов`,
+            });
+            this.emit(sessionId, {
+              type: "thinking",
+              text: `План зафиксирован (${steps.length} шагов). Перехожу к исполнению.`,
+            });
+            transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+            transcript.push({
+              role: "user",
+              content: executePhaseHint(currentPlanStep(steps), steps),
+            });
+            continue;
+          }
+          if (planAttempts >= PLAN_PHASE_MAX_ATTEMPTS) {
+            steps = defaultPlanForTask(wantsFiles);
+            workingMemory.planFrozen = true;
+            updatePlanMemory(workingMemory, steps);
+            persistScratchpad();
+            syncSystem();
+            this.emit(sessionId, { type: "plan", steps });
+            this.emit(sessionId, {
+              type: "step_done",
+              stepId,
+              detail: "План по шаблону",
+            });
+            this.emit(sessionId, {
+              type: "thinking",
+              text: "Модель не дала план — использую шаблон и начинаю исполнение.",
+            });
+            transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+            transcript.push({
+              role: "user",
+              content: executePhaseHint(currentPlanStep(steps), steps),
+            });
+            continue;
+          }
+          transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+          transcript.push({
+            role: "user",
+            content:
+              planPhaseInstruction(wantsFiles) +
+              "\nПлан обязателен: массив plan из 3–7 пунктов. tool и final сейчас запрещены.",
           });
-          updatePlanMemory(workingMemory, steps);
-          persistScratchpad();
-          this.emit(sessionId, { type: "plan", steps });
+          this.emit(sessionId, {
+            type: "step_done",
+            stepId,
+            detail: "Жду план",
+          });
+          continue;
+        }
+
+        // Frozen: ignore structural plan rewrites from the model.
+        if (parsed.plan?.length) {
+          // Keep titles/ids; statuses only advanced by the runtime after tools.
         }
 
         if (parsed.final && !parsed.tool) {
@@ -707,11 +821,18 @@ export class AgentLoop {
             filesWritten > 0 &&
             !substantialWrite &&
             stubNudgeCount < 2;
+          const pendingLeft = steps.some((s) => s.status === "pending");
+          const current = currentPlanStep(steps);
+          const currentIsFinalish =
+            current &&
+            /итог|final|finish|отчет|отчёт|резюме/i.test(current.title);
           // Keep forcing writes even on the last step when no files exist yet.
           const mustWork =
             noFileYet ||
             (i < settings.agentMaxSteps - 1 &&
-              (stubOnly || (!wantsFiles && toolsUsed === 0 && steps.length > 0)));
+              (stubOnly ||
+                (!wantsFiles && toolsUsed === 0 && steps.length > 0) ||
+                (pendingLeft && !currentIsFinalish && toolsUsed === 0)));
           if (mustWork) {
             if (stubOnly) stubNudgeCount += 1;
             transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
@@ -721,15 +842,15 @@ export class AgentLoop {
                 ? filesWritten === 0
                   ? "Рано для final. Сначала создай файлы через write_file (полный код в args.content). list_dir/read_file не считаются выполнением. final только после записи рабочих файлов."
                   : `Рано для final: запись похожа на stub. Допиши полный код через write_file или apply_patch (цель ≥${MIN_CODING_WRITE_CHARS} символов на ключевой файл), затем final.`
-                : "Рано для final. Сначала выполни план инструментами.",
+                : "Рано для final. Сначала выполни текущий пункт плана инструментом.",
             });
             continue;
           }
-          const marked = steps.map((s) =>
-            s.status === "pending" ? { ...s, status: "skipped" as const } : s,
-          );
+          const marked = skipRemainingPlan(steps);
           if (marked.length) {
             steps = marked;
+            updatePlanMemory(workingMemory, steps);
+            persistScratchpad();
             this.emit(sessionId, { type: "plan", steps });
           }
           const msg = this.store.addMessage(sessionId, {
@@ -754,7 +875,23 @@ export class AgentLoop {
         }
 
         const toolName = parsed.tool.name;
-        const args = parsed.tool.args || {};
+        const coerced = coerceToolArgs(toolName, parsed.tool.args || {});
+        const argCheck = validateToolArgs(toolName, coerced, extraToolNames);
+        if (!argCheck.ok) {
+          transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+          transcript.push({
+            role: "user",
+            content: `${argCheck.error}. Верни JSON с полными tool.args.`,
+          });
+          this.emit(sessionId, {
+            type: "step_done",
+            stepId,
+            detail: argCheck.error,
+          });
+          continue;
+        }
+        const args = argCheck.args;
+        parsed.tool = { name: toolName, args };
         const callId = uuid();
         this.emit(sessionId, { type: "tool_call", name: toolName, args, callId });
 
@@ -778,6 +915,12 @@ export class AgentLoop {
             continue;
           }
           const summary = String(args.summary || parsed.final || "Готово");
+          if (steps.length) {
+            steps = skipRemainingPlan(steps);
+            updatePlanMemory(workingMemory, steps);
+            persistScratchpad();
+            this.emit(sessionId, { type: "plan", steps });
+          }
           const msg = this.store.addMessage(sessionId, {
             role: "assistant",
             content: summary,
@@ -827,15 +970,13 @@ export class AgentLoop {
                 substantialWrite = true;
               }
             }
-          }
-          if (steps.length) {
-            const idx = steps.findIndex((s) => s.status === "pending");
-            if (idx >= 0) {
-              steps = steps.map((s, j) =>
-                j === idx ? { ...s, status: "done" as const, detail: toolName } : s,
-              );
-              this.emit(sessionId, { type: "plan", steps });
+            if (settings.projectRoot && targetPath) {
+              void invalidateIndexPaths(settings.projectRoot, [targetPath]).catch(() => undefined);
             }
+          }
+          if (steps.length && PLAN_ADVANCING_TOOLS.has(toolName)) {
+            steps = markCurrentPlanDone(steps, toolName);
+            this.emit(sessionId, { type: "plan", steps });
           }
           rememberToolSuccess(workingMemory, toolName, normalizedArgs, result);
           updatePlanMemory(workingMemory, steps);
@@ -879,6 +1020,10 @@ export class AgentLoop {
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           rememberToolError(workingMemory, toolName, message);
+          if (steps.length) {
+            steps = markCurrentPlanFailed(steps, message.slice(0, 120));
+            this.emit(sessionId, { type: "plan", steps });
+          }
           persistScratchpad();
           this.emit(sessionId, {
             type: "tool_result",
@@ -902,6 +1047,10 @@ export class AgentLoop {
       const msg = this.store.addMessage(sessionId, {
         role: "assistant",
         content: limitMsg,
+      });
+      this.emit(sessionId, {
+        type: "error",
+        message: `incomplete: ${limitMsg}`,
       });
       this.emit(sessionId, { type: "done", messageId: msg.id });
     } catch (err) {
