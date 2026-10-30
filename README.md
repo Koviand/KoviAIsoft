@@ -1,21 +1,61 @@
 # KoviAIsoft
 
-Локальное Windows-приложение в духе LM Studio + Hermes agent:
+Локальный desktop-чат и агент для Windows: свои GGUF-модели через `llama.cpp`, без облака.
 
-- автоопределение системы и установка нужного `llama.cpp` (CUDA / Vulkan / CPU), включая поддержку архитектур вроде LFM3;
-- чаты со стримингом, system prompt и параметрами генерации;
-- агент с планом, tool-loop, подтверждением опасных действий;
-- MCP, web search, браузер (Playwright);
-- только локальные модели.
+Стек: Electron + React + TypeScript (pnpm monorepo). Агент — Hermes-подобный JSON tool-loop с планом, подтверждениями и Windows-песочницей.
+
+**Репозиторий:** https://github.com/Koviand/KoviAIsoft
+
+---
+
+## Возможности
+
+| Область | Что умеет |
+|--------|-----------|
+| **Runtime** | Автоопределение GPU/CPU, установка/обновление `llama.cpp` (CUDA / Vulkan / CPU), в т.ч. архитектуры вроде LFM3 |
+| **Модели** | Скан локальных GGUF, рекомендации под VRAM/RAM, скачивание с Hugging Face (встроенный HF CLI в portable), выбор папки загрузки, удаление с диска |
+| **Чат** | Стриминг, параметры генерации, system prompt, сжатие истории / working memory |
+| **Агент** | План, инструменты (файлы, терминал, поиск, браузер), `@agent` / авто-intent, подтверждение опасных действий, force-write для coding-задач |
+| **Безопасность** | Path sandbox + junctions, cwd shell ⊆ project/modelRoots, deny `cd` вне roots, SSRF в браузере, таймаут подтверждений |
+| **Прочее** | MCP, OpenAI-совместимый локальный proxy, монитор VRAM/tok/s, темы UI, онбординг |
+
+---
 
 ## Требования
 
 - Windows x64
 - Node.js 20+
 - pnpm 9+
-- NVIDIA/AMD/CPU — по железу
+- GPU NVIDIA/AMD или CPU — по железу
 
-## Установка
+---
+
+## Быстрый старт (portable)
+
+Сборка одной папки, которую можно копировать на другой ПК:
+
+```bash
+pnpm install
+pnpm pack
+```
+
+Результат: `release\KoviAIsoft-Portable\`
+
+| Путь | Назначение |
+|------|------------|
+| `KoviAIsoft.exe` | Запуск |
+| `data\` | Настройки, чаты, runtime |
+| `tools\hf\` | Встроенный Hugging Face CLI (preseed при pack) |
+| `playwright-browsers\` | Chromium для агента |
+| `resources\ui\` | UI |
+
+Также появляется single-file portable в `release\builder-out\`.
+
+`pnpm pack` перед сборкой делает `taskkill` для `KoviAIsoft.exe`, чтобы разблокировать папку release.
+
+---
+
+## Разработка
 
 ```bash
 git clone https://github.com/Koviand/KoviAIsoft.git
@@ -23,54 +63,65 @@ cd KoviAIsoft
 pnpm install
 ```
 
-Для браузер-инструментов агента:
+Браузерные инструменты агента (один раз):
 
 ```bash
-pnpm --filter @kovi/core exec playwright install chromium
+pnpm playwright:install
 ```
 
-## Запуск (dev)
-
-Терминал 1:
+Два терминала:
 
 ```bash
 pnpm dev:ui
-```
-
-Терминал 2:
-
-```bash
 pnpm dev:desktop
 ```
 
-## Portable EXE (одна папка, можно копировать на другой ПК)
+Проверки:
 
 ```bash
-pnpm pack
+pnpm typecheck
+pnpm test
 ```
 
-Готовая папка:
-`release\KoviAIsoft-Portable\`
-- `KoviAIsoft.exe` — запуск
-- `data\` — настройки, чаты, скачанный llama.cpp
-- `playwright-browsers\` — Chromium для агента
-- `resources\ui\` — интерфейс
+CI: `.github/workflows/ci.yml` (Windows: typecheck + test).
 
-Скопируйте всю папку `KoviAIsoft-Portable` на другой Windows x64 ПК и запустите EXE.
-Также создаётся single-file portable в `release\builder-out\`.
+Данные в dev: обычно `%APPDATA%\KoviAIsoft\` (в portable — `data\` рядом с EXE).
 
-## Быстрый сценарий
+---
 
-1. Откройте **Runtime** → «Установить сейчас» (или дождитесь тихого автообновления).
-2. **Модели** → «Обновить список» (по умолчанию `C:\Models\LFM`) или скачайте GGUF с HF.
-3. Нажмите **Загрузить в память** у нужной модели.
-4. В **Чат** отправьте сообщение. Для правок файлов/кода используйте `@agent …` или откройте папку проекта в Настройках — intent routing сам вызовет инструменты.
-5. В **Настройках** выберите папку проекта. Откройте **Монитор** для VRAM/tok/s.
+## Сценарий использования
 
-Данные приложения: рядом с portable EXE в `data\` (или `%APPDATA%\KoviAIsoft\` в dev).
+1. **Runtime** → установить llama.cpp (или дождаться тихого автообновления).
+2. **Модели** → выбрать папку загрузки / сканирования → скачать GGUF с HF или указать локальные файлы → **Загрузить в память**.
+3. **Настройки** → папка проекта (для агента и `AGENTS.md`), режим подтверждений (Ask / Auto-safe / Full), тема.
+4. **Чат** → обычный диалог; для кода и файлов — `@agent …` или включённые tools у сессии (intent routing тоже может включить агента).
+5. **Монитор** → VRAM, tok/s, контекст.
 
-### Git push / CI
+Остановка генерации — кнопка Stop в topbar.
 
-Если `git push` зависает на credentials: выполните `gh auth login` (или настройте SSH/PAT) и повторите push. CI: `.github/workflows/ci.yml` (`pnpm typecheck` + `pnpm test`).
+---
 
-`pnpm pack` перед сборкой делает `taskkill` для `KoviAIsoft.exe`, чтобы разблокировать папку release.
+## Структура репозитория
+
+```
+apps/ui          — React UI
+apps/desktop     — Electron main / preload
+packages/core    — агент, чат, runtime, tools, HF, store
+packages/shared  — типы и IPC-контракт
+scripts/         — pack-portable и smoke
+tests/           — vitest
+```
+
+---
+
+## Заметки
+
+- Только локальные модели; токены HF/GitHub опциональны (gated-репо / rate limit).
+- Агент адаптирует Unix-команды под Windows (`cmd` / PowerShell); запись кода через heredoc запрещена — используйте `write_file`.
+- Если `git push` просит credentials: `gh auth login` или SSH/PAT.
+
+---
+
+## Лицензия / статус
+
+Проект в активной разработке (`0.1.0`). Issues и PR — в GitHub-репозитории выше.
