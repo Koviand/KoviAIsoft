@@ -1,27 +1,84 @@
-import { BUILTIN_TOOL_SPECS } from "./toolsCatalog.js";
+import {
+  BATCHABLE_TOOL_NAMES,
+  BUILTIN_TOOL_SPECS,
+  CORE_TOOL_NAMES,
+} from "./toolsCatalog.js";
 
 export type ConstraintMode = "tools" | "json_schema" | "grammar" | "none";
 
+export type ExtraToolSpec = {
+  name: string;
+  description?: string;
+  inputSchema?: unknown;
+};
+
+function normalizeMcpParameters(inputSchema: unknown): Record<string, unknown> {
+  if (inputSchema && typeof inputSchema === "object" && !Array.isArray(inputSchema)) {
+    const s = inputSchema as Record<string, unknown>;
+    const properties =
+      s.properties && typeof s.properties === "object" && !Array.isArray(s.properties)
+        ? (s.properties as Record<string, unknown>)
+        : {};
+    const required = Array.isArray(s.required)
+      ? s.required.filter((x): x is string => typeof x === "string")
+      : undefined;
+    return {
+      type: "object",
+      properties,
+      ...(required?.length ? { required } : {}),
+      additionalProperties: s.additionalProperties !== false,
+    };
+  }
+  return { type: "object", properties: {}, additionalProperties: true };
+}
+
+export type BuildToolsOpts = {
+  extraTools?: ExtraToolSpec[];
+  /** When true, only CORE builtins (+ no MCP unless passed — caller should omit extras). */
+  compact?: boolean;
+  /** Explicit allow-list of builtin names; defaults from compact. */
+  allowBuiltinNames?: string[];
+};
+
+function selectBuiltinSpecs(opts?: BuildToolsOpts) {
+  if (opts?.allowBuiltinNames?.length) {
+    const allow = new Set(opts.allowBuiltinNames);
+    return BUILTIN_TOOL_SPECS.filter((t) => allow.has(t.name));
+  }
+  if (opts?.compact) {
+    return BUILTIN_TOOL_SPECS.filter((t) => CORE_TOOL_NAMES.has(t.name));
+  }
+  return [...BUILTIN_TOOL_SPECS];
+}
+
 /** OpenAI Chat Completions `tools` array from built-in (+ extra) specs. */
 export function buildOpenAiTools(
-  extraToolNames: string[] = [],
+  extraToolNamesOrOpts: string[] | BuildToolsOpts = [],
 ): Array<{
   type: "function";
   function: { name: string; description: string; parameters: Record<string, unknown> };
 }> {
-  const extras = extraToolNames
-    .filter(Boolean)
-    .filter((n) => !BUILTIN_TOOL_SPECS.some((t) => t.name === n))
-    .map((name) => ({
+  const opts: BuildToolsOpts = Array.isArray(extraToolNamesOrOpts)
+    ? {
+        extraTools: extraToolNamesOrOpts.filter(Boolean).map((name) => ({ name })),
+      }
+    : extraToolNamesOrOpts;
+
+  const builtins = selectBuiltinSpecs(opts);
+  const builtinNames = new Set<string>(builtins.map((t) => t.name));
+  const extras = (opts.extraTools || [])
+    .filter((t) => t?.name && !builtinNames.has(t.name))
+    .map((t) => ({
       type: "function" as const,
       function: {
-        name,
-        description: `MCP/extra tool ${name}`,
-        parameters: { type: "object", properties: {}, additionalProperties: true },
+        name: t.name,
+        description: t.description || `MCP/extra tool ${t.name}`,
+        parameters: normalizeMcpParameters(t.inputSchema),
       },
     }));
+
   return [
-    ...BUILTIN_TOOL_SPECS.map((t) => ({
+    ...builtins.map((t) => ({
       type: "function" as const,
       function: {
         name: t.name,
@@ -63,6 +120,11 @@ export function toolCallsToActionJson(
   if (mapped.length === 1) {
     return JSON.stringify({ thought, tool: mapped[0], final: null });
   }
+  // tools[] only when every call is BATCHABLE read-only; otherwise first call alone.
+  const allBatchable = mapped.every((m) => BATCHABLE_TOOL_NAMES.has(m.name));
+  if (!allBatchable) {
+    return JSON.stringify({ thought, tool: mapped[0], final: null });
+  }
   return JSON.stringify({
     thought,
     tools: mapped.slice(0, 3),
@@ -70,15 +132,22 @@ export function toolCallsToActionJson(
   });
 }
 
+function toolNameEnum(opts?: BuildToolsOpts): string[] {
+  const builtins = selectBuiltinSpecs(opts).map((t) => t.name);
+  const extras = (opts?.extraTools || []).map((t) => t.name).filter(Boolean);
+  return [...new Set([...builtins, ...extras])];
+}
+
 /** Soft JSON Schema for agent step envelope (args intentionally loose). */
 export function buildAgentActionJsonSchema(
-  extraToolNames: string[] = [],
+  extraToolNamesOrOpts: string[] | BuildToolsOpts = [],
 ): Record<string, unknown> {
-  const names = [
-    ...BUILTIN_TOOL_SPECS.map((t) => t.name),
-    ...extraToolNames.filter(Boolean),
-  ];
-  const unique = [...new Set(names)];
+  const opts: BuildToolsOpts = Array.isArray(extraToolNamesOrOpts)
+    ? {
+        extraTools: extraToolNamesOrOpts.filter(Boolean).map((name) => ({ name })),
+      }
+    : extraToolNamesOrOpts;
+  const unique = toolNameEnum(opts);
   return {
     type: "object",
     properties: {
@@ -142,39 +211,117 @@ export function buildAgentActionJsonSchema(
 }
 
 /**
- * Permissive JSON-object GBNF (llama.cpp). Steers models away from prose
- * without locking tool args to a brittle schema.
+ * Envelope-oriented GBNF: JSON object whose members prefer agent keys
+ * (thought / tool / tools / final / plan) in any order.
  */
 export function buildAgentActionGbnf(): string {
-  return `root   ::= object
+  return `root ::= "{" ws (member ("," ws member)*)? "}"
+member ::= thought-kv | tool-kv | tools-kv | final-kv | plan-kv | any-kv
+thought-kv ::= "\\"thought\\"" ws ":" ws string
+tool-kv ::= "\\"tool\\"" ws ":" ws (null | object)
+tools-kv ::= "\\"tools\\"" ws ":" ws (null | array)
+final-kv ::= "\\"final\\"" ws ":" ws (null | string)
+plan-kv ::= "\\"plan\\"" ws ":" ws (null | array)
+any-kv ::= string ":" ws value
 object ::= "{" ws (string ":" ws value ("," ws string ":" ws value)*)? "}"
 array  ::= "[" ws (value ("," ws value)*)? "]"
-value  ::= object | array | string | number | ("true" | "false" | "null")
+value  ::= object | array | string | number | ("true" | "false" | null)
+null   ::= "null"
 string ::= "\\"" ([^"\\\\] | "\\\\" ["\\\\/bfnrt] | "\\\\u" [0-9a-fA-F]{4})* "\\""
 number ::= ("-"? ([0-9] | [1-9] [0-9]*)) ("." [0-9]+)? ([eE] [-+]? [0-9]+)?
 ws     ::= ([ \\t\\n])*
 `;
 }
 
+/** Plan-phase schema: plan[] required, no tools. */
+export function buildPlanPhaseJsonSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      thought: { type: "string" },
+      plan: {
+        type: "array",
+        minItems: 3,
+        maxItems: 7,
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            title: { type: "string" },
+            kind: {
+              type: "string",
+              enum: ["explore", "edit", "run", "verify", "finalize"],
+            },
+          },
+          required: ["id", "title"],
+          additionalProperties: true,
+        },
+      },
+      tool: { type: "null" },
+      final: { type: "null" },
+    },
+    required: ["thought", "plan"],
+    additionalProperties: true,
+  };
+}
+
 export function responseFormatJsonSchema(
-  extraToolNames: string[] = [],
+  extraToolNamesOrOpts: string[] | BuildToolsOpts = [],
+  opts?: { planOnly?: boolean },
 ): Record<string, unknown> {
   return {
     type: "json_schema",
     json_schema: {
-      name: "kovi_agent_action",
+      name: opts?.planOnly ? "kovi_agent_plan" : "kovi_agent_action",
       strict: false,
-      schema: buildAgentActionJsonSchema(extraToolNames),
+      schema: opts?.planOnly
+        ? buildPlanPhaseJsonSchema()
+        : buildAgentActionJsonSchema(extraToolNamesOrOpts),
     },
   };
 }
 
+/** True when text looks like a usable agent envelope (or Hermes tool_call). */
+export function looksLikeUsableAgentJson(text: string): boolean {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (!t) return false;
+  if (/<tool_call\b/i.test(t)) return true;
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start < 0 || end <= start) return false;
+  try {
+    const obj = JSON.parse(t.slice(start, end + 1)) as Record<string, unknown>;
+    if (!obj || typeof obj !== "object") return false;
+    if (obj.tool && typeof obj.tool === "object") return true;
+    if (Array.isArray(obj.tools) && obj.tools.length > 0) return true;
+    if (typeof obj.final === "string" && obj.final.trim()) return true;
+    if (Array.isArray(obj.plan) && obj.plan.length > 0) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 /** Pick next constraint mode given known server capabilities. */
-export function pickConstraintMode(caps: {
-  toolsOk?: boolean | null;
-  jsonSchemaOk: boolean | null;
-  grammarOk: boolean | null;
-}): ConstraintMode {
+export function pickConstraintMode(
+  caps: {
+    toolsOk?: boolean | null;
+    jsonSchemaOk: boolean | null;
+    grammarOk: boolean | null;
+  },
+  preferred: ConstraintMode = "tools",
+): ConstraintMode {
+  if (preferred === "json_schema") {
+    if (caps.jsonSchemaOk !== false) return "json_schema";
+    if (caps.grammarOk !== false) return "grammar";
+    return "none";
+  }
+  if (preferred === "grammar") {
+    if (caps.grammarOk !== false) return "grammar";
+    return "none";
+  }
+  if (preferred === "none") return "none";
+  // preferred tools (default)
   if (caps.toolsOk !== false) return "tools";
   if (caps.jsonSchemaOk !== false) return "json_schema";
   if (caps.grammarOk !== false) return "grammar";

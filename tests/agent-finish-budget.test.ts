@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   AGENT_FINISH_WINDOW,
   AGENT_NON_ADVANCING_MAX,
+  AGENT_REFUSAL_HARD_STOP,
   AGENT_REPAIR_MAX,
   AGENT_STEPS_SAFETY_CAP,
   AGENT_TRUNCATION_MAX,
@@ -9,6 +10,7 @@ import {
   buildAgentResumePrompt,
   clampAgentMaxSteps,
   inFinishWindow,
+  isModelRefusalText,
   normalizeAgentMaxStepsSetting,
   synthesizeBudgetExhaustedAnswer,
   toolFingerprint,
@@ -116,6 +118,35 @@ describe("hard caps constants", () => {
     expect(AGENT_REPAIR_MAX).toBeLessThanOrEqual(4);
     expect(AGENT_TRUNCATION_MAX).toBeLessThanOrEqual(4);
     expect(AGENT_NON_ADVANCING_MAX).toBe(4);
+    expect(AGENT_REFUSAL_HARD_STOP).toBe(2);
+  });
+});
+
+describe("isModelRefusalText", () => {
+  it("detects Russian tiny-model refusals from the screenshot loop", () => {
+    expect(
+      isModelRefusalText(
+        "Извините, но я не могу выполнить ваш запрос. Пожалуйста, уточните вашу задачу или предоставьте больше деталей.",
+      ),
+    ).toBe(true);
+    expect(
+      isModelRefusalText(
+        JSON.stringify({
+          thought: "Извините, но я не могу выполнить ваш запрос.",
+          tool: null,
+          final: "Уточните вашу задачу",
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("detects English refusals; ignores normal tool thoughts", () => {
+    expect(isModelRefusalText("Sorry, I can't help with that request.")).toBe(true);
+    expect(isModelRefusalText("I'm unable to fulfill this.")).toBe(true);
+    expect(
+      isModelRefusalText('{"thought":"пишу main.py","tool":{"name":"write_file"},"final":null}'),
+    ).toBe(false);
+    expect(isModelRefusalText("ок")).toBe(false);
   });
 });
 

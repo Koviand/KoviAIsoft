@@ -11,6 +11,28 @@ export const AGENT_IDENTICAL_TOOL_MAX = 2;
 /** Nudge after this many scout tools; hard-stop at HARD_STOP. */
 export const AGENT_NON_ADVANCING_MAX = 4;
 export const AGENT_NON_ADVANCING_HARD_STOP = AGENT_NON_ADVANCING_MAX * 3;
+/** Soft refusals from tiny instruct models → stop after this many in a row. */
+export const AGENT_REFUSAL_HARD_STOP = 2;
+
+/**
+ * Detect chatty refusals / "I can't help" instead of JSON tools.
+ * Tiny models (e.g. qwen2.5-coder-1.5b) often loop this forever.
+ */
+export function isModelRefusalText(text: string): boolean {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (!t || t.length < 12) return false;
+  return (
+    /не\s+могу\s+(выполнить|помочь|сделать|ответить)/i.test(t) ||
+    /извините,?\s+но\s+я\s+не\s+могу/i.test(t) ||
+    /уточните\s+вашу\s+задачу/i.test(t) ||
+    /предоставьте\s+больше\s+деталей/i.test(t) ||
+    /\bi\s+can'?t\s+(help|assist|do|fulfill|complete)\b/i.test(t) ||
+    /\bi'?m\s+unable\s+to\b/i.test(t) ||
+    /\bas\s+an\s+ai\b.{0,40}\b(can'?t|cannot|unable)\b/i.test(t) ||
+    /\bsorry,?\s+i\s+(can'?t|cannot)\b/i.test(t) ||
+    /\bi\s+must\s+refuse\b/i.test(t)
+  );
+}
 
 /** User turn to resume after stop / budget without full replan. */
 export function buildAgentResumePrompt(goalHint?: string): string {

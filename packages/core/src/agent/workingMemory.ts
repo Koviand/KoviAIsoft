@@ -143,7 +143,15 @@ export function updatePlanMemory(
     id: s.id,
     title: s.title,
     status: s.status,
+    ...(s.kind ? { kind: s.kind } : {}),
   }));
+}
+
+/** Clear checklist after successful final so the next user turn starts fresh. */
+export function clearPlanAfterCompletion(wm: AgentWorkingMemory): void {
+  wm.plan = [];
+  wm.planFrozen = false;
+  wm.lastError = null;
 }
 
 export function rememberToolSuccess(

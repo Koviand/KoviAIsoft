@@ -121,6 +121,10 @@ export interface RuntimeStatus {
   serverRunning: boolean;
   serverPort: number | null;
   loadedModelId: string | null;
+  /** Basename / display name of the loaded GGUF (for family detection). */
+  loadedModelName: string | null;
+  /** Absolute path of the loaded GGUF. */
+  loadedModelPath: string | null;
   /** Context size actually passed to llama-server on last successful load. */
   loadedContext: number | null;
   /** GPU layers actually passed to llama-server on last successful load. */
@@ -301,6 +305,15 @@ export interface HardwareLoadSuggestion {
   agentMaxSteps: number;
 }
 
+/** Result of applying a load profile / «Под этот ПК». */
+export interface ApplyLoadSettingsResult {
+  settings: AppSettings;
+  reload: {
+    status: "ok" | "skipped" | "error" | "idle";
+    detail?: string;
+  };
+}
+
 /** Status of the local semantic @codebase index. */
 export interface CodebaseIndexStatus {
   ready: boolean;
@@ -327,11 +340,20 @@ export interface HfCliStatus {
   installing?: boolean;
 }
 
+export type AgentPlanStepKind =
+  | "explore"
+  | "edit"
+  | "run"
+  | "verify"
+  | "finalize";
+
 export interface AgentPlanStep {
   id: string;
   title: string;
   status: "pending" | "running" | "done" | "failed" | "skipped";
   detail?: string;
+  /** Cursor-like step kind — drives tool advance without title regex. */
+  kind?: AgentPlanStepKind;
 }
 
 export interface AgentConfirmation {

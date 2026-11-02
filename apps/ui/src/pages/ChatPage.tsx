@@ -365,9 +365,29 @@ export function ChatPage(props: {
 
   async function ensureSessionId(): Promise<{ id: string; existed: boolean }> {
     if (props.activeSessionId) return { id: props.activeSessionId, existed: true };
-    const session = await api.createSession("chat");
+    // Backend picks agent when projectRoot is set (Cursor-like).
+    const session = await api.createSession();
     props.setSessions(await api.listSessions());
     return { id: session.id, existed: false };
+  }
+
+  async function toggleAgentMode(): Promise<void> {
+    const session = props.sessions.find((s) => s.id === props.activeSessionId);
+    if (!session || props.busy) return;
+    const nextEnabled = !Boolean(session.toolsEnabled);
+    try {
+      const updated = await api.updateSession({
+        id: session.id,
+        toolsEnabled: nextEnabled,
+        mode: nextEnabled ? "agent" : "chat",
+      });
+      props.setSessions(await api.listSessions());
+      if (updated.id === props.activeSessionId) {
+        /* listSessions refresh is enough */
+      }
+    } catch (e) {
+      props.setError(e instanceof Error ? e.message : String(e));
+    }
   }
 
   function scheduleSessionPatch(next: ChatSession): void {
@@ -588,7 +608,7 @@ export function ChatPage(props: {
             type="button"
             onClick={async () => {
               try {
-                const s = await api.createSession("chat");
+                const s = await api.createSession();
                 props.setSessions(await api.listSessions());
                 props.setActiveSessionId(s.id);
               } catch (e) {
@@ -917,9 +937,23 @@ export function ChatPage(props: {
         <div className="composer-dock">
           <div className="composer">
             <div className="composer-toolbar">
+              <button
+                type="button"
+                className={`btn ghost composer-mode ${
+                  props.sessions.find((s) => s.id === props.activeSessionId)?.toolsEnabled
+                    ? "on"
+                    : ""
+                }`}
+                disabled={props.busy || !props.activeSessionId}
+                title="Агент может править файлы и запускать команды. Чат — только ответы."
+                onClick={() => void toggleAgentMode()}
+              >
+                {props.sessions.find((s) => s.id === props.activeSessionId)?.toolsEnabled
+                  ? "Режим: Агент"
+                  : "Режим: Чат"}
+              </button>
               <span className="muted composer-hint">
-                Один чат: ответы и действия. @ — файлы / @codebase / @agent. Enter — отправить,
-                Shift+Enter — новая строка.
+                @ — файлы / @codebase / @agent. Enter — отправить, Shift+Enter — строка.
               </span>
             </div>
             <div className="composer-input-wrap">

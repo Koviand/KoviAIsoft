@@ -11,11 +11,14 @@ import {
 import {
   buildAgentActionGbnf,
   buildOpenAiTools,
+  looksLikeUsableAgentJson,
   nextConstraintModeAfterFailure,
   pickConstraintMode,
   responseFormatJsonSchema,
   toolCallsToActionJson,
+  type BuildToolsOpts,
   type ConstraintMode,
+  type ExtraToolSpec,
 } from "../agent/actionSchema.js";
 import {
   formatLlmFetchError,
@@ -180,13 +183,16 @@ export class ChatEngine {
           }),
         });
       } catch (err) {
-        this.abort = null;
-        this.activeSessionId = null;
+        // Keep busy flag until recovery finishes so load/agent gates cannot race.
         try {
           await this.runtime.assertLlmReady();
         } catch (probeErr) {
+          this.abort = null;
+          this.activeSessionId = null;
           throw formatLlmFetchError(probeErr, base);
         }
+        this.abort = null;
+        this.activeSessionId = null;
         throw formatLlmFetchError(err, base);
       }
 
@@ -350,7 +356,14 @@ export class ChatEngine {
     messages: OpenAiMessage[],
     params: GenerationParams,
     sessionId?: string,
-    opts?: { extraToolNames?: string[] },
+    opts?: {
+      extraToolNames?: string[];
+      extraTools?: ExtraToolSpec[];
+      compact?: boolean;
+      planOnly?: boolean;
+      /** Preferred first constraint mode (family policy). */
+      preferredConstraint?: ConstraintMode;
+    },
   ): Promise<string> {
     let base: string;
     try {
@@ -373,6 +386,13 @@ export class ChatEngine {
       minPromptReserve: 512,
     });
 
+    const toolsOpts = (): BuildToolsOpts => ({
+      compact: Boolean(opts?.compact),
+      extraTools:
+        opts?.extraTools ||
+        (opts?.extraToolNames || []).map((name) => ({ name })),
+    });
+
     const buildBody = (
       packed: OpenAiMessage[],
       tokenBudget: number,
@@ -389,11 +409,14 @@ export class ChatEngine {
         max_tokens: tokenBudget,
         stream,
       };
-      if (mode === "tools") {
-        body.tools = buildOpenAiTools(opts?.extraToolNames || []);
+      if (mode === "tools" && !opts?.planOnly) {
+        body.tools = buildOpenAiTools(toolsOpts());
         body.tool_choice = "auto";
-      } else if (mode === "json_schema") {
-        body.response_format = responseFormatJsonSchema(opts?.extraToolNames || []);
+      } else if (mode === "json_schema" || (mode === "tools" && opts?.planOnly)) {
+        // Plan phase: never expose native/MCP tools — JSON schema with plan[] only.
+        body.response_format = responseFormatJsonSchema(toolsOpts(), {
+          planOnly: Boolean(opts?.planOnly),
+        });
       } else if (mode === "grammar") {
         body.grammar = buildAgentActionGbnf();
       }
@@ -615,11 +638,20 @@ export class ChatEngine {
       signal: AbortSignal,
       msgs: OpenAiMessage[],
     ): Promise<string> => {
-      let mode = pickConstraintMode({
-        toolsOk: this.runtime.toolsOk,
-        jsonSchemaOk: this.runtime.jsonSchemaOk,
-        grammarOk: this.runtime.grammarOk,
-      });
+      let mode = opts?.planOnly
+        ? this.runtime.jsonSchemaOk === false
+          ? this.runtime.grammarOk === false
+            ? "none"
+            : "grammar"
+          : "json_schema"
+        : pickConstraintMode(
+            {
+              toolsOk: this.runtime.toolsOk,
+              jsonSchemaOk: this.runtime.jsonSchemaOk,
+              grammarOk: this.runtime.grammarOk,
+            },
+            opts?.preferredConstraint || "tools",
+          );
 
       const runWithMode = async (m: ConstraintMode) => {
         let attemptMsgs = msgs;
@@ -656,10 +688,25 @@ export class ChatEngine {
         return result;
       };
 
-      // Walk json_schema → grammar → none on 4xx / unsupported.
+      // Walk tools → json_schema → grammar → none on 4xx / soft-fail / unsupported.
       for (;;) {
         try {
           const result = await runWithMode(mode);
+          // Soft-fail: HTTP 200 tools mode with prose / empty envelope → retry next mode.
+          if (
+            mode === "tools" &&
+            !opts?.planOnly &&
+            !looksLikeUsableAgentJson(result.content)
+          ) {
+            markConstraintFailure(mode);
+            const next = nextConstraintModeAfterFailure(mode);
+            if (!next) {
+              markConstraintSuccess(mode);
+              return result.content;
+            }
+            mode = next;
+            continue;
+          }
           markConstraintSuccess(mode);
           return result.content;
         } catch (err) {

@@ -17,6 +17,7 @@ import type {
   LocalModel,
   McpHealthResult,
   McpServerConfig,
+  ApplyLoadSettingsResult,
   HardwareLoadSuggestion,
   HfCliStatus,
   ModelRecommendationsReport,
@@ -197,12 +198,12 @@ export interface KoviApi {
     modelId?: string;
     applyBackend?: boolean;
     applyDefaultParams?: boolean;
-  }): Promise<AppSettings>;
+  }): Promise<ApplyLoadSettingsResult>;
   /** Activate a load profile and sync defaultParams (context/ngl/maxTokens/flash). */
   applyLoadProfileToSettings(opts: {
     profileId: string;
     modelId?: string;
-  }): Promise<AppSettings>;
+  }): Promise<ApplyLoadSettingsResult>;
   searchHf(query: string): Promise<HfSearchResult[]>;
   listHfFiles(modelId: string): Promise<HfFile[]>;
   downloadHfFile(modelId: string, filePath: string): Promise<string>;

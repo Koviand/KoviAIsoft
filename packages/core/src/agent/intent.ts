@@ -9,20 +9,38 @@ export function detectCodingTask(text: string): boolean {
   if (!trimmed) return false;
   // Verb stem + concrete artifact (JS `\b` is ASCII-only — avoid for Cyrillic).
   const ruEn =
-    /(напис\p{L}*|напиш\p{L}*|созда\p{L}*|сдела\p{L}*|реализ\p{L}*|постро\p{L}*|исправ\p{L}*|добав\p{L}*|перепиш\p{L}*|рефактор\p{L}*).{0,100}(игр[уыае]|программ\p{L}*|скрипт\p{L}*|файл\p{L}*|проект\p{L}*|приложени\p{L}*|код\p{L}*|модул\p{L}*|функци\p{L}*|класс\p{L}*|auth|tetris|тетрис|\.py|\.ts|\.js|\.tsx|\.html|\.css|\.json)/iu.test(
+    /(напис\p{L}*|напиш\p{L}*|созда\p{L}*|сдела\p{L}*|реализ\p{L}*|постро\p{L}*|исправ\p{L}*|добав\p{L}*|перепиш\p{L}*|рефактор\p{L}*|почин\p{L}*|допил\p{L}*|доработ\p{L}*).{0,100}(игр[уыае]|программ\p{L}*|скрипт\p{L}*|файл\p{L}*|проект\p{L}*|приложени\p{L}*|код\p{L}*|модул\p{L}*|функци\p{L}*|класс\p{L}*|баг\p{L}*|ошибк\p{L}*|auth|tetris|тетрис|\.py|\.ts|\.js|\.tsx|\.html|\.css|\.json)/iu.test(
       trimmed,
     ) ||
-    /\b(write|create|implement|build|fix|edit|refactor|rewrite)\b.{0,80}\b(game|app|file|script|python|module|function|auth|tetris|code|\.py|\.ts|\.js|\.tsx|\.html)\b/i.test(
+    /\b(write|create|implement|build|fix|edit|refactor|rewrite|repair)\b.{0,80}\b(game|app|file|script|python|module|function|bug|auth|tetris|code|\.py|\.ts|\.js|\.tsx|\.html)\b/i.test(
       trimmed,
     );
   if (ruEn) return true;
   // Shorter cues for force-write inside agent loop (need an action verb, not just a language name).
-  return /(напиш|создай|сделай|реализ|добав|исправ|перепиш).{0,80}(файл|код|игр[ауые]|тетрис|tetris|скрипт|программ|модул|\.py|\.ts|\.js|\.tsx|\.html)/i.test(
-    trimmed,
-  ) ||
+  return (
+    /(напиш|создай|сделай|реализ|добав|исправ|почин|перепиш|допил).{0,80}(файл|код|игр[ауые]|тетрис|tetris|скрипт|программ|модул|баг|\.py|\.ts|\.js|\.tsx|\.html)/i.test(
+      trimmed,
+    ) ||
     /\b(write|create|implement|fix|edit).{0,60}(\.py|\.ts|\.js|\.tsx|file|script|game|tetris)\b/i.test(
       trimmed,
-    );
+    )
+  );
+}
+
+/**
+ * Short project tasks when projectRoot is set — Cursor-like «сделай tetris» / «почини X»
+ * without requiring the word «файл/код» in the same phrase.
+ */
+export function detectShortProjectTask(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length > 220) return false;
+  // Avoid \\b for Cyrillic (JS word chars are ASCII-only).
+  return (
+    /^(сделай|создай|напиши|почини|исправь|добавь|реализуй|перепиши|допиши|убери|удали|проверь|запусти)($|[\s:,.!?])/i.test(
+      trimmed,
+    ) ||
+    /^(make|create|write|fix|add|implement|build|remove|delete|check|run)\b/i.test(trimmed)
+  );
 }
 
 /** Shell / FS / browser actions that need tools even without a coding verb. */
@@ -46,5 +64,7 @@ export function detectAgentTask(
   opts?: { projectRoot?: string | null },
 ): boolean {
   const hasProject = Boolean(opts?.projectRoot && String(opts.projectRoot).trim());
-  return detectCodingTask(text) || detectToolAction(text, hasProject);
+  if (detectCodingTask(text) || detectToolAction(text, hasProject)) return true;
+  if (hasProject && detectShortProjectTask(text)) return true;
+  return false;
 }

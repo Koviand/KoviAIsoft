@@ -159,7 +159,9 @@ export function App() {
             aria-label="Подтверждение действия"
           >
             <div style={{ minWidth: 0, flex: 1 }}>
-              <strong>Нужно подтверждение ({riskRu(state.pendingConfirm.risk)})</strong>
+              <strong>
+                Ждёт подтверждения ({riskRu(state.pendingConfirm.risk)}) — агент на паузе
+              </strong>
               <div className="mono" style={{ marginTop: 6 }}>
                 {state.pendingConfirm.summary}
               </div>

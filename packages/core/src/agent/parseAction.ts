@@ -196,14 +196,22 @@ export type ToolArgValidation =
 
 const BUILTIN_NAMES = new Set<string>(BUILTIN_TOOL_SPECS.map((t) => t.name));
 
+function requiredFromSchema(schema: unknown): string[] {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return [];
+  const req = (schema as { required?: unknown }).required;
+  return Array.isArray(req) ? req.filter((x): x is string => typeof x === "string") : [];
+}
+
 /**
  * Validate required tool args against BUILTIN_TOOL_SPECS.
  * Unknown non-MCP names are rejected (typos).
+ * Optional mcpSchemas: name → inputSchema for required-key checks.
  */
 export function validateToolArgs(
   toolName: string,
   args: Record<string, unknown> | undefined | null,
   extraToolNames: string[] = [],
+  mcpSchemas?: Record<string, unknown>,
 ): ToolArgValidation {
   const safe = args && typeof args === "object" && !Array.isArray(args) ? { ...args } : {};
   const isMcp = toolName.startsWith("mcp_");
@@ -216,6 +224,21 @@ export function validateToolArgs(
   }
   const spec = BUILTIN_TOOL_SPECS.find((t) => t.name === toolName);
   if (!spec) {
+    const mcpRequired = requiredFromSchema(mcpSchemas?.[toolName]);
+    if (mcpRequired.length) {
+      const missing = mcpRequired.filter((key) => {
+        const v = safe[key];
+        if (v == null) return true;
+        if (typeof v === "string" && !v.trim()) return true;
+        return false;
+      });
+      if (missing.length) {
+        return {
+          ok: false,
+          error: `Инструмент ${toolName}: не хватает args.${missing.join(", args.")}`,
+        };
+      }
+    }
     return { ok: true, args: safe };
   }
   const required = (spec.parameters as { required?: string[] }).required || [];

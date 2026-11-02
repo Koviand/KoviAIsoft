@@ -245,17 +245,21 @@ export function ModelsPage(props: {
   async function setProfile(id: string): Promise<void> {
     if (!props.settings) return;
     try {
-      const saved = await api.applyLoadProfileToSettings({
+      const res = await api.applyLoadProfileToSettings({
         profileId: id,
         modelId: preferModelId(),
       });
-      props.setSettings(saved);
-      if (props.loadedModelId) {
-        setHint("Профиль применён, модель перезагружена с новыми ngl/ctx.");
-        await props.refresh();
+      props.setSettings(res.settings);
+      if (res.reload.status === "ok") {
+        setHint(res.reload.detail || "Профиль применён, модель перезагружена.");
+      } else if (res.reload.status === "skipped" || res.reload.status === "error") {
+        setHint(res.reload.detail || "Профиль сохранён.");
       } else {
-        setHint(`Профиль «${saved.loadProfiles.find((p) => p.id === id)?.name || id}» активен`);
+        setHint(
+          `Профиль «${res.settings.loadProfiles.find((p) => p.id === id)?.name || id}» активен`,
+        );
       }
+      await props.refresh();
     } catch (e) {
       props.setError(e instanceof Error ? e.message : String(e));
     }
@@ -295,23 +299,24 @@ export function ModelsPage(props: {
     setHwBusy(true);
     try {
       const mid = preferModelId();
-      const saved = await api.applyHardwareLoadSettings({
+      const res = await api.applyHardwareLoadSettings({
         modelId: mid,
         applyBackend: true,
         applyDefaultParams: true,
       });
-      props.setSettings(saved);
+      props.setSettings(res.settings);
       setHwPreview(null);
-      const auto = saved.loadProfiles.find((p) => p.id === AUTO_PC_PROFILE_ID);
-      setHint(
-        `Под ПК: ngl ${auto?.gpuLayers}, ctx ${saved.defaultParams.context}, maxTokens ${saved.defaultParams.maxTokens}.${
-          props.loadedModelId
-            ? " Модель перезагружена с этими параметрами."
+      const auto = res.settings.loadProfiles.find((p) => p.id === AUTO_PC_PROFILE_ID);
+      const base = `Под ПК: ngl ${auto?.gpuLayers}, ctx ${res.settings.defaultParams.context}, maxTokens ${res.settings.defaultParams.maxTokens} (backend=auto).`;
+      const reloadPart =
+        res.reload.status === "ok"
+          ? ` ${res.reload.detail || "Модель перезагружена."}`
+          : res.reload.status === "skipped" || res.reload.status === "error"
+            ? ` ${res.reload.detail || ""}`
             : mid
               ? ""
-              : " Размер модели не учтён — загрузите модель и нажмите снова."
-        }`,
-      );
+              : " Размер модели не учтён — загрузите модель и нажмите снова.";
+      setHint(base + reloadPart);
       await props.refresh();
     } catch (e) {
       props.setError(e instanceof Error ? e.message : String(e));

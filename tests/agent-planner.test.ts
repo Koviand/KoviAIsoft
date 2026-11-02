@@ -10,16 +10,17 @@ import {
   skipRemainingPlan,
 } from "../packages/core/src/agent/planner";
 import {
+  clearPlanAfterCompletion,
   createWorkingMemory,
   parseWorkingMemory,
   serializeWorkingMemory,
 } from "../packages/core/src/agent/workingMemory";
 
 describe("agent planner", () => {
-  it("normalizes draft to 3–7 pending steps", () => {
+  it("normalizes draft to 3–7 pending steps with kinds", () => {
     const steps = normalizePlanDraft(
       [
-        { id: "a", title: "  Skeleton  " },
+        { id: "a", title: "  Skeleton  ", kind: "edit" },
         { id: "b", title: "Logic" },
         { id: "c", title: "Run" },
         { id: "d", title: "Fix" },
@@ -35,6 +36,8 @@ describe("agent planner", () => {
     expect(steps!.length).toBeGreaterThanOrEqual(PLAN_MIN_STEPS);
     expect(steps!.every((s) => s.status === "pending")).toBe(true);
     expect(steps![0]!.title).toBe("Skeleton");
+    expect(steps![0]!.kind).toBe("edit");
+    expect(steps!.every((s) => Boolean(s.kind))).toBe(true);
   });
 
   it("pads short plans with defaults", () => {
@@ -87,5 +90,18 @@ describe("agent planner", () => {
     });
     const wm = parseWorkingMemory(raw);
     expect(wm?.planFrozen).toBe(true);
+  });
+
+  it("clearPlanAfterCompletion resets checklist for next turn", () => {
+    const wm = createWorkingMemory("задача");
+    wm.plan = defaultCodingPlan().map((s) => ({
+      id: s.id,
+      title: s.title,
+      status: "done",
+    }));
+    wm.planFrozen = true;
+    clearPlanAfterCompletion(wm);
+    expect(wm.plan).toEqual([]);
+    expect(wm.planFrozen).toBe(false);
   });
 });

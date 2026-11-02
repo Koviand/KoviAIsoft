@@ -47,9 +47,10 @@ describe("suggestHardwareLoadProfile", () => {
         hasNvidia: true,
         recommendedBackend: "cuda",
       }),
+      { layerCount: 32 },
     );
     expect(s.profile.gpuLayers).toBeGreaterThan(0);
-    expect(s.profile.gpuLayers).toBeLessThan(99);
+    expect(s.profile.gpuLayers).toBeLessThanOrEqual(32);
     expect(s.profile.context).toBe(4096);
     expect(s.vramGb).toBe(4);
   });
@@ -67,15 +68,16 @@ describe("suggestHardwareLoadProfile", () => {
     expect(s.profile.flashAttn).toBe(true);
   });
 
-  it("high VRAM (~16 GB)", () => {
+  it("high VRAM (~16 GB) with known layers", () => {
     const s = suggestHardwareLoadProfile(
       baseSys({
         gpus: [{ name: "RTX 4080", vendor: "NVIDIA", vramGb: 16, index: 0 }],
         hasNvidia: true,
         recommendedBackend: "cuda",
       }),
+      { layerCount: 40 },
     );
-    expect(s.profile.gpuLayers).toBe(99);
+    expect(s.profile.gpuLayers).toBe(40);
     expect(s.profile.context).toBe(16384);
     expect(s.profile.maxTokens).toBeGreaterThanOrEqual(4096);
     expect(s.profile.flashAttn).toBe(true);
@@ -97,16 +99,17 @@ describe("suggestHardwareLoadProfile", () => {
     expect(s.gpuName).toMatch(/4080/);
   });
 
-  it("tightens ngl for heavy model on mid VRAM", () => {
+  it("tightens ngl for heavy model on mid VRAM using layerCount", () => {
     const s = suggestHardwareLoadProfile(
       baseSys({
         gpus: [{ name: "RTX 3070", vendor: "NVIDIA", vramGb: 8, index: 0 }],
         hasNvidia: true,
         recommendedBackend: "cuda",
       }),
-      { modelSizeGb: 7.5 },
+      { modelSizeGb: 7.5, layerCount: 33 },
     );
-    expect(s.profile.gpuLayers).toBeLessThan(99);
+    expect(s.profile.gpuLayers).toBeLessThan(33);
+    expect(s.profile.gpuLayers).toBeGreaterThan(0);
     expect(s.rationale).toMatch(/Учтена модель/i);
   });
 
@@ -177,19 +180,23 @@ describe("applyHardwareLoadSettings", () => {
         const suggestion = await svc.suggestHardwareLoadSettings();
         expect(suggestion.profile.id).toBe(AUTO_PC_PROFILE_ID);
 
-        const saved = await svc.applyHardwareLoadSettings({ applyBackend: true });
+        const applied = await svc.applyHardwareLoadSettings({ applyBackend: true });
+        const saved = applied.settings;
         expect(saved.activeLoadProfileId).toBe(AUTO_PC_PROFILE_ID);
         const auto = saved.loadProfiles.find((p) => p.id === AUTO_PC_PROFILE_ID);
         expect(auto?.name).toBe("Под этот ПК");
         expect(auto?.hardwareAware).toBe(true);
         expect(saved.loadProfiles.some((p) => p.id === "fast")).toBe(true);
         expect(saved.loadProfiles.some((p) => p.id === "quality")).toBe(true);
-        expect(saved.runtimeBackendPreference).toBe(suggestion.backend);
+        // «Под этот ПК» keeps preference auto (does not stick to detected backend).
+        expect(saved.runtimeBackendPreference).toBe("auto");
+        expect(applied.reload.status).toMatch(/ok|skipped|error|idle/);
+        expect(suggestion.backend).toBeTruthy();
 
         await svc.applyHardwareLoadSettings({ applyBackend: false });
         const again = svc.getSettings();
         expect(again.loadProfiles.filter((p) => p.id === AUTO_PC_PROFILE_ID)).toHaveLength(1);
-        expect(again.runtimeBackendPreference).toBe(suggestion.backend);
+        expect(again.runtimeBackendPreference).toBe("auto");
       } finally {
         await svc.dispose();
       }
@@ -201,7 +208,8 @@ describe("applyHardwareLoadSettings", () => {
     const svc = new AppService(tmp + "-tier");
     await svc.init();
     try {
-      const saved = await svc.applyLoadProfileToSettings({ profileId: "fast" });
+      const applied = await svc.applyLoadProfileToSettings({ profileId: "fast" });
+      const saved = applied.settings;
       expect(saved.activeLoadProfileId).toBe("fast");
       const fast = saved.loadProfiles.find((p) => p.id === "fast");
       expect(fast).toBeTruthy();

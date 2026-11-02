@@ -5,9 +5,9 @@ import type { GpuInfo, RuntimeBackend, SystemInfo } from "@kovi/shared";
 
 const execFileAsync = promisify(execFile);
 
-/** WMIC AdapterRAM is uint32 — values near 4 GiB are often capped garbage. */
-const WMIC_VRAM_CAP_BYTES = 4 * 1024 ** 3;
-const WMIC_VRAM_SUSPECT_MAX = 4.1; // GiB
+/** CIM/WMIC AdapterRAM is often uint32 — values near 4 GiB can be capped garbage. */
+const CIM_VRAM_CAP_BYTES = 4 * 1024 ** 3;
+const CIM_VRAM_SUSPECT_MAX = 4.1; // GiB
 
 async function run(cmd: string, args: string[]): Promise<string> {
   try {
@@ -70,14 +70,30 @@ async function detectNvidia(): Promise<{ gpus: GpuInfo[]; cudaVersion?: string }
   return { gpus, cudaVersion: match?.[1] };
 }
 
-/** Honest Vulkan probe — no vendor guessing. */
-async function detectVulkan(): Promise<boolean> {
+/**
+ * Vulkan: prefer vulkaninfo confirmation; also treat discrete AMD/Intel as Vulkan-capable
+ * when the SDK utility is missing (common on end-user PCs).
+ */
+export function inferHasVulkan(opts: {
+  vulkaninfoOk: boolean;
+  gpus: GpuInfo[];
+}): boolean {
+  if (opts.vulkaninfoOk) return true;
+  return opts.gpus.some(
+    (g) =>
+      (g.vendor === "AMD" || g.vendor === "Intel") &&
+      typeof g.vramGb === "number" &&
+      g.vramGb >= 2,
+  );
+}
+
+async function probeVulkaninfo(): Promise<boolean> {
   const out = await run("vulkaninfo", ["--summary"]);
   return out.includes("GPU") || out.includes("deviceName");
 }
 
 /**
- * Registry qwMemorySize is a real QWORD (unlike WMIC AdapterRAM uint32).
+ * Registry qwMemorySize is a real QWORD (unlike CIM AdapterRAM uint32).
  * Display class GUID: {4d36e968-e325-11ce-bfc1-08002be10318}
  */
 async function detectGpuVramFromRegistry(): Promise<Map<string, number>> {
@@ -117,45 +133,80 @@ function vendorFromName(name: string): GpuInfo["vendor"] {
   return "Other";
 }
 
-function isSuspectWmicVram(vramGb: number | undefined): boolean {
+function isSuspectCimVram(vramGb: number | undefined): boolean {
   if (vramGb == null || !Number.isFinite(vramGb) || vramGb <= 0) return true;
   // Classic uint32 saturate ≈ 4 GiB (4294967295 bytes → ~4.0)
-  return vramGb >= 3.9 && vramGb <= WMIC_VRAM_SUSPECT_MAX;
+  return vramGb >= 3.9 && vramGb <= CIM_VRAM_SUSPECT_MAX;
 }
 
-async function detectOtherGpus(): Promise<GpuInfo[]> {
-  const registryVram = await detectGpuVramFromRegistry();
-  const out = await run("wmic", [
-    "path",
-    "win32_VideoController",
-    "get",
-    "Name,AdapterRAM",
-    "/format:csv",
-  ]);
+/** Fuzzy name match for registry keys (case / trailing vendor noise). */
+function registryLookup(map: Map<string, number>, name: string): number | undefined {
+  const key = name.toLowerCase().trim();
+  const exact = map.get(key);
+  if (exact != null) return exact;
+  for (const [k, v] of map) {
+    if (k.includes(key) || key.includes(k)) return v;
+  }
+  return undefined;
+}
+
+/**
+ * Parse Get-CimInstance CSV lines: Name,AdapterRAM
+ * Exported for unit tests.
+ */
+export function parseCimVideoControllers(
+  csv: string,
+  registryVram: Map<string, number> = new Map(),
+): GpuInfo[] {
   const gpus: GpuInfo[] = [];
-  const lines = out
+  const lines = csv
     .trim()
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter(Boolean);
 
-  for (let i = 1; i < lines.length; i++) {
-    const parts = lines[i].split(",");
-    if (parts.length < 3) continue;
-    const adapterRam = Number(parts[1]);
-    const name = parts.slice(2).join(",").trim();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    // Skip header
+    if (/^name\s*,/i.test(line) || /^"?name"?,/i.test(line)) continue;
+
+    // CSV may quote names with commas: "AMD Radeon RX 7800 XT",17179869184
+    let name = "";
+    let adapterRam = NaN;
+    const quoted = line.match(/^"([^"]+)"\s*,\s*(-?\d+)/);
+    if (quoted) {
+      name = quoted[1]!.trim();
+      adapterRam = Number(quoted[2]);
+    } else {
+      const idx = line.lastIndexOf(",");
+      if (idx < 0) continue;
+      name = line.slice(0, idx).replace(/^"|"$/g, "").trim();
+      adapterRam = Number(line.slice(idx + 1).trim());
+    }
     if (!name || /microsoft\s+basic/i.test(name)) continue;
 
     let vramGb: number | undefined =
-      Number.isFinite(adapterRam) && adapterRam > 0 ? adapterRam / (1024 ** 3) : undefined;
+      Number.isFinite(adapterRam) && adapterRam > 0 ? adapterRam / 1024 ** 3 : undefined;
 
-    // Prefer registry QWORD when WMIC is missing, zero, or capped at ~4 GB.
-    const reg = registryVram.get(name.toLowerCase());
-    if (reg != null && reg > 0 && (vramGb == null || isSuspectWmicVram(vramGb) || reg > vramGb + 0.25)) {
+    const reg = registryLookup(registryVram, name);
+    if (
+      reg != null &&
+      reg > 0 &&
+      (vramGb == null || isSuspectCimVram(vramGb) || reg > vramGb + 0.25)
+    ) {
+      // Registry QWORD is authoritative when CIM is missing/suspect/lower.
       vramGb = Math.round(reg * 10) / 10;
-    } else if (vramGb != null && adapterRam >= WMIC_VRAM_CAP_BYTES - 1 && reg == null) {
-      // Saturated WMIC with no registry match — treat as unknown rather than "4 GB".
-      vramGb = undefined;
+    } else if (
+      vramGb != null &&
+      Number.isFinite(adapterRam) &&
+      adapterRam >= CIM_VRAM_CAP_BYTES - 1 &&
+      reg == null
+    ) {
+      // Saturated CIM with no registry — keep ~4 GB as a usable floor (real 4 GB cards exist).
+      // Only clear if the value is exactly the uint32 max pattern without any corroboration.
+      vramGb = Math.round(vramGb * 10) / 10;
+    } else if (vramGb != null) {
+      vramGb = Math.round(vramGb * 10) / 10;
     }
 
     gpus.push({
@@ -166,7 +217,6 @@ async function detectOtherGpus(): Promise<GpuInfo[]> {
     });
   }
 
-  // Registry-only devices not listed by WMIC (rare).
   if (gpus.length === 0 && registryVram.size > 0) {
     let i = 0;
     for (const [nameLower, gb] of registryVram) {
@@ -180,6 +230,24 @@ async function detectOtherGpus(): Promise<GpuInfo[]> {
   }
 
   return gpus;
+}
+
+async function detectOtherGpus(): Promise<GpuInfo[]> {
+  const registryVram = await detectGpuVramFromRegistry();
+
+  // Prefer CIM (Win10/11); wmic is removed on newer Windows builds.
+  const ps = [
+    "Get-CimInstance Win32_VideoController |",
+    "  Select-Object Name, AdapterRAM |",
+    "  ConvertTo-Csv -NoTypeInformation",
+  ].join(" ");
+  const out = await run("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps]);
+  if (out.trim()) {
+    return parseCimVideoControllers(out, registryVram);
+  }
+
+  // Last resort: registry-only
+  return parseCimVideoControllers("", registryVram);
 }
 
 export function pickBackend(info: {
@@ -207,12 +275,15 @@ export async function detectSystemInfo(
   } else {
     const others = await detectOtherGpus();
     for (const g of others) {
-      if (!gpus.some((x) => x.name === g.name)) gpus.push({ ...g, index: gpus.length });
+      if (!gpus.some((x) => x.name.toLowerCase() === g.name.toLowerCase())) {
+        gpus.push({ ...g, index: gpus.length });
+      }
     }
   }
 
   const hasNvidia = nvidia.gpus.length > 0 || gpus.some((g) => g.vendor === "NVIDIA");
-  const hasVulkan = await detectVulkan();
+  const vulkaninfoOk = await probeVulkaninfo();
+  const hasVulkan = inferHasVulkan({ vulkaninfoOk, gpus });
   const recommendedBackend = pickBackend({ hasNvidia, hasVulkan, preference });
 
   return {
@@ -255,6 +326,8 @@ export async function sampleVram(): Promise<{
 
 /** Test helpers — exported for unit tests only. */
 export const __detectTest = {
-  isSuspectWmicVram,
-  WMIC_VRAM_SUSPECT_MAX,
+  isSuspectWmicVram: isSuspectCimVram,
+  isSuspectCimVram,
+  WMIC_VRAM_SUSPECT_MAX: CIM_VRAM_SUSPECT_MAX,
+  CIM_VRAM_SUSPECT_MAX,
 };

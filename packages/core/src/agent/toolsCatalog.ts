@@ -227,7 +227,8 @@ export const BUILTIN_TOOL_NAMES = new Set<string>(
   BUILTIN_TOOL_SPECS.map((t) => t.name),
 );
 
-const CORE_TOOL_NAMES = new Set([
+/** Builtins shown/exposed in compact (ctx < 8k) agent mode. */
+export const CORE_TOOL_NAMES = new Set([
   "list_dir",
   "read_file",
   "write_file",
@@ -238,6 +239,17 @@ const CORE_TOOL_NAMES = new Set([
   "run_terminal",
   "finish",
 ]);
+
+/** Builtin (+ MCP) names for a given prompt/schema mode. Compact = CORE + MCP. */
+export function toolNamesForMode(
+  extraToolNames: string[] = [],
+  opts?: { compact?: boolean },
+): string[] {
+  const builtins = opts?.compact
+    ? BUILTIN_TOOL_SPECS.filter((t) => CORE_TOOL_NAMES.has(t.name)).map((t) => t.name)
+    : BUILTIN_TOOL_SPECS.map((t) => t.name);
+  return [...new Set([...builtins, ...extraToolNames.filter(Boolean)])];
+}
 
 /** Read-only tools allowed in parallel `tools[]` batch (max 3). */
 export const BATCHABLE_TOOL_NAMES = new Set([
@@ -258,7 +270,8 @@ export function toolsPromptBlock(
   const specs = opts?.compact
     ? BUILTIN_TOOL_SPECS.filter((t) => CORE_TOOL_NAMES.has(t.name))
     : BUILTIN_TOOL_SPECS;
-  const extras = opts?.compact ? [] : extraTools;
+  // Compact keeps MCP names so OpenAI tools stay aligned; drops only non-CORE builtins.
+  const extras = extraTools;
   const all = [
     ...specs.map((t) => `- ${t.name}: ${t.description}`),
     ...extras.map((t) => `- ${t.name}: ${t.description || "MCP tool"}`),
@@ -277,9 +290,9 @@ export function toolsPromptBlock(
 Мутации (write_file/apply_patch/shell/browser/git_commit/git_push/git_pull) — только одиночный tool.
 Предпочитай JSON; Hermes tool_call допускается как запасной разбор.
 
-Двухфазный режим:
-1) ФАЗА ПЛАНА (первый ответ): только plan из 3–7 коротких пунктов, tool=null, final=null.
-2) ФАЗА ИСПОЛНЕНИЯ: план УЖЕ зафиксирован системой — НЕ меняй plan. Один tool (или batch tools[]) за шаг. final только когда пункты сделаны (или остался «итог»).
+Двухфазный режим (Cursor-like):
+1) ФАЗА ПЛАНА: только plan из 3–7 пунктов с kind (explore|edit|run|verify|finalize); tool и final запрещены.
+2) ФАЗА ИСПОЛНЕНИЯ: план зафиксирован — НЕ меняй plan. Один tool под current_step.kind. final/finish когда пункты закрыты.
 
 Правила исполнения:
 - Git: используй git_status/git_diff/git_log/git_commit/git_pull/git_push вместо run_terminal для git.

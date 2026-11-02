@@ -81,6 +81,26 @@ export function SettingsPage(props: {
 
   if (!draft) return <div className="stack-page">Загрузка…</div>;
 
+  function cancelPendingSave(): void {
+    if (timer.current) {
+      clearTimeout(timer.current);
+      timer.current = null;
+    }
+    // Invalidate in-flight/queued debounce so stale draft cannot overwrite hardware apply.
+    saveSeq.current += 1;
+    dirty.current = false;
+  }
+
+  function reloadHint(
+    reload: { status: string; detail?: string },
+    whenIdle: string,
+  ): string {
+    if (reload.status === "ok") return reload.detail || "Модель перезагружена.";
+    if (reload.status === "skipped") return reload.detail || whenIdle;
+    if (reload.status === "error") return reload.detail || "Ошибка перезагрузки.";
+    return whenIdle;
+  }
+
   function queueSave(next: AppSettings): void {
     dirty.current = true;
     setDraft(next);
@@ -427,20 +447,21 @@ export function SettingsPage(props: {
                 disabled={hwBusy || saving}
                 title={p ? `ngl ${p.gpuLayers} · ctx ${p.context}` : undefined}
                 onClick={() => {
+                  cancelPendingSave();
                   setHwBusy(true);
                   void api
                     .applyLoadProfileToSettings({
                       profileId: id,
                       modelId: preferModelId(),
                     })
-                    .then((saved) => {
-                      props.setSettings(saved);
-                      setDraft(saved);
+                    .then((res) => {
+                      props.setSettings(res.settings);
+                      setDraft(res.settings);
+                      dirty.current = false;
                       setProfileHint(
-                        loadedModelId
-                          ? "Профиль применён, модель перезагружена с новыми ngl/ctx."
-                          : `Активен уровень «${label}»`,
+                        reloadHint(res.reload, `Активен уровень «${label}»`),
                       );
+                      void api.getRuntimeStatus().then((r) => setLoadedModelId(r.loadedModelId));
                     })
                     .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
                     .finally(() => setHwBusy(false));
@@ -450,6 +471,7 @@ export function SettingsPage(props: {
                 {p && (
                   <span className="choice-tile-sub">
                     ngl {p.gpuLayers} · ctx {p.context}
+                    {p.hardwareAware ? " · при загрузке" : ""}
                   </span>
                 )}
               </button>
@@ -460,6 +482,7 @@ export function SettingsPage(props: {
             className={`choice-tile ${s.activeLoadProfileId === AUTO_PC_PROFILE_ID ? "on" : ""}`}
             disabled={hwBusy || saving}
             onClick={() => {
+              cancelPendingSave();
               setHwBusy(true);
               void api
                 .applyHardwareLoadSettings({
@@ -467,24 +490,27 @@ export function SettingsPage(props: {
                   applyBackend: true,
                   applyDefaultParams: true,
                 })
-                .then((saved) => {
-                  props.setSettings(saved);
-                  setDraft(saved);
+                .then((res) => {
+                  props.setSettings(res.settings);
+                  setDraft(res.settings);
+                  dirty.current = false;
                   setHwPreview(null);
                   setProfileHint(
-                    loadedModelId
-                      ? "Под ПК применено, модель перезагружена."
-                      : preferModelId()
-                        ? "Настройки под этот ПК применены"
+                    reloadHint(
+                      res.reload,
+                      preferModelId()
+                        ? "Настройки под этот ПК применены (backend=auto)"
                         : "Под ПК применено без размера модели — загрузите модель для точного ngl",
+                    ),
                   );
+                  void api.getRuntimeStatus().then((r) => setLoadedModelId(r.loadedModelId));
                 })
                 .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
                 .finally(() => setHwBusy(false));
             }}
           >
             <span className="choice-tile-title">Под этот ПК</span>
-            <span className="choice-tile-sub">Автоподбор уровней под железо</span>
+            <span className="choice-tile-sub">Автоподбор · backend auto</span>
           </button>
         </div>
 
@@ -507,16 +533,21 @@ export function SettingsPage(props: {
                   className={`btn ghost ${s.activeLoadProfileId === p.id ? "primary" : ""}`}
                   disabled={hwBusy || saving}
                   onClick={() => {
+                    cancelPendingSave();
                     setHwBusy(true);
                     void api
                       .applyLoadProfileToSettings({
                         profileId: p.id,
                         modelId: preferModelId(),
                       })
-                      .then((saved) => {
-                        props.setSettings(saved);
-                        setDraft(saved);
-                        setProfileHint(`Активен профиль «${p.name}»`);
+                      .then((res) => {
+                        props.setSettings(res.settings);
+                        setDraft(res.settings);
+                        dirty.current = false;
+                        setProfileHint(
+                          reloadHint(res.reload, `Активен профиль «${p.name}»`),
+                        );
+                        void api.getRuntimeStatus().then((r) => setLoadedModelId(r.loadedModelId));
                       })
                       .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
                       .finally(() => setHwBusy(false));
@@ -563,9 +594,15 @@ export function SettingsPage(props: {
         {activeProfile && (
           <dl className="kv-list">
             <dt>ngl</dt>
-            <dd>{activeProfile.gpuLayers}</dd>
+            <dd>
+              {activeProfile.gpuLayers}
+              {activeProfile.hardwareAware ? " (пересчёт при загрузке)" : ""}
+            </dd>
             <dt>ctx</dt>
-            <dd>{activeProfile.context}</dd>
+            <dd>
+              {activeProfile.context}
+              {activeProfile.hardwareAware ? " (пересчёт при загрузке)" : ""}
+            </dd>
             {activeProfile.maxTokens != null && (
               <>
                 <dt>maxTokens</dt>
@@ -613,6 +650,7 @@ export function SettingsPage(props: {
                 type="button"
                 disabled={hwBusy}
                 onClick={() => {
+                  cancelPendingSave();
                   setHwBusy(true);
                   void api
                     .applyHardwareLoadSettings({
@@ -620,10 +658,13 @@ export function SettingsPage(props: {
                       applyBackend: true,
                       applyDefaultParams: true,
                     })
-                    .then((saved) => {
-                      props.setSettings(saved);
-                      setDraft(saved);
+                    .then((res) => {
+                      props.setSettings(res.settings);
+                      setDraft(res.settings);
+                      dirty.current = false;
                       setHwPreview(null);
+                      setProfileHint(reloadHint(res.reload, "Применено всё под ПК"));
+                      void api.getRuntimeStatus().then((r) => setLoadedModelId(r.loadedModelId));
                     })
                     .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
                     .finally(() => setHwBusy(false));
@@ -636,6 +677,7 @@ export function SettingsPage(props: {
                 type="button"
                 disabled={hwBusy}
                 onClick={() => {
+                  cancelPendingSave();
                   setHwBusy(true);
                   void api
                     .applyHardwareLoadSettings({
@@ -643,10 +685,15 @@ export function SettingsPage(props: {
                       applyBackend: true,
                       applyDefaultParams: false,
                     })
-                    .then((saved) => {
-                      props.setSettings(saved);
-                      setDraft(saved);
+                    .then((res) => {
+                      props.setSettings(res.settings);
+                      setDraft(res.settings);
+                      dirty.current = false;
                       setHwPreview(null);
+                      setProfileHint(
+                        reloadHint(res.reload, "Профиль загрузки обновлён (backend=auto)"),
+                      );
+                      void api.getRuntimeStatus().then((r) => setLoadedModelId(r.loadedModelId));
                     })
                     .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
                     .finally(() => setHwBusy(false));

@@ -17,6 +17,9 @@ export type LoadTier = "fast" | "balanced" | "quality";
 
 export const LOAD_TIER_IDS = ["fast", "balanced", "quality"] as const;
 
+/** Sentinel used by llama.cpp for "all layers" when real count is unknown. */
+export const ALL_LAYERS_SENTINEL = 99;
+
 /** Single source of truth for ngl/ctx/maxTokens from PC (+ optional model size). */
 export type LoadPlan = {
   gpuLayers: number;
@@ -32,6 +35,8 @@ export type LoadPlan = {
   rationale: string;
   /** Whether model+KV fits in ~90% VRAM (undefined if no model size / no VRAM). */
   fitsInVram?: boolean;
+  /** GGUF block_count when known. */
+  layerCount?: number | null;
 };
 
 function applyTier(
@@ -83,13 +88,35 @@ function applyTier(
   };
 }
 
+function fullOffloadLayers(layerCount: number | null | undefined): number {
+  return layerCount && layerCount > 0 ? layerCount : ALL_LAYERS_SENTINEL;
+}
+
+/**
+ * Partial offload: fraction of real layers by VRAM headroom.
+ * `layers` is the real block_count (or sentinel 99 when unknown).
+ */
+export function computePartialNgl(
+  layers: number,
+  usableVramGb: number,
+  needGb: number,
+): number {
+  if (needGb <= 0 || usableVramGb <= 0) return 0;
+  const ratio = usableVramGb / needGb;
+  return Math.max(0, Math.min(layers, Math.floor(ratio * layers)));
+}
+
+function kvGb(context: number): number {
+  return context * 0.00025;
+}
+
 /**
  * Unified load estimate — used by hardware profiles, scanner badges, and loadModel.
- * VRAM buckets: none→CPU/4k; <6→partial/4k; <10→99/8k; <16→99/8k; ≥16→99/16k.
+ * VRAM buckets: none→CPU/4k; <6→partial/4k; <10→full/8k; <16→full/8k; ≥16→full/16k.
  */
 export function estimateLoadPlan(
   sys: SystemInfo,
-  opts?: { modelSizeGb?: number; tier?: LoadTier },
+  opts?: { modelSizeGb?: number; tier?: LoadTier; layerCount?: number | null },
 ): LoadPlan {
   const vramGb = pickMaxVram(sys);
   const ramGb = sys.totalRamGb || 16;
@@ -98,6 +125,12 @@ export function estimateLoadPlan(
   const modelSizeGb =
     typeof opts?.modelSizeGb === "number" && opts.modelSizeGb > 0 ? opts.modelSizeGb : null;
   const tier: LoadTier = opts?.tier || "balanced";
+  const layerCount =
+    typeof opts?.layerCount === "number" && opts.layerCount > 0
+      ? Math.floor(opts.layerCount)
+      : null;
+  const layers = fullOffloadLayers(layerCount);
+  const isGpuBackend = backend === "cuda" || backend === "vulkan";
 
   let gpuLayers: number;
   let context: number;
@@ -105,44 +138,69 @@ export function estimateLoadPlan(
   let rationale: string;
   let fitsInVram: boolean | undefined;
 
-  if (vramGb == null || vramGb <= 0) {
+  // Explicit CPU backend → never claim GPU offload.
+  if (backend === "cpu") {
     gpuLayers = 0;
     context = 4096;
     flashAttn = false;
-    rationale = `GPU VRAM не обнаружена — загрузка на CPU/RAM (${ramGb.toFixed(0)} GB). Backend: ${backend}.`;
+    if (vramGb == null || vramGb <= 0) {
+      rationale = `Backend CPU — загрузка на RAM (${ramGb.toFixed(0)} GB), ngl 0, ctx ${context}.`;
+    } else {
+      rationale = `Backend CPU (VRAM ${vramGb.toFixed(1)} GB доступна, но не используется) — ngl 0, ctx ${context}.`;
+    }
+  } else if (vramGb == null || vramGb <= 0) {
+    // GPU backend without known VRAM → conservative partial GPU, not ngl=0 "full GPU".
+    if (isGpuBackend) {
+      gpuLayers = Math.min(layers, 28);
+      context = 4096;
+      flashAttn = false;
+      rationale = `Backend ${backend}, VRAM неизвестна — консервативный GPU offload (ngl≈${gpuLayers}), ctx ${context}.`;
+    } else {
+      gpuLayers = 0;
+      context = 4096;
+      flashAttn = false;
+      rationale = `GPU VRAM не обнаружена — загрузка на CPU/RAM (${ramGb.toFixed(0)} GB). Backend: ${backend}.`;
+    }
   } else if (vramGb < 6) {
-    gpuLayers = 28;
+    gpuLayers = Math.min(layers, 28);
     context = 4096;
     flashAttn = false;
     rationale = `Мало VRAM (${vramGb.toFixed(1)} GB) — частичный offload (ngl≈${gpuLayers}), ctx ${context}. Backend: ${backend}.`;
   } else if (vramGb < 10) {
-    gpuLayers = 99;
+    gpuLayers = layers;
     context = 8192;
     flashAttn = backend === "cuda";
-    rationale = `Средняя VRAM (${vramGb.toFixed(1)} GB) — почти всё на GPU, ctx ${context}${flashAttn ? ", flash-attn" : ""}. Backend: ${backend}.`;
+    rationale = `Средняя VRAM (${vramGb.toFixed(1)} GB) — почти всё на GPU (ngl ${gpuLayers}), ctx ${context}${flashAttn ? ", flash-attn" : ""}. Backend: ${backend}.`;
   } else if (vramGb < 16) {
-    gpuLayers = 99;
+    gpuLayers = layers;
     context = 8192;
     flashAttn = backend === "cuda" || backend === "vulkan";
-    rationale = `Достаточно VRAM (${vramGb.toFixed(1)} GB) — полный GPU, ctx ${context}${flashAttn ? ", flash-attn" : ""}. Backend: ${backend}.`;
+    rationale = `Достаточно VRAM (${vramGb.toFixed(1)} GB) — полный GPU (ngl ${gpuLayers}), ctx ${context}${flashAttn ? ", flash-attn" : ""}. Backend: ${backend}.`;
   } else {
-    gpuLayers = 99;
+    gpuLayers = layers;
     context = 16384;
     flashAttn = backend === "cuda" || backend === "vulkan";
-    rationale = `Большая VRAM (${vramGb.toFixed(1)} GB) — полный GPU, длинный контекст ${context}${flashAttn ? ", flash-attn" : ""}. Backend: ${backend}.`;
+    rationale = `Большая VRAM (${vramGb.toFixed(1)} GB) — полный GPU (ngl ${gpuLayers}), длинный контекст ${context}${flashAttn ? ", flash-attn" : ""}. Backend: ${backend}.`;
   }
 
-  if (modelSizeGb != null && vramGb != null && vramGb > 0) {
-    const kv = context * 0.00025;
-    const need = modelSizeGb + kv;
+  // Model-size fit: raise ngl to full layers when a small model fits on low VRAM.
+  if (modelSizeGb != null && vramGb != null && vramGb > 0 && backend !== "cpu") {
+    const need = modelSizeGb + kvGb(context);
     fitsInVram = need < vramGb * 0.9;
-    if (!fitsInVram) {
-      const ratio = vramGb / need;
-      gpuLayers = Math.max(0, Math.floor(ratio * 99));
+    if (fitsInVram && vramGb < 6 && gpuLayers < layers) {
+      gpuLayers = layers;
+      rationale += ` Модель ≈${modelSizeGb.toFixed(1)} GB влезает → ngl ${gpuLayers}.`;
+    } else if (!fitsInVram) {
+      const usable = vramGb * 0.9;
+      gpuLayers = computePartialNgl(layers, usable, need);
       if (context > 4096 && need > vramGb * 0.75) {
         context = 4096;
+        // Recompute after ctx cut (KV shrinks).
+        const need2 = modelSizeGb + kvGb(context);
+        gpuLayers = computePartialNgl(layers, usable, need2);
+        fitsInVram = need2 < usable;
       }
-      flashAttn = flashAttn && gpuLayers >= 40;
+      flashAttn = flashAttn && gpuLayers >= Math.min(40, Math.floor(layers * 0.4));
       rationale += ` Учтена модель ≈${modelSizeGb.toFixed(1)} GB → ngl ${gpuLayers}, ctx ${context}.`;
     }
   } else if (modelSizeGb != null && (vramGb == null || vramGb <= 0)) {
@@ -165,16 +223,24 @@ export function estimateLoadPlan(
     backend,
   );
 
-  // Re-check fit after tier may change context (KV grows).
-  if (modelSizeGb != null && vramGb != null && vramGb > 0) {
-    const kv = tuned.context * 0.00025;
-    fitsInVram = modelSizeGb + kv < vramGb * 0.9;
+  // After tier may grow ctx/KV — recompute ngl, not only fitsInVram.
+  if (modelSizeGb != null && vramGb != null && vramGb > 0 && backend !== "cpu") {
+    const usable = vramGb * 0.9;
+    const need = modelSizeGb + kvGb(tuned.context);
+    fitsInVram = need < usable;
+    if (!fitsInVram) {
+      tuned.gpuLayers = computePartialNgl(layers, usable, need);
+      tuned.flashAttn =
+        tuned.flashAttn && tuned.gpuLayers >= Math.min(40, Math.floor(layers * 0.4));
+    } else if (vramGb < 6) {
+      tuned.gpuLayers = layers;
+    }
   }
 
   const tierLabel =
     tier === "fast" ? "Быстро" : tier === "quality" ? "Качество" : "Баланс";
   if (tier !== "balanced") {
-    rationale += ` Уровень «${tierLabel}»: ctx ${tuned.context}, maxTokens ${tuned.maxTokens}.`;
+    rationale += ` Уровень «${tierLabel}»: ctx ${tuned.context}, ngl ${tuned.gpuLayers}, maxTokens ${tuned.maxTokens}.`;
   }
   rationale +=
     tuned.agentMaxSteps <= 0
@@ -194,6 +260,7 @@ export function estimateLoadPlan(
     gpuName,
     rationale,
     fitsInVram,
+    layerCount,
   };
 }
 
@@ -203,7 +270,7 @@ export function estimateLoadPlan(
  */
 export function suggestHardwareLoadProfile(
   sys: SystemInfo,
-  opts?: { modelSizeGb?: number; tier?: LoadTier },
+  opts?: { modelSizeGb?: number; tier?: LoadTier; layerCount?: number | null },
 ): HardwareLoadSuggestion {
   const plan = estimateLoadPlan(sys, opts);
   const tier: LoadTier = opts?.tier || "balanced";
@@ -254,7 +321,7 @@ export function suggestHardwareLoadProfile(
 /** Build fast/balanced/quality profiles for this PC (and optional model size). */
 export function buildHardwareTierProfiles(
   sys: SystemInfo,
-  opts?: { modelSizeGb?: number },
+  opts?: { modelSizeGb?: number; layerCount?: number | null },
 ): LoadProfile[] {
   return (["fast", "balanced", "quality"] as const).map((tier) => {
     const s = suggestHardwareLoadProfile(sys, { ...opts, tier });

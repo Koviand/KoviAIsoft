@@ -17,6 +17,8 @@ type McpClient = {
 
 const MCP_CONNECT_TIMEOUT_MS = 10_000;
 const MCP_CLOSE_TIMEOUT_MS = 3_000;
+/** Prevent a stuck MCP tool from hanging the agent loop forever. */
+const MCP_CALL_TIMEOUT_MS = 75_000;
 
 const requireFromHere = createRequire(__filename);
 
@@ -158,7 +160,11 @@ export class McpManager {
     const client = this.clients.get(tool.serverId);
     if (!client) throw new Error(`MCP server not connected: ${tool.serverId}`);
     const rawName = fullName.replace(`mcp_${tool.serverId}_`, "");
-    const result = await client.callTool({ name: rawName, arguments: args });
+    const result = await withTimeout(
+      client.callTool({ name: rawName, arguments: args }),
+      MCP_CALL_TIMEOUT_MS,
+      `MCP ${tool.serverId}/${rawName}`,
+    );
     const content = (result as { content?: Array<{ type: string; text?: string }> }).content;
     if (Array.isArray(content)) {
       return content.map((c) => c.text || JSON.stringify(c)).join("\n");

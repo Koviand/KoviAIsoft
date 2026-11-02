@@ -31,6 +31,7 @@ import {
   AUTO_PC_PROFILE_ID,
   DEFAULT_GENERATION_PARAMS,
   sessionToolsEnabled,
+  type ApplyLoadSettingsResult,
   type HardwareLoadSuggestion,
 } from "@kovi/shared";
 import { detectAgentTask } from "./agent/intent.js";
@@ -77,6 +78,7 @@ import {
 import { ensureHfCli, getHfCliStatus } from "./models/hfCli.js";
 import { verifyGgufFile, withIntegrity } from "./models/integrity.js";
 import { deleteLocalModelFiles } from "./models/deleteLocal.js";
+import { readGgufLayerCountSync } from "./models/ggufMeta.js";
 import { scanLocalModels } from "./models/scanner.js";
 import { getAppDataDir, getAttachmentsDir } from "./paths.js";
 import { OpenAiProxy } from "./proxy/openaiProxy.js";
@@ -87,6 +89,8 @@ import { SettingsStore } from "./settings.js";
 import { detectSystemInfo, pickMaxVram, sampleVram } from "./system/detect.js";
 import { buildModelRecommendations } from "./models/recommend.js";
 import { previewWriteDiff } from "./tools/diff.js";
+
+export type ProfileReloadStatus = ApplyLoadSettingsResult["reload"];
 
 /** Quiet auto-update interval for llama.cpp GitHub checks. */
 export const RUNTIME_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -102,6 +106,8 @@ export class AppService {
   readonly proxy: OpenAiProxy;
   private modelsCache: LocalModel[] = [];
   private systemCache: SystemInfo | null = null;
+  private systemCachePref: RuntimeBackend | "auto" | null = null;
+  private systemDetectInflight: Promise<SystemInfo> | null = null;
   private modelDownload = { active: false, progress: 0, label: "" };
   private genStats = {
     startedAt: 0,
@@ -377,11 +383,37 @@ export class AppService {
     return { id, name: base, mime, path: dest, size: stat.size };
   }
 
-  async getSystemInfo(): Promise<SystemInfo> {
-    if (this.systemCache) return this.systemCache;
-    const pref = this.settings.get().runtimeBackendPreference;
-    this.systemCache = await detectSystemInfo(pref);
-    return this.systemCache;
+  /**
+   * Cached system probe. Pass preference explicitly (e.g. "auto" for «Под этот ПК»)
+   * so a stuck cpu/vulkan preference cannot poison hardware suggestions.
+   */
+  async getSystemInfo(
+    preference?: RuntimeBackend | "auto",
+  ): Promise<SystemInfo> {
+    const pref = preference ?? this.settings.get().runtimeBackendPreference;
+    if (this.systemCache && this.systemCachePref === pref) return this.systemCache;
+    if (this.systemDetectInflight && this.systemCachePref === pref) {
+      return this.systemDetectInflight;
+    }
+    this.systemCachePref = pref;
+    const inflight = detectSystemInfo(pref)
+      .then((info) => {
+        if (this.systemCachePref === pref) this.systemCache = info;
+        if (this.systemDetectInflight === inflight) this.systemDetectInflight = null;
+        return info;
+      })
+      .catch((err) => {
+        if (this.systemDetectInflight === inflight) this.systemDetectInflight = null;
+        throw err;
+      });
+    this.systemDetectInflight = inflight;
+    return inflight;
+  }
+
+  private clearSystemCache(): void {
+    this.systemCache = null;
+    this.systemCachePref = null;
+    this.systemDetectInflight = null;
   }
 
   getSettings(): AppSettings {
@@ -418,7 +450,9 @@ export class AppService {
     ) {
       await this.proxy.start(saved.openaiProxyPort);
     }
-    this.systemCache = null;
+    if (saved.runtimeBackendPreference !== prev.runtimeBackendPreference) {
+      this.clearSystemCache();
+    }
     if (saved.projectRoot !== prev.projectRoot) {
       this.projectWatcher.start(saved.projectRoot);
       if (saved.projectRoot) this.warmCodebaseIndex();
@@ -504,23 +538,41 @@ export class AppService {
     return buildModelRecommendations(sys);
   }
 
-  private async resolveModelSizeGb(modelId?: string): Promise<number | undefined> {
+  private async resolveModel(
+    modelId?: string,
+  ): Promise<LocalModel | undefined> {
     if (!modelId) return undefined;
-    const model =
+    return (
       this.modelsCache.find((m) => m.id === modelId) ||
-      (await this.scanModels()).find((m) => m.id === modelId);
+      (await this.scanModels()).find((m) => m.id === modelId)
+    );
+  }
+
+  private async resolveModelSizeGb(modelId?: string): Promise<number | undefined> {
+    const model = await this.resolveModel(modelId);
     return model ? model.sizeBytes / 1024 ** 3 : undefined;
+  }
+
+  private async resolveModelLayerCount(
+    modelId?: string,
+  ): Promise<number | null | undefined> {
+    const model = await this.resolveModel(modelId);
+    if (!model?.path) return undefined;
+    return readGgufLayerCountSync(model.path);
   }
 
   async suggestHardwareLoadSettings(opts?: {
     modelId?: string;
     tier?: LoadTier;
   }): Promise<HardwareLoadSuggestion> {
-    const sys = await this.getSystemInfo();
+    // Always probe with auto so a stuck preference cannot poison the suggestion.
+    const sys = await this.getSystemInfo("auto");
     const modelSizeGb = await this.resolveModelSizeGb(opts?.modelId);
+    const layerCount = await this.resolveModelLayerCount(opts?.modelId);
     return suggestHardwareLoadProfile(sys, {
       modelSizeGb,
       tier: opts?.tier,
+      layerCount,
     });
   }
 
@@ -528,7 +580,7 @@ export class AppService {
     modelId?: string;
     applyBackend?: boolean;
     applyDefaultParams?: boolean;
-  }): Promise<AppSettings> {
+  }): Promise<ApplyLoadSettingsResult> {
     const suggestion = await this.suggestHardwareLoadSettings({
       modelId: opts?.modelId,
       tier: "balanced",
@@ -540,9 +592,10 @@ export class AppService {
       name: "Под этот ПК",
       hardwareAware: true,
     };
-    const sys = await this.getSystemInfo();
+    const sys = await this.getSystemInfo("auto");
     const modelSizeGb = await this.resolveModelSizeGb(opts?.modelId);
-    const tiers = buildHardwareTierProfiles(sys, { modelSizeGb });
+    const layerCount = await this.resolveModelLayerCount(opts?.modelId);
+    const tiers = buildHardwareTierProfiles(sys, { modelSizeGb, layerCount });
     const cur = this.settings.get();
     const keep = (cur.loadProfiles || []).filter(
       (p) =>
@@ -552,49 +605,52 @@ export class AppService {
         p.id !== "quality",
     );
     const applyParams = opts?.applyDefaultParams !== false;
+    // Preserve user agentMaxSteps when they already set a positive budget.
+    const nextAgentMaxSteps =
+      cur.agentMaxSteps > 0 ? cur.agentMaxSteps : suggestion.agentMaxSteps;
     const next: AppSettings = {
       ...cur,
       loadProfiles: [...tiers, ...keep, autoProfile],
       activeLoadProfileId: AUTO_PC_PROFILE_ID,
+      // Keep preference as auto so re-detect stays honest (do not stick cpu/vulkan).
       runtimeBackendPreference:
-        opts?.applyBackend === false
-          ? cur.runtimeBackendPreference
-          : suggestion.backend,
+        opts?.applyBackend === false ? cur.runtimeBackendPreference : "auto",
       ...(applyParams
         ? {
             defaultParams: {
               ...cur.defaultParams,
               ...suggestion.defaultParams,
             },
-            agentMaxSteps: suggestion.agentMaxSteps,
+            agentMaxSteps: nextAgentMaxSteps,
           }
         : {}),
     };
-    this.systemCache = null;
+    if (next.runtimeBackendPreference !== cur.runtimeBackendPreference) {
+      this.clearSystemCache();
+    }
     const saved = await this.settings.save(next);
-    await this.reloadLoadedModelAfterProfileChange();
-    return saved;
+    const reload = await this.reloadLoadedModelAfterProfileChange();
+    return { settings: saved, reload };
   }
 
   /** If a model is in memory, reload so -c/-ngl match the new profile. */
-  private async reloadLoadedModelAfterProfileChange(): Promise<void> {
+  private async reloadLoadedModelAfterProfileChange(): Promise<ProfileReloadStatus> {
     const loadedId = this.runtime.getStatus().loadedModelId;
-    if (!loadedId) return;
+    if (!loadedId) return { status: "idle" };
     if (this.chat.isBusy() || this.agent.isRunning()) {
-      this.pushErrorLog(
-        "loadProfile",
-        "Профиль сохранён. Остановите генерацию и перезагрузите модель, чтобы применить ngl/ctx.",
-      );
-      return;
+      const detail =
+        "Профиль сохранён. Остановите генерацию и перезагрузите модель, чтобы применить ngl/ctx.";
+      this.pushErrorLog("loadProfile", detail);
+      return { status: "skipped", detail };
     }
     try {
       await this.loadModel(loadedId);
+      return { status: "ok", detail: "Модель перезагружена с новыми ngl/ctx." };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.pushErrorLog(
-        "loadProfile",
-        `Профиль сохранён, но перезагрузка модели не удалась: ${msg}`,
-      );
+      const detail = `Профиль сохранён, но перезагрузка модели не удалась: ${msg}`;
+      this.pushErrorLog("loadProfile", detail);
+      return { status: "error", detail };
     }
   }
 
@@ -605,7 +661,7 @@ export class AppService {
   async applyLoadProfileToSettings(opts: {
     profileId: string;
     modelId?: string;
-  }): Promise<AppSettings> {
+  }): Promise<ApplyLoadSettingsResult> {
     const cur = this.settings.get();
     const tierIds = new Set(["fast", "balanced", "quality"]);
     let profiles = [...(cur.loadProfiles || [])];
@@ -646,9 +702,10 @@ export class AppService {
       profiles.push(profile);
       // Keep sibling tiers in sync when activating any hardware-aware tier.
       if (tierIds.has(opts.profileId)) {
-        const sys = await this.getSystemInfo();
+        const sys = await this.getSystemInfo("auto");
         const modelSizeGb = await this.resolveModelSizeGb(opts.modelId);
-        const tiers = buildHardwareTierProfiles(sys, { modelSizeGb });
+        const layerCount = await this.resolveModelLayerCount(opts.modelId);
+        const tiers = buildHardwareTierProfiles(sys, { modelSizeGb, layerCount });
         const keep = profiles.filter(
           (p) => p.id !== "fast" && p.id !== "balanced" && p.id !== "quality",
         );
@@ -659,14 +716,15 @@ export class AppService {
         ...defaultParams,
         ...suggestion.defaultParams,
       };
-      agentMaxSteps = suggestion.agentMaxSteps;
+      // Keep user-set positive step budget across tier switches.
+      agentMaxSteps =
+        cur.agentMaxSteps > 0 ? cur.agentMaxSteps : suggestion.agentMaxSteps;
     } else if (profile) {
       defaultParams = mergeProfileIntoDefaultParams(defaultParams, profile);
     } else {
       throw new Error(`Профиль загрузки не найден: ${opts.profileId}`);
     }
 
-    this.systemCache = null;
     const saved = await this.settings.save({
       ...cur,
       loadProfiles: profiles,
@@ -674,8 +732,8 @@ export class AppService {
       defaultParams,
       agentMaxSteps,
     });
-    await this.reloadLoadedModelAfterProfileChange();
-    return saved;
+    const reload = await this.reloadLoadedModelAfterProfileChange();
+    return { settings: saved, reload };
   }
 
   getHfCliStatus() {
@@ -784,11 +842,13 @@ export class AppService {
       const modelSizeGb = model.sizeBytes / 1024 ** 3;
       let loadParams: Partial<GenerationParams>;
 
+      const layerCount = readGgufLayerCountSync(model.path);
       if (profile?.hardwareAware) {
         // Recalculate under this model — same calculator as scanner / «Под этот ПК».
         const plan = estimateLoadPlan(sys, {
           modelSizeGb,
           tier: tierFromProfileId(profile.id),
+          layerCount,
         });
         loadParams = {
           gpuLayers: plan.gpuLayers,
@@ -811,7 +871,11 @@ export class AppService {
           maxTokens: profile.maxTokens ?? settings.defaultParams.maxTokens,
         };
       } else {
-        const plan = estimateLoadPlan(sys, { modelSizeGb, tier: "balanced" });
+        const plan = estimateLoadPlan(sys, {
+          modelSizeGb,
+          tier: "balanced",
+          layerCount,
+        });
         loadParams = {
           gpuLayers: plan.gpuLayers,
           context: plan.context,
@@ -874,8 +938,13 @@ export class AppService {
     return this.store.listSessions();
   }
 
-  createSession(mode: "chat" | "agent" = "chat", title?: string): ChatSession {
-    return this.store.createSession(mode, title, this.settings.get().defaultParams);
+  createSession(mode?: "chat" | "agent", title?: string): ChatSession {
+    const settings = this.settings.get();
+    // Cursor-like: with a project folder, new chats are Agent mode by default.
+    const resolved: "chat" | "agent" =
+      mode ??
+      (settings.projectRoot && String(settings.projectRoot).trim() ? "agent" : "chat");
+    return this.store.createSession(resolved, title, settings.defaultParams);
   }
 
   updateSession(patch: SessionPatch | (Partial<ChatSession> & { id: string })): ChatSession {
@@ -960,7 +1029,14 @@ export class AppService {
     if (!session) throw new Error("Сессия не найдена");
     this.noteGenerationStart();
     this.emitGeneration(sessionId, { type: "started", mode: "chat" });
-    const merged = { ...session.params, ...params };
+    const loadedCtx = this.runtime.getStatus().loadedContext;
+    const merged = {
+      ...session.params,
+      ...(typeof loadedCtx === "number" && loadedCtx > 0
+        ? { context: loadedCtx }
+        : {}),
+      ...params,
+    };
     const settings = this.settings.get();
     let system = session.systemPrompt;
     // Lightweight Cursor-style project context for plain chat (no tool catalog).
@@ -1141,11 +1217,18 @@ export class AppService {
     this.emitGeneration(sessionId, { type: "started", mode: "agent" });
     this.noteGenerationStart();
     this.maybeRenameSession(session, content);
+    const loadedCtx = this.runtime.getStatus().loadedContext;
+    const agentParams = {
+      ...session.params,
+      ...(typeof loadedCtx === "number" && loadedCtx > 0
+        ? { context: loadedCtx }
+        : {}),
+    };
     await this.agent.run(
       sessionId,
       content,
       settings,
-      session.params,
+      agentParams,
       session.systemPrompt,
       attachments,
     );

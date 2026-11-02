@@ -77,13 +77,45 @@ describe("toolFingerprint", () => {
 });
 
 describe("isSoftResumeGoal", () => {
-  it("keeps plan on continue / add prompts", () => {
-    expect(isSoftResumeGoal("продолжи", "сделай тетрис")).toBe(true);
-    expect(isSoftResumeGoal("добавь счёт в tetris", "сделай tetris игру")).toBe(true);
+  it("keeps plan on exact goal or continue cue with unfinished plan", () => {
+    expect(isSoftResumeGoal("сделай тетрис", "сделай тетрис")).toBe(true);
+    expect(
+      isSoftResumeGoal("продолжи", "сделай тетрис", { hasUnfinishedFrozenPlan: true }),
+    ).toBe(true);
+  });
+
+  it("does not soft-resume on token overlap or continue without unfinished plan", () => {
+    expect(isSoftResumeGoal("добавь счёт в tetris", "сделай tetris игру")).toBe(false);
+    expect(
+      isSoftResumeGoal("продолжи", "сделай тетрис", { hasUnfinishedFrozenPlan: false }),
+    ).toBe(false);
   });
 
   it("resets on unrelated goal", () => {
     expect(isSoftResumeGoal("напиши калькулятор", "сделай тетрис")).toBe(false);
+  });
+});
+
+describe("kind-based advance", () => {
+  it("advances edit kind only on write/patch", () => {
+    const step = {
+      id: "1",
+      title: "Do stuff",
+      status: "pending" as const,
+      kind: "edit" as const,
+    };
+    expect(shouldAdvancePlanOnTool(step, "write_file", { path: "a.py" })).toBe(true);
+    expect(shouldAdvancePlanOnTool(step, "run_terminal", { command: "x" })).toBe(false);
+  });
+
+  it("advances explore kind on read_file", () => {
+    const step = {
+      id: "1",
+      title: "Look around",
+      status: "pending" as const,
+      kind: "explore" as const,
+    };
+    expect(shouldAdvancePlanOnTool(step, "read_file", { path: "a.py" })).toBe(true);
   });
 });
 

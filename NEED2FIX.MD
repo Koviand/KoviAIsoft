@@ -179,10 +179,38 @@ PAT в Settings + «Проверить token»; SSH/`gh auth login` по жел�
 
 ---
 
+## Cursor-like chat (2026-11-02)
+
+| Пункт | Статус | Примечание |
+|-------|--------|-----------|
+| waitForServer exit-check | fix | мёртвый llama-server → сразу ошибка, не 120с |
+| port retry после stop | fix | пауза TIME_WAIT + EADDRINUSE retry |
+| MCP callTool timeout | fix | 75с withTimeout |
+| confirm ≤0 | fix | трактуется как 180с; баннер «Ждёт подтверждения» |
+| chat busy race | fix | abort не сбрасывается mid-recovery |
+| projectRoot → agent session | fix | createSession() по умолчанию agent |
+| detectShortProjectTask | fix | «добавь счёт» при projectRoot |
+| composer mode toggle | fix | Агент/Чат |
+| run/verify soft-skip | fix | nudge ×2 → soft-skip ×3 |
+| identical-tool | fix | nudge, затем final/finish |
+| settings save chain | fix | serialize + saveSeq на hardware apply |
+| preserve agentMaxSteps | fix | не затирать user >0 при «Под этот ПК» |
+| repair unbill | fix | repair/truncation не жгут step budget |
+| tiny-model refusal loop | fix | isModelRefusalText ×2 → incomplete + hint ≥7B |
+| model identity (name/path) | fix | RuntimeStatus.loadedModelName/Path; family не по hash |
+| preferredConstraintMode | fix | tiny/deepseek/lfm → json_schema first |
+| tools soft-fail | fix | prose в tools mode → retry json_schema |
+| compact tools sync | fix | CORE+MCP одинаково в prompt и OpenAI tools |
+| MCP inputSchema | fix | parameters из schema; validate required |
+
+Авто: `tests/cursor-like-chat.test.ts`, `tests/agent-loop-integration.test.ts`, `tests/model-family.test.ts`, `tests/agent-parse-action.test.ts`, `tests/tools-catalog.test.ts`.
+
+---
+
 ## Регрессия
 
 - `pnpm build:shared` + `pnpm build:core`
 - `pnpm typecheck` — green
 - `pnpm test` — e2e/git/sqlite + прежние
 
-*Обновлено при High+Mid sprint.*
+*Обновлено при models↔tools wiring sprint.*

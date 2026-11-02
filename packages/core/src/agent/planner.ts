@@ -1,4 +1,4 @@
-import type { AgentPlanStep } from "@kovi/shared";
+import type { AgentPlanStep, AgentPlanStepKind } from "@kovi/shared";
 
 import { PLAN_ADVANCING_TOOLS } from "./parseAction.js";
 
@@ -7,26 +7,123 @@ export const PLAN_MAX_STEPS = 7;
 /** Extra targeted repair before falling back to a template plan. */
 export const PLAN_PHASE_MAX_ATTEMPTS = 3;
 
-export type PlanDraftItem = { id: string; title: string };
+/** Cursor-like agent phase. */
+export type AgentPhase = "plan" | "execute" | "finish_only";
+
+export type PlanDraftItem = {
+  id: string;
+  title: string;
+  kind?: AgentPlanStepKind;
+};
+
+/** Infer step kind from title (fallback for models that omit kind). */
+export function inferPlanStepKind(title: string): AgentPlanStepKind {
+  const t = title.toLowerCase();
+  if (
+    /(итог|final|finish|отчет|отчёт|резюме)/i.test(t) &&
+    !(/(исправ|допис|созда|напис|файл|код)/i.test(t))
+  ) {
+    return "finalize";
+  }
+  if (
+    /(запустить|запуск(?!аем)|terminal|shell|cmd|проверь|проверить|тест|run_)/i.test(t)
+  ) {
+    return "run";
+  }
+  if (/(провер|verify|валид|lint|typecheck)/i.test(t)) {
+    return "verify";
+  }
+  if (
+    /(файл|созда|напис|допис|модул|логик|код|write|patch|исправ|реализ|skeleton|скелет|удал|delete)/i.test(
+      t,
+    )
+  ) {
+    return "edit";
+  }
+  if (
+    /(уточн|развед|list|read|search|обзор|состоян|explore|найд|посмотр)/i.test(t)
+  ) {
+    return "explore";
+  }
+  return "edit";
+}
+
+const EXPLORE_TOOLS = new Set([
+  "read_file",
+  "list_dir",
+  "search",
+  "git_status",
+  "git_diff",
+  "git_log",
+]);
+
+export function isExploreTool(toolName: string): boolean {
+  return EXPLORE_TOOLS.has(toolName) || toolName.startsWith("browser_");
+}
 
 /** Default coding checklist when the model fails to produce a plan. */
 export function defaultCodingPlan(): AgentPlanStep[] {
   return [
-    { id: "1", title: "Создать минимально запускаемый основной файл", status: "pending" },
-    { id: "2", title: "Добавить модули / дописать логику", status: "pending" },
-    { id: "3", title: "Проверить запуск (run_terminal)", status: "pending" },
-    { id: "4", title: "Исправить ошибки при необходимости", status: "pending" },
-    { id: "5", title: "Краткий итог пользователю (final)", status: "pending" },
+    {
+      id: "1",
+      title: "Создать минимально запускаемый основной файл",
+      status: "pending",
+      kind: "edit",
+    },
+    {
+      id: "2",
+      title: "Добавить модули / дописать логику",
+      status: "pending",
+      kind: "edit",
+    },
+    {
+      id: "3",
+      title: "Проверить запуск (run_terminal)",
+      status: "pending",
+      kind: "run",
+    },
+    {
+      id: "4",
+      title: "Исправить ошибки при необходимости",
+      status: "pending",
+      kind: "edit",
+    },
+    {
+      id: "5",
+      title: "Краткий итог пользователю (final)",
+      status: "pending",
+      kind: "finalize",
+    },
   ];
 }
 
 /** Generic non-coding checklist. */
 export function defaultGenericPlan(): AgentPlanStep[] {
   return [
-    { id: "1", title: "Уточнить текущее состояние (list_dir / read / search)", status: "pending" },
-    { id: "2", title: "Выполнить основное действие инструментом", status: "pending" },
-    { id: "3", title: "Проверить результат", status: "pending" },
-    { id: "4", title: "Краткий итог (final)", status: "pending" },
+    {
+      id: "1",
+      title: "Уточнить текущее состояние (list_dir / read / search)",
+      status: "pending",
+      kind: "explore",
+    },
+    {
+      id: "2",
+      title: "Выполнить основное действие инструментом",
+      status: "pending",
+      kind: "edit",
+    },
+    {
+      id: "3",
+      title: "Проверить результат",
+      status: "pending",
+      kind: "verify",
+    },
+    {
+      id: "4",
+      title: "Краткий итог (final)",
+      status: "pending",
+      kind: "finalize",
+    },
   ];
 }
 
@@ -34,7 +131,21 @@ export function defaultPlanForTask(wantsFiles: boolean): AgentPlanStep[] {
   return wantsFiles ? defaultCodingPlan() : defaultGenericPlan();
 }
 
-/** Normalize model plan to 3–7 short pending steps. */
+function normalizeKind(raw: unknown, title: string): AgentPlanStepKind {
+  const allowed: AgentPlanStepKind[] = [
+    "explore",
+    "edit",
+    "run",
+    "verify",
+    "finalize",
+  ];
+  if (typeof raw === "string" && (allowed as string[]).includes(raw)) {
+    return raw as AgentPlanStepKind;
+  }
+  return inferPlanStepKind(title);
+}
+
+/** Normalize model plan to 3–7 short pending steps with kind. */
 export function normalizePlanDraft(
   draft: PlanDraftItem[] | undefined | null,
   wantsFiles: boolean,
@@ -54,10 +165,14 @@ export function normalizePlanDraft(
       .slice(0, 24);
     if (!id || seen.has(id)) id = String(cleaned.length + 1);
     seen.add(id);
-    cleaned.push({ id, title, status: "pending" });
+    cleaned.push({
+      id,
+      title,
+      status: "pending",
+      kind: normalizeKind(raw.kind, title),
+    });
   }
   if (cleaned.length < PLAN_MIN_STEPS) {
-    // Pad with defaults so we always freeze a usable checklist.
     const fallback = defaultPlanForTask(wantsFiles);
     for (const f of fallback) {
       if (cleaned.length >= PLAN_MIN_STEPS) break;
@@ -79,6 +194,16 @@ export function currentPlanStep(steps: AgentPlanStep[]): AgentPlanStep | null {
   return idx >= 0 ? steps[idx]! : null;
 }
 
+export function resolveAgentPhase(opts: {
+  planFrozen: boolean;
+  steps: AgentPlanStep[];
+  finishOnly: boolean;
+}): AgentPhase {
+  if (opts.finishOnly) return "finish_only";
+  if (opts.planFrozen && opts.steps.length > 0) return "execute";
+  return "plan";
+}
+
 /** Mark the first pending step done (after a successful tool). */
 export function markCurrentPlanDone(
   steps: AgentPlanStep[],
@@ -93,7 +218,7 @@ export function markCurrentPlanDone(
 
 /**
  * Whether a successful tool should advance the current plan checklist item.
- * Avoids marking "write main file" done after an unrelated run_terminal / browser call.
+ * Prefers step.kind; falls back to title heuristics for legacy plans.
  */
 export function shouldAdvancePlanOnTool(
   step: AgentPlanStep | null,
@@ -101,31 +226,25 @@ export function shouldAdvancePlanOnTool(
   args: Record<string, unknown> = {},
 ): boolean {
   if (!step) return false;
+
+  const kind = step.kind || inferPlanStepKind(step.title);
+
+  if (kind === "finalize") return false;
+
+  if (kind === "explore") {
+    // Explore steps advance on scout tools even if not in PLAN_ADVANCING_TOOLS.
+    return isExploreTool(toolName) || PLAN_ADVANCING_TOOLS.has(toolName);
+  }
+
   if (!PLAN_ADVANCING_TOOLS.has(toolName)) return false;
 
-  const t = step.title.toLowerCase();
-  // Avoid \\b — it does not treat Cyrillic as word chars in JS.
-  const isFinalish =
-    /(итог|final|finish|отчет|отчёт|резюме)/i.test(t) &&
-    !(/(исправ|допис|созда|напис|файл|код)/i.test(t));
-  if (isFinalish) return false;
+  if (kind === "run" || kind === "verify") {
+    return toolName === "run_terminal" || toolName.startsWith("browser_");
+  }
 
-  // Avoid matching «запускаемый» inside coding titles.
-  const wantsRun =
-    /(запустить|запуск(?!аем)|terminal|shell|cmd|проверь|проверить|тест|run_)/i.test(t);
-  const wantsWrite =
-    /(файл|созда|напис|допис|модул|логик|код|write|patch|исправ|реализ|skeleton|скелет)/i.test(
-      t,
-    );
-  const wantsBrowse = /(браузер|browser|сайт|http|навиг|клик)/i.test(t);
-  const wantsDelete = /(удал|delete)/i.test(t);
-
-  if (wantsRun && !wantsWrite) return toolName === "run_terminal";
-  if (wantsBrowse && !wantsWrite) return toolName.startsWith("browser_");
-  if (wantsDelete && !wantsWrite) return toolName === "delete_path";
-
-  if (wantsWrite) {
+  if (kind === "edit") {
     if (toolName === "write_file" || toolName === "apply_patch") {
+      const t = step.title.toLowerCase();
       const pathRaw = String(args.path ?? "")
         .replace(/\\/g, "/")
         .toLowerCase();
@@ -137,40 +256,34 @@ export function shouldAdvancePlanOnTool(
       }
       return true;
     }
-    // Shell during a coding step only advances if the step also mentions run/check.
-    if (toolName === "run_terminal" && wantsRun) return true;
+    if (toolName === "delete_path") return true;
     return false;
   }
 
-  // Generic / exploratory step titles: any advancing tool is OK.
   return true;
 }
 
-/** Detect soft resume / continue prompts that should keep the frozen plan. */
-export function isSoftResumeGoal(freshGoal: string, previousGoal: string): boolean {
+/**
+ * Soft resume: keep frozen unfinished plan only on exact goal match
+ * or a short continuation cue (no token-overlap guessing).
+ */
+export function isSoftResumeGoal(
+  freshGoal: string,
+  previousGoal: string,
+  opts?: { hasUnfinishedFrozenPlan?: boolean },
+): boolean {
   const fresh = freshGoal.toLowerCase().trim();
   const prev = previousGoal.toLowerCase().trim();
   if (!fresh || !prev) return false;
   if (fresh === prev) return true;
-  if (fresh.includes(prev.slice(0, Math.min(80, prev.length)))) return true;
-  if (
+
+  const continueCue =
     /^(продолж|докажи|добь|ещё|еще|добавь|допиши|исправ|почин|resume|continue|keep going)/i.test(
       fresh,
-    )
-  ) {
-    return true;
-  }
-  // Shared significant tokens (≥4 chars) — "tetris score" after "make tetris".
-  const tokenize = (s: string) =>
-    s
-      .split(/[^\p{L}\p{N}]+/u)
-      .map((x) => x.toLowerCase())
-      .filter((x) => x.length >= 4);
-  const a = new Set(tokenize(prev));
-  const b = tokenize(fresh);
-  if (!a.size || !b.length) return false;
-  const overlap = b.filter((t) => a.has(t)).length;
-  return overlap >= 1 && overlap / Math.max(b.length, 1) >= 0.4;
+    );
+  if (!continueCue) return false;
+  // Continue cues require an unfinished frozen plan.
+  return opts?.hasUnfinishedFrozenPlan === true;
 }
 
 /** Mark the first pending step failed (after a tool error). */
@@ -187,6 +300,25 @@ export function markCurrentPlanFailed(
   );
 }
 
+/** Soft-skip the current pending step (stuck run/verify) and continue. */
+export function skipCurrentPlanStep(
+  steps: AgentPlanStep[],
+  detail?: string,
+): AgentPlanStep[] {
+  const idx = firstPendingIndex(steps);
+  if (idx < 0) return steps;
+  return steps.map((s, j) =>
+    j === idx
+      ? { ...s, status: "skipped" as const, detail: detail || s.detail || "soft-skip" }
+      : s,
+  );
+}
+
+export function stepKindOf(step: AgentPlanStep | null): AgentPlanStepKind | null {
+  if (!step) return null;
+  return step.kind || inferPlanStepKind(step.title);
+}
+
 /** Skip remaining pending steps (on successful final). */
 export function skipRemainingPlan(steps: AgentPlanStep[]): AgentPlanStep[] {
   return steps.map((s) =>
@@ -196,12 +328,12 @@ export function skipRemainingPlan(steps: AgentPlanStep[]): AgentPlanStep[] {
 
 export function planPhaseInstruction(wantsFiles: boolean): string {
   const hint = wantsFiles
-    ? `Для кодинга ориентир пунктов: (1) минимально запускаемый файл, (2) модули/логика, (3) проверка запуска, (4) фиксы, (5) итог.`
-    : `Пункты должны быть конкретными действиями с инструментами.`;
+    ? `Кодинг: edit → edit → run → edit(fix) → finalize. У каждого шага kind: explore|edit|run|verify|finalize.`
+    : `Шаги — конкретные действия. Укажи kind у каждого пункта.`;
   return (
-    `ФАЗА ПЛАНА (обязательно сейчас).\n` +
-    `Верни строго JSON: {"thought":"…","plan":[{"id":"1","title":"…"},…],"tool":null,"final":null}.\n` +
-    `Ровно ${PLAN_MIN_STEPS}–${PLAN_MAX_STEPS} коротких шагов. Без tool и без final.\n` +
+    `ФАЗА ПЛАНА.\n` +
+    `Верни ТОЛЬКО JSON: {"thought":"…","plan":[{"id":"1","title":"…","kind":"edit"},…],"tool":null,"final":null}.\n` +
+    `Ровно ${PLAN_MIN_STEPS}–${PLAN_MAX_STEPS} шагов. Инструменты сейчас ЗАПРЕЩЕНЫ.\n` +
     hint
   );
 }
@@ -209,18 +341,29 @@ export function planPhaseInstruction(wantsFiles: boolean): string {
 export function executePhaseHint(current: AgentPlanStep | null, plan: AgentPlanStep[]): string {
   const list = plan
     .slice(0, 12)
-    .map((p) => `  [${p.status}] ${p.id}: ${p.title}`)
+    .map((p) => `  [${p.status}] ${p.id}${p.kind ? `(${p.kind})` : ""}: ${p.title}`)
     .join("\n");
   if (!current) {
     return (
-      `План выполнен. Можно final (краткий итог) или finish.\n` +
+      `План выполнен. Верни final или finish.\n` +
       `План зафиксирован — не переписывай plan.\n${list}`
     );
   }
+  const kind = current.kind || inferPlanStepKind(current.title);
+  const toolHint =
+    kind === "edit"
+      ? "Нужен write_file / apply_patch."
+      : kind === "run" || kind === "verify"
+        ? "Нужен run_terminal (или browser_*)."
+        : kind === "explore"
+          ? "Нужен read_file / list_dir / search."
+          : kind === "finalize"
+            ? "Можно final или finish."
+            : "Один tool под текущий пункт.";
   return (
-    `ФАЗА ИСПОЛНЕНИЯ. План зафиксирован — НЕ меняй plan (поле plan опусти или повтори как есть).\n` +
-    `Текущий пункт: [${current.id}] ${current.title}\n` +
-    `Один tool за шаг. Затем жди результат.\n` +
+    `ФАЗА ИСПОЛНЕНИЯ. План зафиксирован — НЕ меняй plan.\n` +
+    `Текущий: [${current.id}] (${kind}) ${current.title}\n` +
+    `${toolHint} Один tool за шаг.\n` +
     `Чеклист:\n${list}`
   );
 }

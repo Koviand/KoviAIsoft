@@ -51,6 +51,8 @@ function migrateLoadProfiles(profiles: LoadProfile[]): LoadProfile[] {
 export class SettingsStore {
   private appData: string;
   private settings: AppSettings;
+  /** Serialize concurrent saves (debounce + hardware apply race). */
+  private saveChain: Promise<void> = Promise.resolve();
 
   constructor(appData: string) {
     this.appData = appData;
@@ -63,21 +65,29 @@ export class SettingsStore {
   }
 
   async save(next: AppSettings): Promise<AppSettings> {
-    // Merge through defaults so partial/legacy payloads keep new fields.
-    const merged = this.mergePartial(createDefaultSettings(this.appData), next);
-    merged.downloadDir =
-      typeof next.downloadDir === "string" && next.downloadDir.trim()
-        ? next.downloadDir.trim()
-        : merged.downloadDir;
-    merged.agentMaxSteps = normalizeAgentMaxStepsSetting(
-      next.agentMaxSteps ?? merged.agentMaxSteps,
+    const run = async (): Promise<AppSettings> => {
+      // Merge through defaults so partial/legacy payloads keep new fields.
+      const merged = this.mergePartial(createDefaultSettings(this.appData), next);
+      merged.downloadDir =
+        typeof next.downloadDir === "string" && next.downloadDir.trim()
+          ? next.downloadDir.trim()
+          : merged.downloadDir;
+      merged.agentMaxSteps = normalizeAgentMaxStepsSetting(
+        next.agentMaxSteps ?? merged.agentMaxSteps,
+      );
+      this.settings = structuredClone(merged);
+      await writeFileAtomic(
+        getSettingsPath(this.appData),
+        JSON.stringify(this.settings, null, 2),
+      );
+      return this.get();
+    };
+    const queued = this.saveChain.then(run, run);
+    this.saveChain = queued.then(
+      () => undefined,
+      () => undefined,
     );
-    this.settings = structuredClone(merged);
-    await writeFileAtomic(
-      getSettingsPath(this.appData),
-      JSON.stringify(this.settings, null, 2),
-    );
-    return this.get();
+    return queued;
   }
 
   private mergePartial(defaults: AppSettings, parsed: Partial<AppSettings>): AppSettings {

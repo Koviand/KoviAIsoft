@@ -34,18 +34,25 @@ import { runBatchTools } from "./phases/runBatchTools.js";
 import {
   agentTuningForFamily,
   detectModelFamily,
+  looksLikeSmallOrUnknownModel,
+  modelIdentityForTuning,
+  preferredConstraintMode,
 } from "../models/modelFamily.js";
 import {
   currentPlanStep,
   defaultPlanForTask,
   executePhaseHint,
+  isExploreTool,
   isSoftResumeGoal,
   markCurrentPlanDone,
   normalizePlanDraft,
   PLAN_PHASE_MAX_ATTEMPTS,
   planPhaseInstruction,
+  resolveAgentPhase,
   shouldAdvancePlanOnTool,
+  skipCurrentPlanStep,
   skipRemainingPlan,
+  stepKindOf,
 } from "./planner.js";
 import {
   parseAgentAction,
@@ -59,6 +66,7 @@ import {
   AGENT_IDENTICAL_TOOL_MAX,
   AGENT_NON_ADVANCING_HARD_STOP,
   AGENT_NON_ADVANCING_MAX,
+  AGENT_REFUSAL_HARD_STOP,
   AGENT_REPAIR_HARD_STOP,
   AGENT_REPAIR_MAX,
   AGENT_STEPS_SAFETY_CAP,
@@ -66,10 +74,12 @@ import {
   agentHasPendingWork,
   clampAgentMaxSteps,
   inFinishWindow,
+  isModelRefusalText,
   toolFingerprint,
 } from "./finishPolicy.js";
 import {
   applyWorkingMemoryToSystem,
+  clearPlanAfterCompletion,
   createWorkingMemory,
   emergencyShrinkTranscript,
   parseWorkingMemory,
@@ -280,36 +290,36 @@ export class AgentLoop {
       settings,
     });
     this.emit(sessionId, { type: "confirmation_required", confirmation });
-    const timeoutSec =
+    const rawTimeout =
       typeof settings.agentConfirmTimeoutSec === "number"
         ? settings.agentConfirmTimeoutSec
         : 120;
-    const timeoutMs =
-      timeoutSec <= 0
-        ? 0
-        : Math.max(5_000, Math.min(600_000, Math.floor(timeoutSec) * 1000));
+    // ≤0 used to mean "wait forever" and hung the UI — treat as 180s (Cursor-like).
+    const timeoutSec = rawTimeout <= 0 ? 180 : rawTimeout;
+    const timeoutMs = Math.max(5_000, Math.min(600_000, Math.floor(timeoutSec) * 1000));
+    this.emit(sessionId, {
+      type: "thinking",
+      text: `Ждёт подтверждения «${toolName}» (до ${Math.round(timeoutMs / 1000)} с)…`,
+    });
     return new Promise<"approved" | "rejected" | "timeout">((resolve) => {
-      const timer =
-        timeoutMs > 0
-          ? setTimeout(() => {
-              const still = this.pendingConfirm.get(confirmation.id);
-              if (!still) return;
-              this.pendingConfirm.delete(confirmation.id);
-              this.emit(sessionId, {
-                type: "confirmation_timeout",
-                confirmationId: confirmation.id,
-                toolName,
-                timeoutSec: Math.round(timeoutMs / 1000),
-              });
-              still.resolve("timeout");
-            }, timeoutMs)
-          : null;
+      const timer = setTimeout(() => {
+        const still = this.pendingConfirm.get(confirmation.id);
+        if (!still) return;
+        this.pendingConfirm.delete(confirmation.id);
+        this.emit(sessionId, {
+          type: "confirmation_timeout",
+          confirmationId: confirmation.id,
+          toolName,
+          timeoutSec: Math.round(timeoutMs / 1000),
+        });
+        still.resolve("timeout");
+      }, timeoutMs);
       this.pendingConfirm.set(confirmation.id, {
         resolve,
         toolName,
         sessionId,
         rememberKey,
-        timer: timer || undefined,
+        timer,
       });
     });
   }
@@ -357,15 +367,29 @@ export class AgentLoop {
       const mcpTools = this.mcp.listTools().map((t) => ({
         name: t.name,
         description: t.description,
+        inputSchema: t.inputSchema,
       }));
       const extraToolNames = mcpTools.map((t) => t.name);
+      const mcpSchemas: Record<string, unknown> = {};
+      for (const t of mcpTools) {
+        if (t.inputSchema != null) mcpSchemas[t.name] = t.inputSchema;
+      }
       const toolBlock = toolsPromptBlock(mcpTools, { compact: compactTools });
 
       const session = this.store.listSessions().find((s) => s.id === sessionId);
       const restored = parseWorkingMemory(session?.agentScratchpad);
       const freshGoal = userContent.replace(/\s+/g, " ").trim().slice(0, 400);
+      const unfinishedFrozen =
+        Boolean(restored?.planFrozen) &&
+        Array.isArray(restored?.plan) &&
+        restored!.plan.some(
+          (p) => p.status === "pending" || p.status === "running",
+        );
       const softResume =
-        Boolean(restored?.goal) && isSoftResumeGoal(freshGoal, restored!.goal);
+        Boolean(restored?.goal) &&
+        isSoftResumeGoal(freshGoal, restored!.goal, {
+          hasUnfinishedFrozenPlan: unfinishedFrozen,
+        });
       const goalChanged =
         Boolean(restored?.goal) &&
         restored!.goal.toLowerCase() !== freshGoal.toLowerCase() &&
@@ -537,12 +561,16 @@ export class AgentLoop {
         }
       };
 
-      let lastPhaseKind: "plan" | "exec" | null = null;
+      let lastPhaseKind: "plan" | "execute" | "finish_only" | null = null;
       let repairAttempts = 0;
       let truncationStreak = 0;
       let identicalToolStreak = 0;
       let lastToolFp: string | null = null;
+      let identicalNudgeSent = false;
+      /** Wrong tools on run/verify steps before soft-skip. */
+      let kindMismatchStreak = 0;
       let nonAdvancingStreak = 0;
+      let refusalStreak = 0;
       const userStepsPref =
         typeof settings.agentMaxSteps === "number" ? settings.agentMaxSteps : 0;
       const showStepCap = userStepsPref > 0;
@@ -565,11 +593,16 @@ export class AgentLoop {
       const runStartedAt = Date.now();
       let stopReason: "budget" | "no_progress" | "time_limit" | null = null;
 
+      // i advances every iteration; repair/truncation/plan-wait paths unbill (i--) so they
+      // do not burn the step budget.
       for (let i = 0; ; i++) {
         if (this.cancelled) {
           this.emit(sessionId, { type: "cancelled" });
           return;
         }
+        const unbillStep = () => {
+          i = Math.max(-1, i - 1);
+        };
         if (maxRunMs > 0 && Date.now() - runStartedAt >= maxRunMs) {
           this.emit(sessionId, {
             type: "thinking",
@@ -610,6 +643,7 @@ export class AgentLoop {
         // Never force finish-only while the plan / coding task is still open.
         const finishOnly = inFinishWindow(i, stepBudget) && !pendingWork;
         const planFrozen = Boolean(workingMemory.planFrozen) && steps.length > 0;
+        const phase = resolveAgentPhase({ planFrozen, steps, finishOnly });
         const curPlan = currentPlanStep(steps);
         // Match plan step ids ("1","2",…) so ChatPage checklist updates.
         const stepId = planFrozen && curPlan ? curPlan.id : `p${i + 1}`;
@@ -619,13 +653,14 @@ export class AgentLoop {
         this.emit(sessionId, { type: "step_start", stepId });
         this.emit(sessionId, {
           type: "thinking",
-          text: finishOnly
-            ? `${stepLabel}: финальный ответ…`
-            : planFrozen
-              ? `${stepLabel}: исполнение плана…`
-              : `${stepLabel}: составление плана…`,
+          text:
+            phase === "finish_only"
+              ? `${stepLabel}: финальный ответ…`
+              : phase === "execute"
+                ? `${stepLabel}: исполнение плана…`
+                : `${stepLabel}: составление плана…`,
         });
-        if (finishOnly && planFrozen) {
+        if (phase === "finish_only" && planFrozen) {
           transcript.push({
             role: "user",
             content:
@@ -635,13 +670,13 @@ export class AgentLoop {
 
         // Inject phase instruction once per phase (not every tool turn).
         syncSystem();
-        const phaseKind = planFrozen ? "exec" : "plan";
-        if (lastPhaseKind !== phaseKind) {
-          const phaseHint = planFrozen
-            ? executePhaseHint(curPlan, steps)
-            : planPhaseInstruction(wantsFiles);
+        if (lastPhaseKind !== phase) {
+          const phaseHint =
+            phase === "plan"
+              ? planPhaseInstruction(wantsFiles)
+              : executePhaseHint(curPlan, steps);
           transcript.push({ role: "user", content: phaseHint });
-          lastPhaseKind = phaseKind;
+          lastPhaseKind = phase;
         }
 
         let raw: string;
@@ -659,9 +694,11 @@ export class AgentLoop {
             promptReserveRatio: !planFrozen ? 0.45 : wantsFiles ? 0.25 : 0.35,
             minPromptReserve: 512,
           });
-          const loadedId = this.chat.getRuntime().getStatus().loadedModelId || "";
-          const family = detectModelFamily(loadedId);
-          const tuning = agentTuningForFamily(family, loadedId);
+          const runtimeStatus = this.chat.getRuntime().getStatus();
+          const modelIdentity = modelIdentityForTuning(runtimeStatus);
+          const family = detectModelFamily(modelIdentity);
+          const tuning = agentTuningForFamily(family, modelIdentity);
+          const constraintPrefer = preferredConstraintMode(family, modelIdentity);
           const callParams = {
             ...params,
             maxTokens,
@@ -696,7 +733,12 @@ export class AgentLoop {
           });
           try {
             raw = await this.chat.completeJson(packed, callParams, sessionId, {
-              extraToolNames,
+              extraToolNames: phase === "plan" ? [] : extraToolNames,
+              extraTools: phase === "plan" ? [] : mcpTools,
+              compact: compactTools,
+              planOnly: phase === "plan",
+              preferredConstraint:
+                phase === "plan" ? "json_schema" : constraintPrefer,
             });
             truncationStreak = 0;
           } catch (err) {
@@ -718,6 +760,7 @@ export class AgentLoop {
                   content:
                     "Слишком много обрезок. Больше не пиши крупные write_file. Верни JSON с final: краткий итог и что осталось сделать.",
                 });
+                unbillStep();
                 continue;
               }
               this.emit(sessionId, {
@@ -731,6 +774,7 @@ export class AgentLoop {
                   "Предыдущий ответ обрезан (finish_reason=length). НЕ пытайся уместить всё в один write_file. " +
                   "Короткий thought + один небольшой write_file. Верни один tool JSON.",
               });
+              unbillStep();
               continue;
             }
             if (!isContextOverflowError(err)) throw err;
@@ -751,7 +795,12 @@ export class AgentLoop {
               text: `Шаг ${i + 1}: контекст переполнен — сжимаю историю, цель и план сохранены… (~${estimateMessagesTokens(packed)}/${ctx} tok)`,
             });
             raw = await this.chat.completeJson(packed, callParams, sessionId, {
-              extraToolNames,
+              extraToolNames: phase === "plan" ? [] : extraToolNames,
+              extraTools: phase === "plan" ? [] : mcpTools,
+              compact: compactTools,
+              planOnly: phase === "plan",
+              preferredConstraint:
+                phase === "plan" ? "json_schema" : constraintPrefer,
             });
             truncationStreak = 0;
           }
@@ -778,6 +827,7 @@ export class AgentLoop {
                   ? "Обрезки исчерпали лимит. Верни JSON с final — итог без новых крупных файлов."
                   : "Ответ снова обрезан. Пиши МЕНЬШЕ за шаг: один небольшой write_file. Без длинного thought.",
             });
+            unbillStep();
             continue;
           }
           throw err;
@@ -789,6 +839,58 @@ export class AgentLoop {
 
         const inPlanPhase = !finishOnly && !planFrozen;
         const parsed = parseAgentAction(raw, inPlanPhase ? "plan" : "execute");
+        // Tiny instruct models often refuse in prose / JSON thought+final without tools.
+        const refusalBlob = [
+          raw,
+          parsed?.thought || "",
+          parsed?.final || "",
+        ].join("\n");
+        if (isModelRefusalText(refusalBlob)) {
+          refusalStreak += 1;
+          this.emit(sessionId, {
+            type: "thinking",
+            text: (parsed?.thought || parsed?.final || raw).replace(/\s+/g, " ").trim().slice(0, 400),
+          });
+          if (refusalStreak >= AGENT_REFUSAL_HARD_STOP) {
+            const refuseIdentity = modelIdentityForTuning(
+              this.chat.getRuntime().getStatus(),
+            );
+            const small = looksLikeSmallOrUnknownModel(refuseIdentity);
+            const hint = small
+              ? " Текущая модель слишком слабая для агента — загрузите instruct ≥7B."
+              : " Сформулируйте задачу конкретнее или смените модель.";
+            const msg = this.store.addMessage(sessionId, {
+              role: "assistant",
+              content:
+                `Модель отказалась выполнять шаги агента (повторный отказ).${hint}`,
+            });
+            this.emit(sessionId, {
+              type: "step_done",
+              stepId,
+              detail: "model_refusal",
+            });
+            this.emit(sessionId, {
+              type: "incomplete",
+              message: msg.content.slice(0, 400),
+              reason: "no_progress",
+            });
+            this.emit(sessionId, { type: "stream", text: msg.content });
+            this.emit(sessionId, { type: "done", messageId: msg.id });
+            return;
+          }
+          transcript.push({ role: "assistant", content: raw.slice(0, 2000) });
+          transcript.push({
+            role: "user",
+            content:
+              "Это задача локального coding-агента, не запрещённый контент. " +
+              "Верни строго JSON с tool (write_file/run_terminal/…) по текущему пункту плана. " +
+              "Без отказа текстом. Пример: {\"thought\":\"пишу файл\",\"tool\":{\"name\":\"write_file\",\"args\":{\"path\":\"main.py\",\"content\":\"...\"}},\"final\":null}",
+          });
+          this.emit(sessionId, { type: "step_done", stepId, detail: "refusal nudge" });
+          continue;
+        }
+        refusalStreak = 0;
+
         if (!parsed) {
           // Plan phase: tool/final-without-plan counts as a failed plan attempt.
           if (inPlanPhase) {
@@ -827,6 +929,7 @@ export class AgentLoop {
               stepId,
               detail: "Жду план",
             });
+            unbillStep();
             continue;
           }
           repairAttempts += 1;
@@ -836,8 +939,13 @@ export class AgentLoop {
             (raw.includes("{") && !raw.includes("}")) ||
             raw.length > 1500;
           transcript.push({ role: "assistant", content: raw.slice(0, 4000) });
-          const loadedId = this.chat.getRuntime().getStatus().loadedModelId || "";
-          const tuning = agentTuningForFamily(detectModelFamily(loadedId), loadedId);
+          const repairIdentity = modelIdentityForTuning(
+            this.chat.getRuntime().getStatus(),
+          );
+          const tuning = agentTuningForFamily(
+            detectModelFamily(repairIdentity),
+            repairIdentity,
+          );
           const familyNudge = tuning.jsonNudge;
           const proseReject = tuning.rejectProseReasoning
             ? " Обычный текст/рассуждения без JSON отвергнуты — повтори строго JSON."
@@ -863,6 +971,7 @@ export class AgentLoop {
                 "Не удалось получить валидный JSON. Верни ТОЛЬКО: " +
                 `{"thought":"итог","tool":null,"final":"${workingMemory.goal.slice(0, 80) || "Готово"} — прогресс сохранён, нужен следующий запуск."}`,
             });
+            unbillStep();
             continue;
           }
           const repair =
@@ -875,6 +984,7 @@ export class AgentLoop {
                 : `Снова не JSON. ${familyNudge}${proseReject}`;
           this.emit(sessionId, { type: "step_done", stepId, detail: "repair" });
           transcript.push({ role: "user", content: repair });
+          unbillStep();
           continue;
         }
         repairAttempts = 0;
@@ -946,6 +1056,7 @@ export class AgentLoop {
             stepId,
             detail: "Жду план",
           });
+          unbillStep();
           continue;
         }
 
@@ -1020,7 +1131,8 @@ export class AgentLoop {
           const current = currentPlanStep(steps);
           const currentIsFinalish =
             current &&
-            /итог|final|finish|отчет|отчёт|резюме/i.test(current.title);
+            (current.kind === "finalize" ||
+              /итог|final|finish|отчет|отчёт|резюме/i.test(current.title));
           const mustWork =
             noFileYet ||
             (!finishOnly &&
@@ -1047,6 +1159,7 @@ export class AgentLoop {
                   : `Рано для final: запись похожа на stub.${curTitle} Допиши полный код через write_file/apply_patch (цель ≥${MIN_CODING_WRITE_CHARS} символов), затем final.`
                 : `Рано для final.${curTitle} Сначала выполни текущий пункт плана инструментом.`,
             });
+            // Count toward budget — otherwise thought-only loops never stop.
             continue;
           }
           let finalText = parsed.final;
@@ -1058,9 +1171,10 @@ export class AgentLoop {
           if (marked.length) {
             steps = marked;
             updatePlanMemory(workingMemory, steps);
-            persistScratchpad();
             this.emit(sessionId, { type: "plan", steps });
           }
+          clearPlanAfterCompletion(workingMemory);
+          persistScratchpad();
           const msg = this.store.addMessage(sessionId, {
             role: "assistant",
             content: finalText,
@@ -1087,6 +1201,7 @@ export class AgentLoop {
                 ? `${curHint} Ты вернул thought без tool. Сейчас ОБЯЗАТЕЛЕН tool.write_file (или apply_patch) с полным кодом в args — не описывай файлы в thought/final. Пример: {"thought":"создаю main","tool":{"name":"write_file","args":{"path":"tetris/main.py","content":"..."}},"final":null}`
                 : `${curHint} Нужен один tool или final. Не отвечай только thought.`,
           });
+          // Count toward budget — empty turns must not loop forever.
           continue;
         }
 
@@ -1107,7 +1222,12 @@ export class AgentLoop {
 
         const toolName = parsed.tool.name;
         const coerced = coerceToolArgs(toolName, parsed.tool.args || {});
-        const argCheck = validateToolArgs(toolName, coerced, extraToolNames);
+        const argCheck = validateToolArgs(
+          toolName,
+          coerced,
+          extraToolNames,
+          mcpSchemas,
+        );
         if (!argCheck.ok) {
           transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
           transcript.push({
@@ -1142,12 +1262,40 @@ export class AgentLoop {
             /codebase-index|\.kovi|__.__kovi/i.test(badPath)
               ? " Путь похож на служебный индекс — пиши в tetris/main.py или src/main.py."
               : "";
+          const pendingOnlyFinalize =
+            steps.length > 0 &&
+            !steps.some(
+              (s) =>
+                s.status === "pending" &&
+                stepKindOf(s) !== "finalize",
+            );
           transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+          if (!identicalNudgeSent) {
+            identicalNudgeSent = true;
+            transcript.push({
+              role: "user",
+              content:
+                `Ты повторяешь тот же ${toolName} с теми же аргументами.${pathHint} ` +
+                `Смени path/args или другой tool. Если работа сделана — final/finish.`,
+            });
+            continue;
+          }
+          if (pendingOnlyFinalize || identicalToolStreak > AGENT_IDENTICAL_TOOL_MAX + 2) {
+            transcript.push({
+              role: "user",
+              content:
+                "Повтор инструмента исчерпан. Верни JSON с final (краткий честный итог) или tool finish.",
+            });
+            identicalToolStreak = 0;
+            lastToolFp = null;
+            continue;
+          }
+          identicalToolStreak = 0;
+          lastToolFp = null;
           transcript.push({
             role: "user",
             content:
-              `Ты повторяешь тот же ${toolName} с теми же аргументами — он уже не сработал.${pathHint} ` +
-              `Смени path/args или верни final с честным итогом.`,
+              `Смени аргументы ${toolName} или вызови другой tool / final.${pathHint}`,
           });
           continue;
         }
@@ -1189,9 +1337,10 @@ export class AgentLoop {
           if (steps.length) {
             steps = skipRemainingPlan(steps);
             updatePlanMemory(workingMemory, steps);
-            persistScratchpad();
             this.emit(sessionId, { type: "plan", steps });
           }
+          clearPlanAfterCompletion(workingMemory);
+          persistScratchpad();
           const msg = this.store.addMessage(sessionId, {
             role: "assistant",
             content: summary,
@@ -1208,7 +1357,17 @@ export class AgentLoop {
           return;
         }
 
-        if (!PLAN_ADVANCING_TOOLS.has(toolName)) {
+        // Explore tools against an explore step are progress — do not count toward no_progress.
+        const curForProgress = currentPlanStep(steps);
+        const exploreProgress =
+          isExploreTool(toolName) &&
+          curForProgress &&
+          (curForProgress.kind === "explore" ||
+            (!curForProgress.kind &&
+              /уточн|развед|list|read|search|обзор|состоян|explore/i.test(
+                curForProgress.title,
+              )));
+        if (!PLAN_ADVANCING_TOOLS.has(toolName) && !exploreProgress) {
           nonAdvancingStreak += 1;
           if (nonAdvancingStreak > AGENT_NON_ADVANCING_HARD_STOP) {
             this.emit(sessionId, {
@@ -1300,12 +1459,37 @@ export class AgentLoop {
               );
             }
           }
-          if (
-            steps.length &&
-            shouldAdvancePlanOnTool(currentPlanStep(steps), toolName, normalizedArgs)
-          ) {
-            steps = markCurrentPlanDone(steps, toolName);
-            this.emit(sessionId, { type: "plan", steps });
+          let kindMismatchHint: string | null = null;
+          if (steps.length) {
+            const curStep = currentPlanStep(steps);
+            if (shouldAdvancePlanOnTool(curStep, toolName, normalizedArgs)) {
+              steps = markCurrentPlanDone(steps, toolName);
+              kindMismatchStreak = 0;
+              this.emit(sessionId, { type: "plan", steps });
+            } else {
+              const kind = stepKindOf(curStep);
+              if (kind === "run" || kind === "verify") {
+                kindMismatchStreak += 1;
+                if (kindMismatchStreak === 2) {
+                  kindMismatchHint =
+                    `Текущий пункт плана (${kind}): нужен run_terminal (или browser_*). ` +
+                    `Сначала запусти проверку.`;
+                } else if (kindMismatchStreak >= 3) {
+                  steps = skipCurrentPlanStep(
+                    steps,
+                    `soft-skip: ожидали ${kind}, был ${toolName}`,
+                  );
+                  kindMismatchStreak = 0;
+                  this.emit(sessionId, { type: "plan", steps });
+                  this.emit(sessionId, {
+                    type: "thinking",
+                    text: `Пункт ${curStep?.id || "?"} пропущен (нет run_terminal) — продолжаю.`,
+                  });
+                }
+              } else {
+                kindMismatchStreak = 0;
+              }
+            }
           }
           rememberToolSuccess(workingMemory, toolName, normalizedArgs, result);
           updatePlanMemory(workingMemory, steps);
@@ -1333,6 +1517,9 @@ export class AgentLoop {
             detail: `${toolName} ok`,
           });
           let followUp = `Результат инструмента ${toolName}:\n${result.slice(0, TOOL_RESULT_TRANSCRIPT_CHARS)}`;
+          if (kindMismatchHint) {
+            followUp += `\n\n${kindMismatchHint}`;
+          }
           if (
             toolName === "run_terminal" &&
             /exit:\s*(?!0\b)\d+/i.test(result)

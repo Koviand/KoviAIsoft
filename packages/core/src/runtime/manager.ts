@@ -42,9 +42,38 @@ async function findFreePort(start = 8080): Promise<number> {
   throw new Error("Не удалось найти свободный порт для llama-server");
 }
 
-async function waitForServer(port: number, timeoutMs = 120_000): Promise<void> {
+function childAlreadyDead(child?: ChildProcess | null): string | null {
+  if (!child) return null;
+  if (child.exitCode != null) {
+    return `llama-server завершился с кодом ${child.exitCode} до готовности HTTP`;
+  }
+  if (child.signalCode) {
+    return `llama-server остановлен (${child.signalCode}) до готовности HTTP`;
+  }
+  // killed flag set after kill(); exit may not have fired yet
+  if (child.killed && child.exitCode == null && !child.pid) {
+    return "llama-server процесс уже завершён";
+  }
+  return null;
+}
+
+/**
+ * Poll until llama-server answers. Fail immediately if the child already exited
+ * (OOM / bad GGUF / Vulkan) instead of waiting the full timeout.
+ */
+export async function waitForServer(
+  port: number,
+  timeoutMs = 120_000,
+  child?: ChildProcess | null,
+  getLogTail?: () => string,
+): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    const dead = childAlreadyDead(child);
+    if (dead) {
+      const tail = getLogTail?.() || "";
+      throw new Error(dead + (tail ? `\n${tail.slice(-600)}` : ""));
+    }
     try {
       const res = await fetch(`http://127.0.0.1:${port}/v1/models`);
       if (res.ok) return;
@@ -62,6 +91,8 @@ export class RuntimeManager {
   private process: ChildProcess | null = null;
   private port: number | null = null;
   private loadedModelId: string | null = null;
+  private loadedModelName: string | null = null;
+  private loadedModelPath: string | null = null;
   private loadedContext: number | null = null;
   private loadedGpuLayers: number | null = null;
   private downloading = false;
@@ -105,6 +136,8 @@ export class RuntimeManager {
       serverRunning: Boolean(this.process && !this.process.killed),
       serverPort: this.port,
       loadedModelId: this.loadedModelId,
+      loadedModelName: this.loadedModelId ? this.loadedModelName : null,
+      loadedModelPath: this.loadedModelId ? this.loadedModelPath : null,
       loadedContext: this.loadedModelId ? this.loadedContext : null,
       loadedGpuLayers: this.loadedModelId ? this.loadedGpuLayers : null,
       lastError: this.lastError,
@@ -119,6 +152,8 @@ export class RuntimeManager {
 
   private clearLoadedModel(): void {
     this.loadedModelId = null;
+    this.loadedModelName = null;
+    this.loadedModelPath = null;
     this.loadedContext = null;
     this.loadedGpuLayers = null;
   }
@@ -647,99 +682,114 @@ export class RuntimeManager {
       throw new Error("Runtime llama.cpp не установлен");
     }
     await this.stopServer();
-    const port = await findFreePort(8080);
+    // Let OS release the previous listen socket (Windows TIME_WAIT).
+    await new Promise((r) => setTimeout(r, 350));
+
     if (model.integrityOk === false) {
       throw new Error(
         `Модель не прошла проверку GGUF: ${model.integrityError || "повреждённый файл"}`,
       );
     }
     if (model.fitsInVram === false && params.gpuLayers > 0) {
-      // Soft warning into lastError after start; still allow load with profile override.
       console.warn(
         `Модель ${model.name} может не влезть в VRAM (ngl=${params.gpuLayers}, ctx=${params.context}).`,
       );
     }
-    const args = [
-      "-m",
-      model.path,
-      "--host",
-      "127.0.0.1",
-      "--port",
-      String(port),
-      "-c",
-      String(params.context),
-      "-ngl",
-      String(params.gpuLayers),
-      // Keep HTTP accept queue responsive while a completion is running.
-      "--threads-http",
-      "4",
-      "--alias",
-      model.name,
-      "--jinja",
-      "--no-webui",
-    ];
-    if (params.flashAttn) {
-      args.push("-fa");
-    }
-    if (model.mmprojPath) {
-      args.push("--mmproj", model.mmprojPath);
-    }
 
     const cwd = path.dirname(this.installed.serverPath);
-    // CRITICAL on Windows: default piped stdout fills (~64KB) and freezes llama-server
-    // if nobody reads it — HTTP then looks like "fetch failed" while the process is "alive".
-    const child = spawn(this.installed.serverPath, args, {
-      cwd,
-      windowsHide: true,
-      env: { ...process.env },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    this.process = child;
-    this.port = port;
-    this.loadedModelId = model.id;
-    this.loadedContext = params.context;
-    this.loadedGpuLayers = params.gpuLayers;
-    this.lastError = null;
-    this.serverLog = "";
+    let lastSpawnError: Error | null = null;
 
-    const onChunk = (buf: Buffer) => this.appendServerLog(buf.toString());
-    child.stdout?.on("data", onChunk);
-    child.stderr?.on("data", onChunk);
-    child.on("error", (err) => {
-      this.appendServerLog(`\n[spawn error] ${err.message}\n`);
-      this.lastError = `Не удалось запустить llama-server: ${err.message}`;
-    });
-    child.on("exit", (code, signal) => {
-      if (this.process === child) {
-        this.process = null;
-        this.port = null;
-        this.clearLoadedModel();
-        const tail = this.getServerLogTail(500);
-        if (code && code !== 0) {
-          this.lastError = `llama-server завершился с кодом ${code}. ${tail}`;
-        } else if (signal) {
-          this.lastError = `llama-server остановлен (${signal}). ${tail}`;
-        }
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const port = await findFreePort(8080 + attempt * 17);
+      const args = [
+        "-m",
+        model.path,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        String(port),
+        "-c",
+        String(params.context),
+        "-ngl",
+        String(params.gpuLayers),
+        "--threads-http",
+        "4",
+        "--alias",
+        model.name,
+        "--jinja",
+        "--no-webui",
+      ];
+      if (params.flashAttn) {
+        args.push("-fa");
       }
-    });
+      if (model.mmprojPath) {
+        args.push("--mmproj", model.mmprojPath);
+      }
 
-    try {
-      await waitForServer(port);
-    } catch (err) {
-      const log = this.serverLog;
-      await this.stopServer();
-      const oom =
-        /out of memory|cuda.?error|failed to allocate|ggml_cuda|VRAM|insufficient|vk::|vulkan/i.test(
-          log,
-        );
-      const base =
-        (err instanceof Error ? err.message : String(err)) +
-        (log ? `\n${log.slice(-800)}` : "");
-      this.lastError = oom
-        ? `Нехватка VRAM/памяти при загрузке модели. Выберите профиль «Мало VRAM» или «Только CPU».\n${base}`
-        : base;
-      throw new Error(this.lastError);
+      // CRITICAL on Windows: default piped stdout fills (~64KB) and freezes llama-server
+      // if nobody reads it — HTTP then looks like "fetch failed" while the process is "alive".
+      const child = spawn(this.installed.serverPath, args, {
+        cwd,
+        windowsHide: true,
+        env: { ...process.env },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      this.process = child;
+      this.port = port;
+      this.loadedModelId = model.id;
+      this.loadedModelName = model.name;
+      this.loadedModelPath = model.path;
+      this.loadedContext = params.context;
+      this.loadedGpuLayers = params.gpuLayers;
+      this.lastError = null;
+      this.serverLog = "";
+
+      const onChunk = (buf: Buffer) => this.appendServerLog(buf.toString());
+      child.stdout?.on("data", onChunk);
+      child.stderr?.on("data", onChunk);
+      child.on("error", (err) => {
+        this.appendServerLog(`\n[spawn error] ${err.message}\n`);
+        this.lastError = `Не удалось запустить llama-server: ${err.message}`;
+      });
+      child.on("exit", (code, signal) => {
+        if (this.process === child) {
+          this.process = null;
+          this.port = null;
+          this.clearLoadedModel();
+          const tail = this.getServerLogTail(500);
+          if (code && code !== 0) {
+            this.lastError = `llama-server завершился с кодом ${code}. ${tail}`;
+          } else if (signal) {
+            this.lastError = `llama-server остановлен (${signal}). ${tail}`;
+          }
+        }
+      });
+
+      try {
+        await waitForServer(port, 120_000, child, () => this.getServerLogTail(600));
+        return;
+      } catch (err) {
+        const log = this.serverLog;
+        await this.stopServer();
+        const msg = err instanceof Error ? err.message : String(err);
+        const eaddr = /EADDRINUSE|address already in use|bind/i.test(msg + log);
+        if (eaddr && attempt < 2) {
+          await new Promise((r) => setTimeout(r, 400));
+          continue;
+        }
+        const oom =
+          /out of memory|cuda.?error|failed to allocate|ggml_cuda|VRAM|insufficient|vk::|vulkan/i.test(
+            log,
+          );
+        const base = msg + (log ? `\n${log.slice(-800)}` : "");
+        this.lastError = oom
+          ? `Нехватка VRAM/памяти при загрузке модели. Выберите профиль «Мало VRAM» или «Только CPU».\n${base}`
+          : base;
+        lastSpawnError = new Error(this.lastError);
+        break;
+      }
     }
+    throw lastSpawnError || new Error("Не удалось запустить llama-server");
   }
 }
 

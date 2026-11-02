@@ -140,7 +140,8 @@ export function ProcessTimeline(props: {
                 <span className="plan-status">{statusRu(p.status)}</span>
                 <span>
                   <span className="muted mono" style={{ marginRight: 6 }}>
-                    {p.id}.
+                    {p.id}
+                    {p.kind ? `(${p.kind})` : ""}.
                   </span>
                   {p.title}
                 </span>
