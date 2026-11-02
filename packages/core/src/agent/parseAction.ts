@@ -88,13 +88,17 @@ export function normalizeToolsBatch(
   const out: ParsedToolCall[] = [];
   for (const t of tools) {
     if (!t?.name) continue;
-    if (!BATCHABLE_TOOL_NAMES.has(t.name)) {
+    const name = canonicalizeToolName(t.name);
+    if (!BATCHABLE_TOOL_NAMES.has(name)) {
       return {
         ok: false,
-        error: `tools[] только read-only: ${[...BATCHABLE_TOOL_NAMES].join(", ")} (не ${t.name})`,
+        error: `tools[] только read-only: ${[...BATCHABLE_TOOL_NAMES].join(", ")} (не ${name})`,
       };
     }
-    out.push({ name: t.name, args: t.args && typeof t.args === "object" ? t.args : {} });
+    out.push({
+      name,
+      args: t.args && typeof t.args === "object" ? t.args : {},
+    });
   }
   if (!out.length) return { ok: false, error: "tools[] без валидных элементов" };
   return { ok: true, tools: out };
@@ -210,6 +214,24 @@ function requiredFromSchema(schema: unknown): string[] {
  * Unknown non-MCP names are rejected (typos).
  * Optional mcpSchemas: name → inputSchema for required-key checks.
  */
+/** Map common model typos / aliases onto builtin tool names. */
+export function canonicalizeToolName(toolName: string): string {
+  const n = toolName.trim();
+  const aliases: Record<string, string> = {
+    list_files: "list_dir",
+    list_directory: "list_dir",
+    listdir: "list_dir",
+    read: "read_file",
+    write: "write_file",
+    patch: "apply_patch",
+    shell: "run_terminal",
+    terminal: "run_terminal",
+    bash: "run_terminal",
+    cmd: "run_terminal",
+  };
+  return aliases[n] || n;
+}
+
 export function validateToolArgs(
   toolName: string,
   args: Record<string, unknown> | undefined | null,
@@ -217,6 +239,7 @@ export function validateToolArgs(
   mcpSchemas?: Record<string, unknown>,
 ): ToolArgValidation {
   const safe = args && typeof args === "object" && !Array.isArray(args) ? { ...args } : {};
+  toolName = canonicalizeToolName(toolName);
   const isMcp = toolName.startsWith("mcp_");
   const knownExtra = extraToolNames.includes(toolName);
   if (!BUILTIN_NAMES.has(toolName) && !isMcp && !knownExtra) {

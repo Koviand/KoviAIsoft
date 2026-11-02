@@ -12,6 +12,8 @@ export const AGENT_TRUNCATION_HARD_STOP = AGENT_TRUNCATION_MAX * 2;
 export const AGENT_IDENTICAL_TOOL_MAX = 2;
 /** Blocked early final / empty turns before hard-stop. */
 export const AGENT_FINAL_BLOCKED_HARD_STOP = 4;
+/** Finish-window tool blocks before no_progress stop. */
+export const AGENT_FINISH_BLOCKED_HARD_STOP = 3;
 /** Nudge after this many scout tools; hard-stop at HARD_STOP. */
 export const AGENT_NON_ADVANCING_MAX = 4;
 export const AGENT_NON_ADVANCING_HARD_STOP = AGENT_NON_ADVANCING_MAX * 3;

@@ -302,7 +302,20 @@ export function looksLikeUsableAgentJson(text: string): boolean {
   try {
     const obj = JSON.parse(t.slice(start, end + 1)) as Record<string, unknown>;
     if (!obj || typeof obj !== "object") return false;
-    if (obj.tool && typeof obj.tool === "object") return true;
+    if (obj.tool && typeof obj.tool === "object") {
+      const tool = obj.tool as { name?: unknown; args?: unknown };
+      // Truncated native args masked as {_raw} are not usable.
+      if (
+        tool.args &&
+        typeof tool.args === "object" &&
+        !Array.isArray(tool.args) &&
+        Object.keys(tool.args as object).length === 1 &&
+        "_raw" in (tool.args as object)
+      ) {
+        return false;
+      }
+      return Boolean(tool.name);
+    }
     if (Array.isArray(obj.tools) && obj.tools.length > 0) return true;
     if (typeof obj.final === "string" && obj.final.trim()) return true;
     if (Array.isArray(obj.plan) && obj.plan.length > 0) return true;

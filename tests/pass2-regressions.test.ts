@@ -71,6 +71,30 @@ describe("Pass-2 regressions", () => {
     expect(JSON.parse(ok).final).toBeNull();
   });
 
+  it("looksLikeUsableAgentJson rejects {_raw} truncated tool args", async () => {
+    const { looksLikeUsableAgentJson } = await import(
+      "../packages/core/src/agent/actionSchema"
+    );
+    expect(
+      looksLikeUsableAgentJson(
+        JSON.stringify({
+          thought: "x",
+          tool: { name: "write_file", args: { _raw: '{"path":' } },
+          final: null,
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      looksLikeUsableAgentJson(
+        JSON.stringify({
+          thought: "x",
+          tool: { name: "list_dir", args: { path: "." } },
+          final: null,
+        }),
+      ),
+    ).toBe(true);
+  });
+
   it("IPv4-mapped loopback is private", async () => {
     // Import via assertSafeNavigateUrl side — isPrivateIp not exported; re-test via URL.
     const { assertSafeNavigateUrl } = await import("../packages/core/src/tools/browser");

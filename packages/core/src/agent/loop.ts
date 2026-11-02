@@ -17,7 +17,7 @@ import {
   isNetworkTool,
   NETWORK_TOOL_NAMES,
 } from "../tools/internetAccess.js";
-import { cancelActiveTerminals } from "../tools/terminal.js";
+import { cancelActiveTerminals, isNonZeroShellExit } from "../tools/terminal.js";
 import { resolveAgentPath } from "../tools/sandbox.js";
 import { buildToolConfirmation, evaluateToolConfirmNeed } from "./confirmGate.js";
 import { execAgentTool } from "./toolExec.js";
@@ -63,6 +63,7 @@ import {
 import {
   parseAgentAction,
   PLAN_ADVANCING_TOOLS,
+  canonicalizeToolName,
   validateToolArgs,
 } from "./parseAction.js";
 import { toolsPromptBlock } from "./toolsCatalog.js";
@@ -79,6 +80,7 @@ import {
   AGENT_TRUNCATION_MAX,
   AGENT_TRUNCATION_HARD_STOP,
   AGENT_FINAL_BLOCKED_HARD_STOP,
+  AGENT_FINISH_BLOCKED_HARD_STOP,
   agentHasPendingWork,
   clampAgentMaxSteps,
   inFinishWindow,
@@ -375,14 +377,22 @@ export class AgentLoop {
     params: GenerationParams,
     systemPrompt: string,
     attachments?: ChatAttachment[],
+    signal?: AbortSignal,
   ): Promise<void> {
     if (this.running) throw new Error("Агент уже выполняется");
     this.running = true;
-    this.cancelled = false;
+    // Honour Stop that landed during prep (assertLlmReady) before this entry.
+    this.cancelled = Boolean(signal?.aborted);
     this.checkpointRunId = `${sessionId.slice(0, 8)}-${Date.now().toString(36)}`;
     projectContextCache.clear();
+    const onAbort = () => this.cancel();
+    signal?.addEventListener("abort", onAbort);
 
     try {
+      if (this.cancelled) {
+        this.emit(sessionId, { type: "cancelled" });
+        return;
+      }
       this.store.addMessage(sessionId, {
         role: "user",
         content: userContent,
@@ -467,6 +477,8 @@ export class AgentLoop {
                   lastError: null,
                   lastTool: null,
                   lastResult: null,
+                  writtenPaths: [],
+                  hadSubstantialWrite: false,
                 }
               : {}),
           }
@@ -530,6 +542,11 @@ export class AgentLoop {
       }
       let planAttempts = 0;
       let toolsUsed = 0;
+      /** Successful tool outcomes only — reject/error must not unlock mustWork/final. */
+      let successfulTools = 0;
+      /** Shell/browser attempts (incl. nonzero exit) — gates soft-skip of run/verify. */
+      let verifyAttempts = 0;
+      let finishBlockedStreak = 0;
       // Sticky writtenPaths survive notes ring eviction; notes are a fallback.
       const stickyWrites = workingMemory.writtenPaths?.filter(Boolean) || [];
       const writeNotes = workingMemory.notes.filter((n) => /^wrote\s+\S/.test(n));
@@ -540,9 +557,8 @@ export class AgentLoop {
           .filter(Boolean),
       ]);
       let filesWritten = writePaths.size;
-      let substantialWrite =
-        Boolean(workingMemory.hadSubstantialWrite) ||
-        (filesWritten > 0 && writeNotes.some((n) => !/stub/i.test(n)));
+      // Notes are always `wrote path` without "stub" — do not infer substantial from them.
+      let substantialWrite = Boolean(workingMemory.hadSubstantialWrite);
       let stubNudgeCount = 0;
       let lastRetrieveAt = 0;
       const wantsFiles = detectCodingTask(effectiveGoal || userContent);
@@ -1134,11 +1150,16 @@ export class AgentLoop {
         // ——— Batch read-only tools (parallel) ———
         if (Array.isArray(parsed.tools) && parsed.tools.length && !parsed.tool?.name) {
           if (finishOnly) {
+            finishBlockedStreak += 1;
             this.emit(sessionId, {
               type: "step_done",
               stepId,
               detail: "finish window — tools[] blocked",
             });
+            if (finishBlockedStreak >= AGENT_FINISH_BLOCKED_HARD_STOP) {
+              if (!stopReason) stopReason = "no_progress";
+              break;
+            }
             transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
             transcript.push({
               role: "user",
@@ -1168,20 +1189,40 @@ export class AgentLoop {
             continue;
           }
           toolsUsed += batchResult.count;
+          if (!batchResult.allFailed) successfulTools += batchResult.okCount;
           const combined = batchResult.combined.slice(0, TOOL_RESULT_TRANSCRIPT_CHARS * 2);
-          rememberToolSuccess(
-            workingMemory,
-            "tools[]",
-            {},
-            combined.slice(0, 400),
-          );
+          if (batchResult.allFailed) {
+            rememberToolError(
+              workingMemory,
+              "tools[]",
+              combined.slice(0, 400) || "all failed",
+            );
+          } else {
+            rememberToolSuccess(
+              workingMemory,
+              "tools[]",
+              {},
+              combined.slice(0, 400),
+            );
+          }
+          this.store.addMessage(sessionId, {
+            role: "tool",
+            content: combined.slice(0, TOOL_RESULT_TRANSCRIPT_CHARS * 2),
+            toolCallId: stepId,
+            toolName: "tools[]",
+          });
           const curExplore = currentPlanStep(steps);
           const batchNames = (parsed.tools || []).map((t) => t.name).filter(Boolean);
           const allExplore =
             curExplore?.kind === "explore" &&
             batchNames.length > 0 &&
             batchNames.every((n) => isExploreTool(n));
-          if (allExplore && shouldAdvancePlanOnTool(curExplore, batchNames[0]!)) {
+          // Do not advance explore plan when every batch tool failed.
+          if (
+            !batchResult.allFailed &&
+            allExplore &&
+            shouldAdvancePlanOnTool(curExplore, batchNames[0]!)
+          ) {
             steps = markCurrentPlanDone(steps);
             updatePlanMemory(workingMemory, steps);
             nonAdvancingStreak = 0;
@@ -1193,7 +1234,9 @@ export class AgentLoop {
           this.emit(sessionId, {
             type: "step_done",
             stepId,
-            detail: `tools×${batchResult.count} ok`,
+            detail: batchResult.allFailed
+              ? `tools×${batchResult.count} all failed`
+              : `tools×${batchResult.okCount}/${batchResult.count} ok`,
           });
           transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
           transcript.push({
@@ -1236,8 +1279,8 @@ export class AgentLoop {
             (!finishOnly &&
               i < stepBudget - 1 &&
               (stubOnly ||
-                (!wantsFiles && toolsUsed === 0 && steps.length > 0) ||
-                (pendingLeft && !currentIsFinalish && toolsUsed === 0)));
+                (!wantsFiles && successfulTools === 0 && steps.length > 0) ||
+                (pendingLeft && !currentIsFinalish && successfulTools === 0)));
           if (mustWork) {
             if (stubOnly) stubNudgeCount += 1;
             finalBlockedStreak += 1;
@@ -1316,11 +1359,16 @@ export class AgentLoop {
         finalBlockedStreak = 0;
 
         if (finishOnly && parsed.tool.name !== "finish") {
+          finishBlockedStreak += 1;
           this.emit(sessionId, {
             type: "step_done",
             stepId,
             detail: "finish window — tool blocked",
           });
+          if (finishBlockedStreak >= AGENT_FINISH_BLOCKED_HARD_STOP) {
+            if (!stopReason) stopReason = "no_progress";
+            break;
+          }
           transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
           transcript.push({
             role: "user",
@@ -1329,8 +1377,10 @@ export class AgentLoop {
           });
           continue;
         }
+        finishBlockedStreak = 0;
 
-        const toolName = parsed.tool.name;
+        const toolName = canonicalizeToolName(parsed.tool.name);
+        parsed.tool = { ...parsed.tool, name: toolName };
         const coerced = coerceToolArgs(toolName, parsed.tool.args || {});
         const argCheck = validateToolArgs(
           toolName,
@@ -1475,8 +1525,10 @@ export class AgentLoop {
             (!finishOnly &&
               i < stepBudget - 1 &&
               (stubOnlyFinish ||
-                (!wantsFiles && toolsUsed === 0 && steps.length > 0) ||
-                (pendingLeftFinish && !currentIsFinalishFinish && toolsUsed === 0)));
+                (!wantsFiles && successfulTools === 0 && steps.length > 0) ||
+                (pendingLeftFinish &&
+                  !currentIsFinalishFinish &&
+                  successfulTools === 0)));
           if (mustWorkFinish) {
             if (stubOnlyFinish) stubNudgeCount += 1;
             const deny = noFileYetFinish
@@ -1579,6 +1631,9 @@ export class AgentLoop {
         }
         if (confirm === "rejected") {
           const deny = "Пользователь отклонил действие";
+          toolsUsed += 1;
+          rememberToolError(workingMemory, toolName, deny);
+          persistScratchpad();
           this.emit(sessionId, { type: "tool_result", callId, result: deny, isError: true });
           this.emit(sessionId, { type: "step_done", stepId, detail: deny });
           transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
@@ -1597,6 +1652,51 @@ export class AgentLoop {
           });
           const result = await this.execTool(toolName, args, settings);
           toolsUsed += 1;
+          if (
+            toolName === "run_terminal" ||
+            toolName.startsWith("browser_")
+          ) {
+            verifyAttempts += 1;
+          }
+          const shellFailed =
+            isNonZeroShellExit(result) &&
+            (toolName === "run_terminal" || toolName.startsWith("git_"));
+          if (shellFailed) {
+            // Non-zero exit is soft failure: do not advance plan / clear lastError.
+            rememberToolError(
+              workingMemory,
+              toolName,
+              result.slice(0, 400) || "nonzero exit",
+            );
+            updatePlanMemory(workingMemory, steps);
+            persistScratchpad();
+            this.store.addMessage(sessionId, {
+              role: "tool",
+              content: result,
+              toolCallId: callId,
+              toolName,
+            });
+            this.emit(sessionId, {
+              type: "tool_result",
+              callId,
+              result,
+              isError: true,
+            });
+            this.emit(sessionId, {
+              type: "step_done",
+              stepId,
+              detail: `${toolName} exit≠0`,
+            });
+            transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+            transcript.push({
+              role: "user",
+              content:
+                `Результат инструмента ${toolName}:\n${result.slice(0, TOOL_RESULT_TRANSCRIPT_CHARS)}\n\n` +
+                `Учти блок «Диагностика» (если есть): исправь код через write_file/apply_patch и повтори запуск.`,
+            });
+            continue;
+          }
+          successfulTools += 1;
           if (FILE_MUTATION_TOOLS.has(toolName)) {
             filesWritten += 1;
             const targetPath = String(normalizedArgs.path ?? args.path ?? "");
@@ -1648,16 +1748,24 @@ export class AgentLoop {
                     `Текущий пункт плана (${kind}): нужен run_terminal (или browser_*). ` +
                     `Сначала запусти проверку.`;
                 } else if (kindMismatchStreak >= 3) {
-                  steps = skipCurrentPlanStep(
-                    steps,
-                    `soft-skip: ожидали ${kind}, был ${toolName}`,
-                  );
-                  kindMismatchStreak = 0;
-                  this.emit(sessionId, { type: "plan", steps });
-                  this.emit(sessionId, {
-                    type: "thinking",
-                    text: `Пункт ${curStep?.id || "?"} пропущен (нет run_terminal) — продолжаю.`,
-                  });
+                  // Soft-skip only after at least one shell/browser attempt.
+                  if (verifyAttempts > 0) {
+                    steps = skipCurrentPlanStep(
+                      steps,
+                      `soft-skip: ожидали ${kind}, был ${toolName}`,
+                    );
+                    kindMismatchStreak = 0;
+                    this.emit(sessionId, { type: "plan", steps });
+                    this.emit(sessionId, {
+                      type: "thinking",
+                      text: `Пункт ${curStep?.id || "?"} пропущен — продолжаю.`,
+                    });
+                  } else {
+                    kindMismatchHint =
+                      `Нельзя пропустить пункт ${kind} без run_terminal/browser_*. ` +
+                      `Сначала запусти проверку.`;
+                    kindMismatchStreak = 2;
+                  }
                 }
               } else {
                 kindMismatchStreak = 0;
@@ -1694,13 +1802,6 @@ export class AgentLoop {
             followUp += `\n\n${kindMismatchHint}`;
           }
           if (
-            toolName === "run_terminal" &&
-            /exit:\s*(?!0\b)\d+/i.test(result)
-          ) {
-            followUp +=
-              `\n\nУчти блок «Диагностика» (если есть): исправь код через write_file/apply_patch и повтори запуск.`;
-          }
-          if (
             wantsFiles &&
             toolName === "write_file" &&
             String(normalizedArgs.content ?? "").length <
@@ -1727,6 +1828,7 @@ export class AgentLoop {
           }
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
+          toolsUsed += 1;
           rememberToolError(workingMemory, toolName, message);
           // Do NOT mark the plan step failed on a single tool error — the model may retry
           // with a fixed path. Premature "failed" made the checklist skip the real work.
@@ -1770,6 +1872,7 @@ export class AgentLoop {
         message: err instanceof Error ? err.message : String(err),
       });
     } finally {
+      signal?.removeEventListener("abort", onAbort);
       this.running = false;
     }
   }

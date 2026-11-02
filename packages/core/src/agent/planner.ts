@@ -202,8 +202,10 @@ export function resolveAgentPhase(opts: {
   steps: AgentPlanStep[];
   finishOnly: boolean;
 }): AgentPhase {
+  // Plan must freeze before finish window — tiny budgets otherwise skip planning.
+  if (!opts.planFrozen) return "plan";
   if (opts.finishOnly) return "finish_only";
-  if (opts.planFrozen && opts.steps.length > 0) return "execute";
+  if (opts.steps.length > 0) return "execute";
   return "plan";
 }
 

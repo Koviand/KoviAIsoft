@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import type { ChatMessage, ChatSession } from "@kovi/shared";
+import { writeFileAtomicSync } from "../fsAtomic.js";
 
 const nodeRequire = createRequire(__filename);
 
@@ -124,11 +125,8 @@ export function writeDbShape(db: SqlJsDatabase, data: DbShape): void {
 export function persistSqliteBinary(sqlitePath: string, db: SqlJsDatabase, data: DbShape): void {
   writeDbShape(db, data);
   const exported = Buffer.from(db.export());
-  const dir = path.dirname(sqlitePath);
-  fs.mkdirSync(dir, { recursive: true });
-  const tmp = `${sqlitePath}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, exported);
-  fs.renameSync(tmp, sqlitePath);
+  // Use the shared atomic writer (tmp+fsync+replace) — Windows-safe.
+  writeFileAtomicSync(sqlitePath, exported);
 }
 
 export function migrateJsonToSqlite(

@@ -413,12 +413,10 @@ export function ChatPage(props: {
     overrideText?: string,
     opts?: { forceAgent?: boolean },
   ): Promise<void> {
-    const text = (overrideText ?? input).trim();
+    const text =
+      (overrideText ?? input).trim() ||
+      (pendingAttachments.length ? "Обработай вложения." : "");
     if ((!text && !pendingAttachments.length) || props.busy) return;
-    if (!text && pendingAttachments.length) {
-      props.setError("Добавьте текст к вложению");
-      return;
-    }
     const attachments = pendingAttachments;
     setPendingAttachments([]);
     setInput("");
@@ -471,9 +469,7 @@ export function ChatPage(props: {
   }
 
   async function onStop(): Promise<void> {
-    // Invalidate late tokens immediately; stay busy until cancelled/done if possible.
-    generationEpochRef.current += 1;
-    streamSessionRef.current = null;
+    // Clear draft UI immediately; keep streamSession/busy until cancelled/done.
     setStreaming("");
     setThinking("");
     setModelOutput("");
@@ -481,10 +477,22 @@ export function ChatPage(props: {
     try {
       await api.stopGeneration();
     } finally {
-      props.setBusy(false);
-      setGenMode(null);
-      setPlan([]);
-      setToolTrail([]);
+      try {
+        const bar = await api.getStatusBar();
+        if (!bar.busy) {
+          generationEpochRef.current += 1;
+          streamSessionRef.current = null;
+          props.setBusy(false);
+          setGenMode(null);
+          setPlan([]);
+          setToolTrail([]);
+        }
+        // If still busy, terminal cancelled/done (streamSession ownership) clears busy.
+      } catch {
+        generationEpochRef.current += 1;
+        streamSessionRef.current = null;
+        props.setBusy(false);
+      }
       if (props.activeSessionId) {
         props.setMessages(await api.getMessages(props.activeSessionId));
       }
@@ -493,13 +501,13 @@ export function ChatPage(props: {
 
   async function onDeleteSession(id: string): Promise<void> {
     try {
-      if (props.busy && (streamSessionRef.current === id || props.activeSessionId === id)) {
+      if (streamSessionRef.current === id || props.activeSessionId === id) {
         generationEpochRef.current += 1;
         streamSessionRef.current = null;
-        await api.stopGeneration();
-        props.setBusy(false);
       }
+      // Backend stopGeneration if this session is mid-flight; do not force busy=false early.
       await api.deleteSession(id);
+      props.setBusy(false);
       const all = await api.listSessions();
       props.setSessions(all);
       if (props.activeSessionId === id) {
@@ -1149,7 +1157,9 @@ export function ChatPage(props: {
               <button
                 className="btn primary"
                 type="button"
-                disabled={props.busy || !input.trim()}
+                disabled={
+                  props.busy || (!input.trim() && pendingAttachments.length === 0)
+                }
                 onClick={() => void onSend()}
               >
                 Отправить

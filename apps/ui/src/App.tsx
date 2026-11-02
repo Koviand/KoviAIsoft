@@ -83,17 +83,69 @@ export function App() {
             .catch((e) => state.setError(e instanceof Error ? e.message : String(e)));
         }}
         onStop={() => {
-          // ChatPage also listens; Topbar Stop must not leave composer writable mid-flight alone.
-          void api
-            .stopGeneration()
-            .finally(() => {
-              state.setGenerating(false);
-              if (state.activeSessionId) {
-                void api.getMessages(state.activeSessionId).then(state.setMessages);
-              }
-            });
+          // Do not force busy=false while agent/chat still unwinds — sync from statusBar.
+          void api.stopGeneration().finally(() => {
+            void api
+              .getStatusBar()
+              .then((bar) => state.setGenerating(Boolean(bar.busy)))
+              .catch(() => undefined);
+            void state.refresh();
+            if (state.activeSessionId) {
+              void api.getMessages(state.activeSessionId).then(state.setMessages);
+            }
+          });
         }}
       />
+      {/* Confirm dialog outside aria-hidden main so screen readers can focus it. */}
+      {state.pendingConfirm && (
+        <div
+          className="confirm-banner"
+          role="alertdialog"
+          aria-modal="true"
+          aria-label="Подтверждение действия"
+        >
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <strong>
+              Ждёт подтверждения ({riskRu(state.pendingConfirm.risk)}) — агент на паузе
+            </strong>
+            <div className="mono" style={{ marginTop: 6 }}>
+              {state.pendingConfirm.summary}
+            </div>
+            {state.pendingConfirm.diff ? (
+              <pre className="diff-preview">{state.pendingConfirm.diff}</pre>
+            ) : null}
+          </div>
+          <div className="row" style={{ marginTop: 10, flexWrap: "wrap" }}>
+            <button
+              className="btn primary"
+              type="button"
+              disabled={state.confirmBusy}
+              onClick={() => void state.resolvePendingConfirm(true)}
+            >
+              Разрешить
+            </button>
+            {state.pendingConfirm.canRemember !== false ? (
+              <button
+                className="btn"
+                type="button"
+                disabled={state.confirmBusy}
+                onClick={() => void state.resolvePendingConfirm(true, true)}
+              >
+                Разрешить до конца диалога
+              </button>
+            ) : null}
+            <button
+              ref={rejectBtnRef}
+              className="btn danger"
+              type="button"
+              disabled={state.confirmBusy}
+              onClick={() => void state.resolvePendingConfirm(false)}
+            >
+              Отклонить
+            </button>
+          </div>
+        </div>
+      )}
       <main className="main" aria-hidden={Boolean(state.pendingConfirm)}>
         {!isElectronBridge && (
           <div className="confirm-banner error-banner" role="status">
@@ -150,55 +202,6 @@ export function App() {
             onReject={(item) => void state.resolveChangeItem(item, false)}
             onRestore={(item) => void state.restoreChangeItem(item)}
           />
-        )}
-        {state.pendingConfirm && (
-          <div
-            className="confirm-banner"
-            role="alertdialog"
-            aria-modal="true"
-            aria-label="Подтверждение действия"
-          >
-            <div style={{ minWidth: 0, flex: 1 }}>
-              <strong>
-                Ждёт подтверждения ({riskRu(state.pendingConfirm.risk)}) — агент на паузе
-              </strong>
-              <div className="mono" style={{ marginTop: 6 }}>
-                {state.pendingConfirm.summary}
-              </div>
-              {state.pendingConfirm.diff ? (
-                <pre className="diff-preview">{state.pendingConfirm.diff}</pre>
-              ) : null}
-            </div>
-            <div className="row" style={{ marginTop: 10, flexWrap: "wrap" }}>
-              <button
-                className="btn primary"
-                type="button"
-                disabled={state.confirmBusy}
-                onClick={() => void state.resolvePendingConfirm(true)}
-              >
-                Разрешить
-              </button>
-              {state.pendingConfirm.canRemember !== false ? (
-                <button
-                  className="btn"
-                  type="button"
-                  disabled={state.confirmBusy}
-                  onClick={() => void state.resolvePendingConfirm(true, true)}
-                >
-                  Разрешить до конца диалога
-                </button>
-              ) : null}
-              <button
-                ref={rejectBtnRef}
-                className="btn danger"
-                type="button"
-                disabled={state.confirmBusy}
-                onClick={() => void state.resolvePendingConfirm(false)}
-              >
-                Отклонить
-              </button>
-            </div>
-          </div>
         )}
         {/* Keep Chat mounted (hidden) so ProcessTimeline survives Models/Runtime navigation. */}
         <div

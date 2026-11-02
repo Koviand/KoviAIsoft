@@ -280,7 +280,7 @@ export function toolsPromptBlock(
     ...extras.map((t) => `- ${t.name}: ${t.description || "MCP tool"}`),
   ];
   const rules = opts?.compact
-    ? `ТОЛЬКО один JSON {"thought","plan?","tool"|null,"tools"?,"final"|null}. Сначала plan (3–7), потом tool или tools[]≤3 (list/read/search/git_status|diff|log). Код — write_file. Windows/cmd.`
+    ? `ТОЛЬКО один JSON {"thought","plan?","tool"|null,"tools"?,"final"|null}. Сначала plan (3–7), потом tool или tools[]≤3 (list/read/search/git_status|diff). Код — write_file. Windows/cmd.`
     : `Формат ответа на каждом шаге — строго ОДИН JSON-объект без текста до/после (сервер может требовать schema):
 {
   "thought": "краткие рассуждения",
@@ -289,7 +289,7 @@ export function toolsPromptBlock(
   "tools": [{"name":"read_file","args":{...}}, ...] | null,
   "final": "текст пользователю если закончили" | null
 }
-Для разведки можно tools[] (до 3): list_dir, read_file, search, git_status, git_diff, git_log — параллельно.
+Для разведки можно tools[] (до 3): list_dir, read_file, search, git_status, git_diff (и git_log вне compact) — параллельно.
 Мутации (write_file/apply_patch/shell/browser/git_commit/git_push/git_pull) — только одиночный tool.
 Предпочитай JSON; Hermes tool_call допускается как запасной разбор.
 

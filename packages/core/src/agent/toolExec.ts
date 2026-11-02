@@ -22,6 +22,7 @@ import {
   isInternetEnabled,
   isNetworkTool,
 } from "../tools/internetAccess.js";
+import { assertAllowedPath, resolveAgentPath } from "../tools/sandbox.js";
 import { runTerminal } from "../tools/terminal.js";
 import { webSearch } from "../tools/websearch.js";
 import type { McpManager } from "../mcp/manager.js";
@@ -44,15 +45,18 @@ export async function execAgentTool(opts: {
 }): Promise<string> {
   const { name, args, settings, normalize, browser, mcp, checkpointRunId } = opts;
   if (isNetworkTool(name) && !isInternetEnabled(settings)) {
-    return internetDisabledMessage(name);
+    throw new Error(internetDisabledMessage(name));
   }
-  // MCP tools that clearly hit the network when internetAccessMode=off.
-  if (
-    name.startsWith("mcp_") &&
-    !isInternetEnabled(settings) &&
-    /fetch|http|web|browse|url|download/i.test(name)
-  ) {
-    return internetDisabledMessage(name);
+  // MCP: block network-ish tools when internet is off (name + URL-like args).
+  if (name.startsWith("mcp_") && !isInternetEnabled(settings)) {
+    const argBlob = JSON.stringify(args || {}).toLowerCase();
+    const networkish =
+      /fetch|https?|web|browse|url|download|request|api|search|scrap|crawl|remote|webhook|rest|graphql|proxy|smtp|ftp|ssh|socket/i.test(
+        name,
+      ) || /https?:\/\/|www\./i.test(argBlob);
+    if (networkish) {
+      throw new Error(internetDisabledMessage(name));
+    }
   }
   const a = normalize(name, args, settings.projectRoot);
   switch (name) {
@@ -113,23 +117,40 @@ export async function execAgentTool(opts: {
         settings,
       );
     case "web_search": {
-      const q = String(args.query ?? "").trim();
+      const q = String(a.query ?? args.query ?? "").trim();
       if (!q) return "web_search: укажите args.query";
       return webSearch(q, settings);
     }
     case "browser_navigate":
-      return browser.navigate(String(args.url));
+      return browser.navigate(String(a.url ?? args.url ?? ""));
     case "browser_snapshot":
       return browser.snapshot();
     case "browser_click":
-      return browser.click(String(args.selector));
+      return browser.click(String(a.selector ?? args.selector ?? ""));
     case "browser_type":
-      return browser.type(String(args.selector), String(args.text ?? ""));
+      return browser.type(
+        String(a.selector ?? args.selector ?? ""),
+        String(a.text ?? args.text ?? ""),
+      );
     case "finish":
-      return String(args.summary ?? "");
+      return String(a.summary ?? args.summary ?? "");
     default:
       if (name.startsWith("mcp_")) {
-        return mcp.callTool(name, args);
+        // Use normalized args; sandbox any path-like keys against project roots.
+        const sandboxed: Record<string, unknown> = { ...a };
+        for (const [k, v] of Object.entries(sandboxed)) {
+          if (typeof v !== "string" || !v.trim()) continue;
+          if (!/path|file|dir|cwd|folder|root/i.test(k)) continue;
+          const resolved = resolveAgentPath(v, settings.projectRoot);
+          assertAllowedPath(
+            resolved,
+            settings.fileAccessMode,
+            settings.projectRoot,
+            settings.modelRoots,
+          );
+          sandboxed[k] = resolved;
+        }
+        return mcp.callTool(name, sandboxed);
       }
       throw new Error(`Неизвестный инструмент: ${name}`);
   }

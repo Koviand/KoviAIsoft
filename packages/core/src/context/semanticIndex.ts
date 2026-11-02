@@ -135,9 +135,17 @@ function writeMeta(dir: string, meta: IndexMeta): void {
   fs.writeFileSync(metaPath(dir), JSON.stringify(meta, null, 2), "utf8");
 }
 
+function isInsideRoot(absPath: string, rootResolved: string): boolean {
+  const abs = path.resolve(absPath);
+  const root = path.resolve(rootResolved);
+  const rel = path.relative(root, abs);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
 function listProjectFiles(projectRoot: string): Array<{ abs: string; rel: string; mtimeMs: number; size: number }> {
   const out: Array<{ abs: string; rel: string; mtimeMs: number; size: number }> = [];
-  const stack = [projectRoot];
+  const rootResolved = path.resolve(projectRoot);
+  const stack = [rootResolved];
   while (stack.length) {
     const dir = stack.pop()!;
     let entries: fs.Dirent[];
@@ -149,18 +157,31 @@ function listProjectFiles(projectRoot: string): Array<{ abs: string; rel: string
     for (const e of entries) {
       if (e.name === ".kovi") continue;
       const full = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        if (!shouldIgnoreDirName(e.name)) stack.push(full);
+      // Never follow symlinks/junctions — they can escape the workspace.
+      let lst: fs.Stats;
+      try {
+        lst = fs.lstatSync(full);
+      } catch {
         continue;
       }
-      if (!e.isFile()) continue;
+      if (lst.isSymbolicLink()) continue;
+      if (lst.isDirectory()) {
+        if (!shouldIgnoreDirName(e.name) && isInsideRoot(full, rootResolved)) {
+          stack.push(full);
+        }
+        continue;
+      }
+      if (!lst.isFile()) continue;
       if (!isTextSourcePath(full) || isProbablyBinaryPath(full)) continue;
       try {
-        const st = fs.statSync(full);
+        // Realpath guards against odd reparse points not reported as symlinks.
+        const real = fs.realpathSync(full);
+        if (!isInsideRoot(real, rootResolved)) continue;
+        const st = fs.statSync(real);
         if (!shouldIndexFileBytes(st.size)) continue;
         out.push({
-          abs: full,
-          rel: path.relative(projectRoot, full).replace(/\\/g, "/"),
+          abs: real,
+          rel: path.relative(rootResolved, real).replace(/\\/g, "/"),
           mtimeMs: st.mtimeMs,
           size: st.size,
         });
@@ -370,8 +391,8 @@ export async function ensureProjectIndex(
     return getCodebaseIndexStatus(root);
   }
 
-  // Single-flight: wait and re-join if another waiter already scheduled a follow-up.
-  for (let attempt = 0; attempt < 3; attempt++) {
+  // Single-flight: claim the slot synchronously before any await in the job body.
+  for (let attempt = 0; attempt < 4; attempt++) {
     const existing = indexJobs.get(key);
     if (existing) {
       await existing;
@@ -384,27 +405,27 @@ export async function ensureProjectIndex(
         meta.modelId !== spec.metaModelId ||
         meta.dim !== spec.dim;
       if (!needsAgain) return getCodebaseIndexStatus(root);
-      // Another waiter may have started a job while we checked — loop.
       if (indexJobs.has(key)) continue;
     }
-    break;
-  }
-  if (indexJobs.has(key)) {
-    await indexJobs.get(key);
-    return getCodebaseIndexStatus(root);
-  }
 
-  const job = (async () => {
-    const prev = statusByRoot.get(key) || emptyStatus(root);
-    setRootStatus(key, {
-      ...prev,
-      indexing: true,
-      root,
-      error: null,
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
     });
-    opts?.onProgress?.(`Индексация ${root}…`);
-    const dir = indexDirForProject(root);
+    // Reserve before starting work so a concurrent caller always joins.
+    if (indexJobs.has(key)) continue;
+    indexJobs.set(key, gate);
+
     try {
+      const prev = statusByRoot.get(key) || emptyStatus(root);
+      setRootStatus(key, {
+        ...prev,
+        indexing: true,
+        root,
+        error: null,
+      });
+      opts?.onProgress?.(`Индексация ${root}…`);
+      const dir = indexDirForProject(root);
       const meta = readMeta(dir);
       const spec = getActiveEmbeddingSpec();
       if (
@@ -443,12 +464,12 @@ export async function ensureProjectIndex(
         `Ошибка индекса: ${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
-      indexJobs.delete(key);
+      if (indexJobs.get(key) === gate) indexJobs.delete(key);
+      release();
     }
-  })();
-
-  indexJobs.set(key, job);
-  await job;
+    return getCodebaseIndexStatus(root);
+  }
+  // Exhausted join attempts — return latest status.
   return getCodebaseIndexStatus(root);
 }
 

@@ -406,6 +406,22 @@ function registerIpc(svc: AppService): void {
         setOverride(null);
         return;
       }
+      // Empty field from UI means "unchanged" (draft scrubbed a placeholder) — keep secret.
+      // Explicit wipe: send "__clear__".
+      if (value === "") {
+        const existing = loadSecret(appData, id);
+        if (existing) {
+          assign("__secure__");
+          setOverride(existing);
+          return;
+        }
+      }
+      if (value === "__clear__") {
+        saveSecret(appData, id, "");
+        assign("");
+        setOverride(null);
+        return;
+      }
       if (saveSecret(appData, id, value)) {
         assign(value ? "__secure__" : "");
         if (value === "__secure__") {
@@ -486,24 +502,33 @@ function registerIpc(svc: AppService): void {
     const r = assertSendRequest(req);
     return svc.sendChat(r.sessionId, r.content, r.params as never, r.attachments);
   });
-  // Always fire-and-forget: completion is signaled via agentEvent (started/done/error).
+  // Start generation; surface sync rejects (AGENT_BUSY / validation) to the renderer.
+  // Long agent runs continue in background — completion via agentEvent.
   ipcMain.handle(IPC.sendMessage, async (_e, req) => {
     const r = assertSendRequest(req);
-    void svc
-      .sendMessage(r.sessionId, r.content, {
-        useAgent: r.useAgent,
-        params: r.params as never,
-        attachments: r.attachments,
-      })
-      .catch((err) => {
-        const message = err instanceof Error ? err.message : String(err);
-        const code = (err as Error & { code?: string })?.code;
-        if (isCancelErrorMessage(message) || code === "AGENT_BUSY") return;
-        broadcastMain(IPC.agentEvent, {
-          sessionId: r.sessionId,
-          event: { type: "error", message },
-        });
+    const p = svc.sendMessage(r.sessionId, r.content, {
+      useAgent: r.useAgent,
+      params: r.params as never,
+      attachments: r.attachments,
+    });
+    void p.catch((err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      const code = (err as Error & { code?: string })?.code;
+      if (isCancelErrorMessage(message) || code === "AGENT_BUSY") return;
+      broadcastMain(IPC.agentEvent, {
+        sessionId: r.sessionId,
+        event: { type: "error", message },
       });
+    });
+    try {
+      await Promise.race([
+        p,
+        new Promise<"started">((resolve) => queueMicrotask(() => resolve("started"))),
+      ]);
+    } catch (err) {
+      // Propagate AGENT_BUSY / empty message so UI can clear optimistic busy.
+      throw err;
+    }
   });
   ipcMain.handle(IPC.stopGeneration, () => svc.stopGeneration());
   ipcMain.handle(IPC.startAgent, async (_e, req) => {

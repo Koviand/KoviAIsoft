@@ -1,5 +1,11 @@
 import { createRequire } from "node:module";
 import type { McpHealthResult, McpServerConfig } from "@kovi/shared";
+import { assertSafeNavigateUrl } from "../tools/browser.js";
+
+/** SSE MCP URLs must be http(s) and pass the same SSRF guard as the browser. */
+async function assertSafeMcpUrl(raw: string): Promise<URL> {
+  return assertSafeNavigateUrl(raw);
+}
 
 export interface McpToolInfo {
   serverId: string;
@@ -116,7 +122,8 @@ export class McpManager {
             );
           } else {
             if (!cfg.url) return;
-            const transport = new sdk.SSEClientTransport(new URL(cfg.url));
+            const safeUrl = await assertSafeMcpUrl(cfg.url);
+            const transport = new sdk.SSEClientTransport(safeUrl);
             await withTimeout(
               client.connect(transport),
               MCP_CONNECT_TIMEOUT_MS,
@@ -239,7 +246,8 @@ export class McpManager {
           );
         } else {
           if (!cfg.url) throw new Error("Не задан URL SSE");
-          const transport = new sdk.SSEClientTransport(new URL(cfg.url));
+          const safeUrl = await assertSafeMcpUrl(cfg.url);
+          const transport = new sdk.SSEClientTransport(safeUrl);
           await withTimeout(
             client.connect(transport),
             MCP_CONNECT_TIMEOUT_MS,

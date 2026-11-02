@@ -267,6 +267,23 @@ export class SettingsStore {
         parsed.internetAccessMode === "allow"
           ? parsed.internetAccessMode
           : defaults.internetAccessMode,
+      fileAccessMode:
+        parsed.fileAccessMode === "project" || parsed.fileAccessMode === "disk"
+          ? parsed.fileAccessMode
+          : defaults.fileAccessMode,
+      projectRoot:
+        typeof parsed.projectRoot === "string" && parsed.projectRoot.trim()
+          ? parsed.projectRoot.trim()
+          : parsed.projectRoot === null
+            ? null
+            : defaults.projectRoot,
+      runtimeBackendPreference:
+        parsed.runtimeBackendPreference === "auto" ||
+        parsed.runtimeBackendPreference === "cpu" ||
+        parsed.runtimeBackendPreference === "vulkan" ||
+        parsed.runtimeBackendPreference === "cuda"
+          ? parsed.runtimeBackendPreference
+          : defaults.runtimeBackendPreference,
     };
   }
 

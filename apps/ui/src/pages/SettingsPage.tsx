@@ -87,7 +87,9 @@ export function SettingsPage(props: {
       if (timer.current) clearTimeout(timer.current);
       // Flush pending local edits so navigating away does not drop them.
       if (dirty.current && draftRef.current) {
-        void api.saveSettings(draftRef.current).catch(() => undefined);
+        void api.saveSettings(draftRef.current).catch((e) => {
+          console.error("[settings] flush on unmount failed", e);
+        });
       }
     };
   }, []);

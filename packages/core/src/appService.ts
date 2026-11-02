@@ -128,10 +128,16 @@ export class AppService {
   /** Serialize MCP sync so background init cannot race saveSettings. */
   private mcpSyncChain: Promise<void> = Promise.resolve();
   private agentStartLock = false;
+  /** Sync lock so two sendChat calls cannot both pass isGenerationBusy TOCTOU. */
+  private chatStartLock = false;
   /** Abort in-flight startAgent waits (loadModelChain) before agent.run. */
   private agentStartAbort: AbortController | null = null;
   /** Abort weather/web/context prep before chat.send starts its own controller. */
   private chatPrepAbort: AbortController | null = null;
+  /** Session id for in-flight chat prep / send (deleteSession stop scope). */
+  private activeChatSessionId: string | null = null;
+  /** Session id for in-flight agent run. */
+  private activeAgentSessionId: string | null = null;
   private projectWatcher = new ProjectRootWatcher();
 
   onRuntimeProgress?: (p: { progress: number; label: string }) => void;
@@ -554,7 +560,7 @@ export class AppService {
     const roots = this.settings.get().modelRoots;
     const st = this.runtime.getStatus();
     if (st.loadedModelId === modelId) {
-      if (this.chat.isBusy() || this.agent.isRunning()) {
+      if (this.isGenerationBusy()) {
         throw new Error("Сначала остановите генерацию или агента, затем удалите модель");
       }
       await this.unloadModel();
@@ -667,7 +673,7 @@ export class AppService {
   private async reloadLoadedModelAfterProfileChange(): Promise<ProfileReloadStatus> {
     const loadedId = this.runtime.getStatus().loadedModelId;
     if (!loadedId) return { status: "idle" };
-    if (this.chat.isBusy() || this.agent.isRunning()) {
+    if (this.isGenerationBusy()) {
       const detail =
         "Профиль сохранён. Остановите генерацию и перезагрузите модель, чтобы применить ngl/ctx.";
       this.pushErrorLog("loadProfile", detail);
@@ -1054,6 +1060,14 @@ export class AppService {
   }
 
   deleteSession(sessionId: string): void {
+    // Stop generation that still targets this session so tool rows cannot land after wipe.
+    if (
+      this.activeChatSessionId === sessionId ||
+      this.activeAgentSessionId === sessionId ||
+      this.chat.getActiveSessionId() === sessionId
+    ) {
+      this.stopGeneration();
+    }
     this.agent.clearSessionAllow(sessionId);
     this.store.deleteSession(sessionId);
   }
@@ -1110,14 +1124,19 @@ export class AppService {
     params?: Partial<GenerationParams>,
     attachments?: ChatAttachment[],
   ): Promise<ChatMessage> {
-    if (this.isGenerationBusy()) {
+    if (this.chatStartLock || this.isGenerationBusy()) {
       throw new Error("Генерация уже выполняется. Дождитесь ответа или нажмите Стоп.");
     }
+    this.chatStartLock = true;
     const session = this.store.listSessions().find((s) => s.id === sessionId);
-    if (!session) throw new Error("Сессия не найдена");
+    if (!session) {
+      this.chatStartLock = false;
+      throw new Error("Сессия не найдена");
+    }
     this.chatPrepAbort?.abort();
     this.chatPrepAbort = new AbortController();
     const prepSignal = this.chatPrepAbort.signal;
+    this.activeChatSessionId = sessionId;
     this.noteGenerationStart();
     this.emitGeneration(sessionId, { type: "started", mode: "chat" });
     const loadedCtx = this.runtime.getStatus().loadedContext;
@@ -1189,7 +1208,7 @@ export class AppService {
             let injected = "";
             if (wantsWeather && !prepSignal.aborted) {
               try {
-                const brief = await fetchWeatherBrief(content);
+                const brief = await fetchWeatherBrief(content, { signal: prepSignal });
                 if (brief && !prepSignal.aborted) {
                   injected =
                     `## Погода (${dateLabel})\n` +
@@ -1200,7 +1219,7 @@ export class AppService {
               }
             }
             if (!injected && !prepSignal.aborted) {
-              const hits = await webSearch(content, settings);
+              const hits = await webSearch(content, settings, { signal: prepSignal });
               if (!hits || hits === "Ничего не найдено" || hits === "Пустой запрос") {
                 injected =
                   `## Веб-поиск (${dateLabel})\n` +
@@ -1234,6 +1253,7 @@ export class AppService {
         merged,
         system,
         attachments,
+        { linkAbort: prepSignal },
       );
       if (this.chatPrepAbort?.signal === prepSignal) {
         this.chatPrepAbort = null;
@@ -1261,12 +1281,15 @@ export class AppService {
       if (this.chatPrepAbort?.signal === prepSignal) {
         this.chatPrepAbort = null;
       }
+      if (this.activeChatSessionId === sessionId) this.activeChatSessionId = null;
+      this.chatStartLock = false;
     }
   }
 
   /** True while chat prep (weather/web/context), chat stream, or agent is active. */
   isGenerationBusy(): boolean {
     return (
+      this.chatStartLock ||
       Boolean(this.chatPrepAbort) ||
       this.chat.isBusy() ||
       this.agent.isRunning() ||
@@ -1280,19 +1303,31 @@ export class AppService {
    * Fire-and-forget from IPC — resolves without a ChatMessage when agent path is used.
    */
   /** Build text block from attachments (text files inlined, others as path meta). */
-  static formatAttachmentsBlock(attachments: ChatAttachment[]): string {
+  static formatAttachmentsBlock(
+    attachments: ChatAttachment[],
+    attachmentsRoot?: string,
+  ): string {
     if (!attachments.length) return "";
+    const root = attachmentsRoot ? path.resolve(attachmentsRoot) : null;
     const parts: string[] = ["\n\n[Вложения]"];
     let budget = 32_000;
     for (const a of attachments) {
+      const resolved = path.resolve(a.path || "");
+      if (root) {
+        const rel = path.relative(root, resolved);
+        if (!resolved || rel.startsWith("..") || path.isAbsolute(rel)) {
+          parts.push(`- ${a.name} (${a.mime}, ${a.size} B) — путь вне каталога вложений, пропущен`);
+          continue;
+        }
+      }
       const isText =
         /^text\//i.test(a.mime) ||
         /\.(txt|md|json|ts|tsx|js|jsx|py|rs|go|java|c|cpp|h|css|html|yml|yaml|toml|xml|csv|log)$/i.test(
           a.name,
         );
-      if (isText && fs.existsSync(a.path) && budget > 0) {
+      if (isText && fs.existsSync(resolved) && budget > 0) {
         try {
-          const raw = fs.readFileSync(a.path, "utf8");
+          const raw = fs.readFileSync(resolved, "utf8");
           const slice = raw.slice(0, Math.min(budget, 16_000));
           budget -= slice.length;
           parts.push(`--- ${a.name} ---\n${slice}`);
@@ -1304,10 +1339,10 @@ export class AppService {
       if (/^image\//i.test(a.mime)) {
         parts.push(
           `- ${a.name} (${a.mime}, ${a.size} B) — изображение приложено как файл; ` +
-            `текстовая модель его не видит (нужен vision/mmproj). path=${a.path}`,
+            `текстовая модель его не видит (нужен vision/mmproj).`,
         );
       } else {
-        parts.push(`- ${a.name} (${a.mime}, ${a.size} B) path=${a.path}`);
+        parts.push(`- ${a.name} (${a.mime}, ${a.size} B)`);
       }
     }
     return parts.join("\n");
@@ -1333,11 +1368,18 @@ export class AppService {
     if (parsed.emptyAgentPrefix) {
       throw new Error("После @agent укажите задачу (например: @agent list files)");
     }
-    if (!parsed.content) throw new Error("Пустое сообщение");
-    const attBlock = opts?.attachments?.length
-      ? AppService.formatAttachmentsBlock(opts.attachments)
+    const hasAtt = Boolean(opts?.attachments?.length);
+    if (!parsed.content && !hasAtt) throw new Error("Пустое сообщение");
+    const body =
+      parsed.content ||
+      (hasAtt ? "Обработай вложения." : "");
+    const attBlock = hasAtt
+      ? AppService.formatAttachmentsBlock(
+          opts!.attachments!,
+          getAttachmentsDir(this.appData),
+        )
       : "";
-    const contentForModel = parsed.content + attBlock;
+    const contentForModel = body + attBlock;
     if (parsed.useAgent) {
       await this.startAgent(sessionId, contentForModel, opts?.attachments);
       return;
@@ -1351,8 +1393,8 @@ export class AppService {
   }
 
   stopGeneration(): void {
+    // Abort only — owners clear refs in finally so isGenerationBusy stays true while unwinding.
     this.chatPrepAbort?.abort();
-    this.chatPrepAbort = null;
     this.agentStartAbort?.abort();
     this.chat.stop();
     this.agent.cancel();
@@ -1383,6 +1425,7 @@ export class AppService {
     }
     // Sync lock before any await — prevents double-start race.
     this.agentStartLock = true;
+    this.activeAgentSessionId = sessionId;
     const startAbort = new AbortController();
     this.agentStartAbort = startAbort;
     try {
@@ -1392,9 +1435,10 @@ export class AppService {
         this.emitGeneration(sessionId, { type: "cancelled" });
         return;
       }
-      await this.startAgentInner(sessionId, content, attachments);
+      await this.startAgentInner(sessionId, content, attachments, startAbort);
     } finally {
       if (this.agentStartAbort === startAbort) this.agentStartAbort = null;
+      if (this.activeAgentSessionId === sessionId) this.activeAgentSessionId = null;
       this.agentStartLock = false;
     }
   }
@@ -1402,8 +1446,13 @@ export class AppService {
   private async startAgentInner(
     sessionId: string,
     content: string,
-    attachments?: ChatAttachment[],
+    attachments: ChatAttachment[] | undefined,
+    startAbort: AbortController,
   ): Promise<void> {
+    if (startAbort.signal.aborted) {
+      this.emitGeneration(sessionId, { type: "cancelled" });
+      return;
+    }
     if (this.chat.isBusy()) {
       this.chat.stop();
     }
@@ -1431,7 +1480,16 @@ export class AppService {
         "Папка проекта не задана — shell/относительные пути могут не работать. Укажите projectRoot в Настройках.",
       );
     }
+    if (startAbort.signal.aborted) {
+      this.emitGeneration(sessionId, { type: "cancelled" });
+      return;
+    }
     await this.runtime.assertLlmReady();
+    // Stop during assertLlmReady must not reach agent.run (which clears cancelled).
+    if (startAbort.signal.aborted) {
+      this.emitGeneration(sessionId, { type: "cancelled" });
+      return;
+    }
     this.emitGeneration(sessionId, { type: "started", mode: "agent" });
     this.noteGenerationStart();
     this.maybeRenameSession(session, content);
@@ -1449,6 +1507,7 @@ export class AppService {
       agentParams,
       session.systemPrompt,
       attachments,
+      startAbort.signal,
     );
   }
 

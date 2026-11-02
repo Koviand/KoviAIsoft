@@ -301,6 +301,10 @@ export class Store {
     if (!bundle?.session || !Array.isArray(bundle.messages)) {
       throw new Error("Некорректный файл экспорта сессии");
     }
+    const MAX_IMPORT_MESSAGES = 2_000;
+    if (bundle.messages.length > MAX_IMPORT_MESSAGES) {
+      throw new Error(`Слишком много сообщений в импорте (макс. ${MAX_IMPORT_MESSAGES})`);
+    }
     const now = new Date().toISOString();
     const id = uuid();
     const session = normalizeSession({
@@ -311,6 +315,8 @@ export class Store {
         : `[импорт] ${bundle.session.title || "Диалог"}`,
       createdAt: now,
       updatedAt: now,
+      // Do not resume a foreign/hostile scratchpad plan from an import file.
+      agentScratchpad: undefined,
     });
     this.data.sessions.unshift(session);
     const idMap = new Map<string, string>();
@@ -321,10 +327,20 @@ export class Store {
       const newId = (m.id && idMap.get(m.id)) || uuid();
       const parentId =
         m.parentId && idMap.has(m.parentId) ? idMap.get(m.parentId)! : undefined;
+      const content = clampToolContent(m.role, String(m.content ?? ""));
+      // Drop absolute attachment paths from untrusted import bundles.
+      const attachments = Array.isArray(m.attachments)
+        ? m.attachments.map((a) => ({
+            ...a,
+            path: "",
+          }))
+        : undefined;
       return {
         ...m,
         id: newId,
         parentId,
+        content,
+        attachments: attachments?.length ? attachments : undefined,
         createdAt: m.createdAt || now,
       };
     });
@@ -347,10 +363,18 @@ export class Store {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
     }
+    if (this.blockPersist) return;
+    // Snapshot dirty; re-mark if mutated during await so a follow-up persist runs.
     this.dirty = false;
-    await writeFileAtomic(this.jsonPath, JSON.stringify(this.data, null, 2));
-    if (this.db) {
-      persistSqliteBinary(this.sqlitePath, this.db, this.data);
+    try {
+      await writeFileAtomic(this.jsonPath, JSON.stringify(this.data, null, 2));
+      if (this.db) {
+        persistSqliteBinary(this.sqlitePath, this.db, this.data);
+      }
+    } catch (err) {
+      this.dirty = true;
+      throw err;
     }
+    if (this.dirty) this.persist();
   }
 }

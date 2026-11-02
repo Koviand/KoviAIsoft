@@ -52,7 +52,10 @@ export async function assertSafeNavigateUrl(url: string): Promise<URL> {
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new Error(`Разрешены только http/https URL (получено ${parsed.protocol})`);
   }
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const host = parsed.hostname
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.+$/g, "");
   if (BLOCKED_HOSTS.has(host) || host.endsWith(".localhost") || host.endsWith(".local")) {
     throw new Error(`Навигация к локальному/служебному хосту запрещена: ${host}`);
   }
@@ -70,8 +73,11 @@ export async function assertSafeNavigateUrl(url: string): Promise<URL> {
       }
     }
   } catch (err) {
-    if (err instanceof Error && /приватн|запрещен/i.test(err.message)) throw err;
-    // DNS failure — still block obvious names; let navigation fail later otherwise.
+    if (err instanceof Error && /приватн|запрещен|служебн/i.test(err.message)) throw err;
+    // Fail-closed: unresolved host must not bypass SSRF.
+    throw new Error(
+      `DNS для ${host} недоступен — навигация запрещена (${err instanceof Error ? err.message : String(err)})`,
+    );
   }
   return parsed;
 }
@@ -95,25 +101,13 @@ export class BrowserTooling {
       if (!this.ssrfRouteInstalled && this.context) {
         // Abort navigations (incl. redirects) to private/local targets mid-flight.
         await this.context.route("**/*", async (route) => {
-          const req = route.request();
-          // Block navigations and XHR/fetch/WS to private hosts (SSRF).
-          const kind = req.resourceType();
-          if (
-            req.isNavigationRequest() ||
-            kind === "document" ||
-            kind === "xhr" ||
-            kind === "fetch" ||
-            kind === "websocket"
-          ) {
-            try {
-              await assertSafeNavigateUrl(req.url());
-              await route.continue();
-            } catch {
-              await route.abort("blockedbyclient");
-            }
-            return;
+          // Gate ALL resource types — images/scripts/fonts can hit metadata/LAN too.
+          try {
+            await assertSafeNavigateUrl(route.request().url());
+            await route.continue();
+          } catch {
+            await route.abort("blockedbyclient");
           }
-          await route.continue();
         });
         this.ssrfRouteInstalled = true;
       }
@@ -150,6 +144,7 @@ export class BrowserTooling {
 
   async snapshot(): Promise<string> {
     const page = await this.ensurePage();
+    await assertSafeNavigateUrl(page.url());
     const text = await page.evaluate(`document.body?.innerText?.slice(0, 12000) || ""`);
     return `URL: ${page.url()}\nTitle: ${await page.title()}\n\n${text}`;
   }
@@ -157,12 +152,18 @@ export class BrowserTooling {
   async click(selector: string): Promise<string> {
     const page = await this.ensurePage();
     await page.click(selector, { timeout: 15000 });
-    await assertSafeNavigateUrl(page.url()).catch(() => undefined);
+    try {
+      await assertSafeNavigateUrl(page.url());
+    } catch (err) {
+      await this.close().catch(() => undefined);
+      throw err;
+    }
     return `Clicked ${selector}`;
   }
 
   async type(selector: string, text: string): Promise<string> {
     const page = await this.ensurePage();
+    await assertSafeNavigateUrl(page.url());
     await page.fill(selector, text, { timeout: 15000 });
     return `Typed into ${selector}`;
   }

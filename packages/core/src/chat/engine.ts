@@ -70,8 +70,8 @@ export class ChatEngine {
 
   /** Abort in-flight streaming chat or agent JSON completion. */
   stop(): void {
+    // Abort only — keep this.abort so isBusy() stays true until the owner clears it in finally.
     this.abort?.abort();
-    this.abort = null;
   }
 
   isBusy(): boolean {
@@ -88,17 +88,28 @@ export class ChatEngine {
     params: GenerationParams,
     systemPrompt: string,
     attachments?: ChatAttachment[],
+    opts?: { linkAbort?: AbortSignal },
   ): Promise<ChatMessage> {
     // Own AbortController before any await so isBusy() covers assertLlmReady gap.
     this.stop();
     this.abort = new AbortController();
     this.activeSessionId = sessionId;
     const signal = this.abort.signal;
+    // Link prep abort so Stop between prep-check and controller install is honoured.
+    const linkAbort = opts?.linkAbort;
+    const forwardPrepAbort = () => {
+      if (this.abort?.signal === signal) this.abort.abort();
+    };
+    if (linkAbort) {
+      if (linkAbort.aborted) this.abort.abort();
+      else linkAbort.addEventListener("abort", forwardPrepAbort, { once: true });
+    }
 
     let base: string;
     try {
       base = await this.runtime.assertLlmReady();
     } catch (err) {
+      linkAbort?.removeEventListener("abort", forwardPrepAbort);
       if (this.abort?.signal === signal) {
         this.abort = null;
         this.activeSessionId = null;
@@ -106,6 +117,7 @@ export class ChatEngine {
       throw formatLlmFetchError(err, this.runtime.getOpenAiBaseUrl());
     }
     if (signal.aborted) {
+      linkAbort?.removeEventListener("abort", forwardPrepAbort);
       if (this.abort?.signal === signal) {
         this.abort = null;
         this.activeSessionId = null;
@@ -113,6 +125,30 @@ export class ChatEngine {
       throw new Error("Генерация отменена");
     }
 
+    try {
+      return await this.sendInner(
+        sessionId,
+        userContent,
+        params,
+        systemPrompt,
+        attachments,
+        signal,
+        base,
+      );
+    } finally {
+      linkAbort?.removeEventListener("abort", forwardPrepAbort);
+    }
+  }
+
+  private async sendInner(
+    sessionId: string,
+    userContent: string,
+    params: GenerationParams,
+    systemPrompt: string,
+    attachments: ChatAttachment[] | undefined,
+    signal: AbortSignal,
+    base: string,
+  ): Promise<ChatMessage> {
     this.store.addMessage(sessionId, {
       role: "user",
       content: userContent,
@@ -203,22 +239,29 @@ export class ChatEngine {
         });
       } catch (err) {
         // Keep busy flag until recovery finishes so load/agent gates cannot race.
+        // Only clear THIS send's controller — a newer send may already own this.abort.
         try {
           await this.runtime.assertLlmReady();
         } catch (probeErr) {
-          this.abort = null;
-          this.activeSessionId = null;
+          if (this.abort?.signal === signal) {
+            this.abort = null;
+            this.activeSessionId = null;
+          }
           throw formatLlmFetchError(probeErr, base);
         }
-        this.abort = null;
-        this.activeSessionId = null;
+        if (this.abort?.signal === signal) {
+          this.abort = null;
+          this.activeSessionId = null;
+        }
         throw formatLlmFetchError(err, base);
       }
 
       if (!res.ok || !res.body) {
         const text = await res.text().catch(() => "");
-        this.abort = null;
-        this.activeSessionId = null;
+        if (this.abort?.signal === signal) {
+          this.abort = null;
+          this.activeSessionId = null;
+        }
         if (
           isContextOverflowError(text) ||
           isContextOverflowError(`Ошибка генерации: ${res.status} ${text}`)
@@ -386,11 +429,28 @@ export class ChatEngine {
       excludeBuiltinNames?: string[];
     },
   ): Promise<string> {
+    // Own AbortController before assertLlmReady so Stop during readiness is honoured.
+    this.stop();
+    this.abort = new AbortController();
+    this.activeSessionId = sessionId || null;
+    const signal = this.abort.signal;
+
     let base: string;
     try {
       base = await this.runtime.assertLlmReady();
     } catch (err) {
+      if (this.abort?.signal === signal) {
+        this.abort = null;
+        if (this.activeSessionId === (sessionId || null)) this.activeSessionId = null;
+      }
       throw formatLlmFetchError(err, this.runtime.getOpenAiBaseUrl());
+    }
+    if (signal.aborted) {
+      if (this.abort?.signal === signal) {
+        this.abort = null;
+        if (this.activeSessionId === (sessionId || null)) this.activeSessionId = null;
+      }
+      throw new Error("Генерация отменена");
     }
 
     // Agent JSON may need a large budget (full file bodies). Cap only by context headroom.
@@ -613,12 +673,16 @@ export class ChatEngine {
             }>;
           };
           const choice = json.choices?.[0];
+          if (choice?.finish_reason === "length") truncated = true;
           if (mode === "tools" && choice?.message?.tool_calls?.length) {
-            content = toolCallsToActionJson(choice.message.tool_calls);
+            content = toolCallsToActionJson(
+              choice.message.tool_calls,
+              "native tool_calls",
+              { rejectBrokenArgs: truncated },
+            );
           } else {
             content = pickCompletionText(choice?.message);
           }
-          if (choice?.finish_reason === "length") truncated = true;
           if (sessionId && content) {
             this.onToken?.({ sessionId, text: content, draft: true });
           }
@@ -657,10 +721,18 @@ export class ChatEngine {
       if (isContextOverflowError(msg) || isContextOverflowError(`Ошибка: ${msg}`)) {
         return false;
       }
-      if (status === 400 || status === 422) return true;
-      return /json_schema|response_format|grammar|tool_choice|unknown field|invalid.*schema|tools?\b/i.test(
-        msg,
-      );
+      // Narrow: do not treat every 400 mentioning "tool" as permanent tools death.
+      if (
+        /json_schema|response_format|grammar|tool_choice|unknown field|invalid.*schema|unsupported.*tool/i.test(
+          msg,
+        )
+      ) {
+        return true;
+      }
+      if (status === 400 || status === 422) {
+        return /tools|function.?call|tool_calls|parallel_tool/i.test(msg);
+      }
+      return false;
     };
 
     const resolveAttempt = async (
@@ -738,21 +810,27 @@ export class ChatEngine {
       for (;;) {
         try {
           const result = await runWithMode(mode);
-          // Soft-fail: HTTP 200 tools mode with prose → retry json_schema this turn only.
-          // Do NOT mark toolsOk=false forever (one bad sample must not kill native tools).
+          // Soft-fail: HTTP 200 tools mode with prose → retry json_schema this turn.
+          // After several consecutive soft-fails, degrade toolsOk (avoid 2× LLM forever).
           if (
             mode === "tools" &&
             !opts?.planOnly &&
             !looksLikeUsableAgentJson(result.content)
           ) {
+            this.runtime.toolsSoftFailStreak =
+              (this.runtime.toolsSoftFailStreak || 0) + 1;
+            if (this.runtime.toolsSoftFailStreak >= 3) {
+              markConstraintFailure(mode);
+              this.runtime.toolsSoftFailStreak = 0;
+            }
             const next = nextConstraintModeAfterFailure(mode);
             if (!next) {
-              markConstraintSuccess(mode);
               return result.content;
             }
             mode = next;
             continue;
           }
+          if (mode === "tools") this.runtime.toolsSoftFailStreak = 0;
           markConstraintSuccess(mode);
           return result.content;
         } catch (err) {
@@ -768,12 +846,6 @@ export class ChatEngine {
         }
       }
     };
-
-    // Reuse / replace abort so agent cancel (chat.stop) interrupts JSON calls too.
-    this.stop();
-    this.abort = new AbortController();
-    this.activeSessionId = sessionId || null;
-    const signal = this.abort.signal;
 
     try {
       try {
@@ -806,7 +878,7 @@ export class ChatEngine {
       if (this.abort?.signal === signal) {
         this.abort = null;
       }
-      if (this.activeSessionId === sessionId) {
+      if (this.activeSessionId === (sessionId || null)) {
         this.activeSessionId = null;
       }
     }

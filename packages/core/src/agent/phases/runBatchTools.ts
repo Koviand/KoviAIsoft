@@ -39,7 +39,10 @@ export async function runBatchTools(opts: {
   checkpointRunId?: string;
   emit: Emit;
   isCancelled?: () => boolean;
-}): Promise<{ ok: true; combined: string; count: number } | { ok: false; error: string }> {
+}): Promise<
+  | { ok: true; combined: string; count: number; okCount: number; allFailed: boolean }
+  | { ok: false; error: string }
+> {
   const batch = normalizeToolsBatch(opts.tools);
   if (!batch.ok) {
     return {
@@ -112,7 +115,14 @@ export async function runBatchTools(opts: {
     }),
   );
   const combined = results
-    .map((r, i) => `### ${r.name} [${r.isError ? "err" : "ok"}]\n${r.result}`)
+    .map((r) => `### ${r.name} [${r.isError ? "err" : "ok"}]\n${r.result}`)
     .join("\n\n");
-  return { ok: true, combined, count: results.length };
+  const okCount = results.filter((r) => !r.isError).length;
+  return {
+    ok: true,
+    combined,
+    count: results.length,
+    okCount,
+    allFailed: okCount === 0,
+  };
 }

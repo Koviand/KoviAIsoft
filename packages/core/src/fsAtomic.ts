@@ -61,13 +61,36 @@ async function withPathLock(filePath: string, fn: () => Promise<void>): Promise<
   }
 }
 
+function fsyncSync(fdOrPath: number | string): void {
+  try {
+    if (typeof fdOrPath === "number") {
+      fs.fsyncSync(fdOrPath);
+      return;
+    }
+    const fd = fs.openSync(fdOrPath, "r");
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    // Best-effort — some FS ignore fsync.
+  }
+}
+
 /** Write file via unique temp + replace to avoid torn content on crash. */
-export function writeFileAtomicSync(filePath: string, content: string): void {
+export function writeFileAtomicSync(filePath: string, content: string | Buffer): void {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
   const tmp = tmpName(filePath);
   try {
-    fs.writeFileSync(tmp, content, "utf8");
+    const fd = fs.openSync(tmp, "w");
+    try {
+      fs.writeFileSync(fd, content);
+      fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
     replaceSync(tmp, filePath);
   } catch (err) {
     try {
@@ -79,13 +102,22 @@ export function writeFileAtomicSync(filePath: string, content: string): void {
   }
 }
 
-export async function writeFileAtomic(filePath: string, content: string): Promise<void> {
+export async function writeFileAtomic(
+  filePath: string,
+  content: string | Buffer,
+): Promise<void> {
   await withPathLock(filePath, async () => {
     const dir = path.dirname(filePath);
     await fsp.mkdir(dir, { recursive: true });
     const tmp = tmpName(filePath);
     try {
-      await fsp.writeFile(tmp, content, "utf8");
+      const fh = await fsp.open(tmp, "w");
+      try {
+        await fh.writeFile(content);
+        await fh.sync().catch(() => undefined);
+      } finally {
+        await fh.close();
+      }
       await replaceAsync(tmp, filePath);
     } catch (err) {
       try {

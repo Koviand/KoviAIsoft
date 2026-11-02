@@ -66,7 +66,7 @@ const sessionExportSchema = z.object({
   version: z.literal(1),
   exportedAt: z.string().min(1),
   session: chatSessionSchema,
-  messages: z.array(chatMessageSchema),
+  messages: z.array(chatMessageSchema).max(2000),
 });
 
 export function assertSessionExportBundle(bundle: unknown): SessionExportBundle {

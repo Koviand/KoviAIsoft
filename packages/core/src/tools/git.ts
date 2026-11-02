@@ -207,11 +207,12 @@ function ensureAskPassScript(): string {
     "#!/usr/bin/env node",
     "const t = process.env.KOVI_GIT_ASKPASS_TOKEN || '';",
     "const q = process.argv.slice(2).join(' ').toLowerCase();",
-    "if (q.includes('username')) { process.stdout.write('x-access-token'); process.exit(0); }",
-    "// Host-aware: github.com as hostname, not a path substring.",
-    "const hostOk = /(?:^|[\\s@/:])github\\.com(?:[:/\\s]|$)/.test(q) ||",
-    "  (/password|passphrase|token/.test(q) && !q.includes('://') && !q.includes('@'));",
-    "if (hostOk) { process.stdout.write(t); } else { process.stdout.write(''); }",
+    "// Only github.com host prompts — never SSH passphrase / generic Password: / other remotes.",
+    "const hostOk = /(?:^|[\\s@/:'\"])github\\.com(?:[:/\\s'\"?]|$)/.test(q);",
+    "if (!hostOk) { process.stdout.write(''); process.exit(0); }",
+    "if (/username/.test(q)) { process.stdout.write('x-access-token'); process.exit(0); }",
+    "if (/password|passphrase|token/.test(q)) { process.stdout.write(t); process.exit(0); }",
+    "process.stdout.write('');",
   ].join("\n");
   try {
     if (!fs.existsSync(jsDest) || fs.readFileSync(jsDest, "utf8") !== script) {

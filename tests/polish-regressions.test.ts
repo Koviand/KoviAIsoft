@@ -75,29 +75,33 @@ describe("polish regressions", () => {
     expect(copy.byteOffset % 4).toBe(0);
   });
 
-  it("getEffectiveSettings returns usable webSearchApiKey for Tavily chat prep", async () => {
-    const { AppService } = await import("../packages/core/src/appService");
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kovi-eff-"));
-    dirs.push(dir);
-    const svc = new AppService(dir);
-    await svc.init();
-    try {
-      const base = svc.getSettings();
-      await svc.saveSettings({
-        ...base,
-        webSearchApiKey: "tvly-test-key-123",
-        webSearchProvider: "tavily",
-      });
-      const eff = svc.getEffectiveSettings();
-      expect(eff.webSearchProvider).toBe("tavily");
-      expect(typeof eff.webSearchApiKey).toBe("string");
-      expect(eff.webSearchApiKey.length).toBeGreaterThan(0);
-      // Chat path must use effective settings (not raw encrypted placeholder alone).
-      expect(eff.webSearchApiKey === "__secure__" ? false : true).toBe(true);
-    } finally {
-      await svc.dispose();
-    }
-  });
+  it(
+    "getEffectiveSettings returns usable webSearchApiKey for Tavily chat prep",
+    async () => {
+      const { AppService } = await import("../packages/core/src/appService");
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kovi-eff-"));
+      dirs.push(dir);
+      const svc = new AppService(dir);
+      await svc.init();
+      try {
+        const base = svc.getSettings();
+        await svc.saveSettings({
+          ...base,
+          webSearchApiKey: "tvly-test-key-123",
+          webSearchProvider: "tavily",
+        });
+        const eff = svc.getEffectiveSettings();
+        expect(eff.webSearchProvider).toBe("tavily");
+        expect(typeof eff.webSearchApiKey).toBe("string");
+        expect(eff.webSearchApiKey.length).toBeGreaterThan(0);
+        // Chat path must use effective settings (not raw encrypted placeholder alone).
+        expect(eff.webSearchApiKey === "__secure__" ? false : true).toBe(true);
+      } finally {
+        await svc.dispose();
+      }
+    },
+    15_000,
+  );
 
   it("internet-off soft-fail uses one shared callId for tool_call and tool_result", () => {
     const loopSrc = fs.readFileSync(

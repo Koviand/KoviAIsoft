@@ -13,6 +13,7 @@ import type {
   RuntimeUpdateInfo,
 } from "@kovi/shared";
 import { getRuntimesDir } from "../paths.js";
+import { writeFileAtomic } from "../fsAtomic.js";
 import {
   fetchLatestRuntimeAsset,
   isNewerRuntime,
@@ -110,6 +111,8 @@ export class RuntimeManager {
   grammarOk: boolean | null = null;
   /** OpenAI-style tools / tool_calls support (null = unknown). */
   toolsOk: boolean | null = null;
+  /** Consecutive soft-fails (prose in tools mode) before toolsOk=false. */
+  toolsSoftFailStreak = 0;
   private onProgress?: ProgressFn;
   private ensurePromise: Promise<{
     updated: boolean;
@@ -326,10 +329,9 @@ export class RuntimeManager {
     if (!hydrated) {
       throw new Error("Не удалось сохранить runtime: llama-server.exe не найден");
     }
-    await fsp.writeFile(
+    await writeFileAtomic(
       this.metaPath(),
       JSON.stringify(this.toStoredMeta(hydrated), null, 2),
-      "utf8",
     );
     this.installed = hydrated;
   }
@@ -656,6 +658,7 @@ export class RuntimeManager {
     this.jsonSchemaOk = null;
     this.grammarOk = null;
     this.toolsOk = null;
+    this.toolsSoftFailStreak = 0;
     if (!this.process) {
       this.port = null;
       this.clearLoadedModel();

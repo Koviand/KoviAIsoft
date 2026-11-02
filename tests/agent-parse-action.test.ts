@@ -89,8 +89,9 @@ describe("validateToolArgs", () => {
     expect(good.ok).toBe(true);
   });
 
-  it("rejects typo builtin names", () => {
-    expect(validateToolArgs("list_directory", {}).ok).toBe(false);
+  it("canonicalizes common typo builtin names", () => {
+    expect(validateToolArgs("list_directory", { path: "." }).ok).toBe(true);
+    expect(validateToolArgs("totally_unknown_tool", {}).ok).toBe(false);
   });
 });
 

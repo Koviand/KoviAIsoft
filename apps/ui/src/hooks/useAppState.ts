@@ -127,6 +127,8 @@ export function useAppState() {
           .then((bar) => setStatus({ ...bar, view: viewRef.current }))
           .catch(() => undefined);
       }
+      // busy ownership: ChatPage clears via streamSession; here we only raise
+      // generating and sync terminal state from backend truth (avoids stale cancel).
       if (ev.type === "confirmation_required") {
         setPendingConfirm({
           id: ev.confirmation.id,
@@ -149,7 +151,16 @@ export function useAppState() {
           status: "pending",
         };
         setAgentChanges((cur) => {
-          const without = cur.filter((c) => c.confirmationId !== change.confirmationId);
+          // Merge twin tool_call row (id=callId) for the same path into one confirm item.
+          const without = cur.filter(
+            (c) =>
+              c.confirmationId !== change.confirmationId &&
+              !(
+                c.path === pathGuess &&
+                (c.status === "pending" || c.status === "accepted") &&
+                !c.confirmationId
+              ),
+          );
           return [...without, change];
         });
         setSelectedChangeId(change.id);
@@ -190,6 +201,9 @@ export function useAppState() {
       if (ev.type === "tool_result" && !ev.isError) {
         const cpMatch = /checkpoint:\s*(\S+)/i.exec(ev.result || "");
         const checkpointPath = cpMatch?.[1];
+        const pathFromResult =
+          /(?:Written|Patched)\s+.*?\s+to\s+(\S+)/i.exec(ev.result || "")?.[1] ||
+          undefined;
         setAgentChanges((cur) =>
           cur.map((c) => {
             if (c.id === ev.callId) {
@@ -200,7 +214,15 @@ export function useAppState() {
                 checkpointPath: checkpointPath || c.checkpointPath,
               };
             }
-            if (c.status === "accepted") {
+            if (c.status !== "accepted") return c;
+            const pathMatch =
+              pathFromResult &&
+              c.path.replace(/\\/g, "/") === pathFromResult.replace(/\\/g, "/");
+            // Single in-flight accepted confirm without a twin callId row.
+            const onlyAccepted =
+              !pathFromResult &&
+              cur.filter((x) => x.status === "accepted").length === 1;
+            if (pathMatch || onlyAccepted) {
               return {
                 ...c,
                 status: "applied",
@@ -216,8 +238,7 @@ export function useAppState() {
         setConfirmBusy(false);
         setAgentChanges((cur) =>
           cur.map((c) =>
-            c.confirmationId === ev.confirmationId ||
-            (c.status === "pending" && c.summary.includes(ev.toolName))
+            c.confirmationId === ev.confirmationId
               ? { ...c, status: "rejected" as const }
               : c,
           ),
@@ -227,9 +248,11 @@ export function useAppState() {
         );
       }
       if (ev.type === "tool_result" && ev.isError) {
+        // Only the matching callId — do not reject unrelated accepted confirms.
         setAgentChanges((cur) =>
           cur.map((c) =>
-            c.id === ev.callId && c.status === "pending"
+            c.id === ev.callId &&
+            (c.status === "pending" || c.status === "accepted")
               ? { ...c, status: "rejected" as const }
               : c,
           ),
@@ -250,7 +273,6 @@ export function useAppState() {
           .catch(() => undefined);
       }
       if (ev.type === "done" || ev.type === "cancelled" || ev.type === "error") {
-        setGenerating(false);
         setPendingConfirm(null);
         setConfirmBusy(false);
         if (ev.type === "error") setError(ev.message);
@@ -258,10 +280,14 @@ export function useAppState() {
           void api.getMessages(p.sessionId).then(setMessages).catch(() => undefined);
         }
         void api.listSessions().then(setSessions).catch(() => undefined);
+        // Backend busy is source of truth — stale cancelled must not clear a new gen.
         void api
           .getStatusBar()
-          .then((bar) => setStatus({ ...bar, view: viewRef.current }))
-          .catch(() => undefined);
+          .then((bar) => {
+            setGenerating(Boolean(bar.busy));
+            setStatus({ ...bar, view: viewRef.current });
+          })
+          .catch(() => setGenerating(false));
       }
     });
     return off;
@@ -348,10 +374,9 @@ export function useAppState() {
         let cp = item.checkpointPath;
         if (!cp) {
           const list = await api.listCheckpoints();
+          const want = item.path.replace(/\\/g, "/").replace(/^\.\//, "");
           const hit = list.find(
-            (c) =>
-              c.relPath.replace(/\\/g, "/") === item.path.replace(/\\/g, "/") ||
-              c.checkpointPath.endsWith(item.path.replace(/\\/g, "/")),
+            (c) => c.relPath.replace(/\\/g, "/").replace(/^\.\//, "") === want,
           );
           cp = hit?.checkpointPath;
         }

@@ -391,6 +391,11 @@ function formatResult(
   return parts.join("\n");
 }
 
+/** True when run_terminal result text reports a non-zero exit (soft failure). */
+export function isNonZeroShellExit(result: string): boolean {
+  return /(?:^|\n)exit:\s*(?!0\b)\d+/im.test(result || "");
+}
+
 type ShellResult = { stdout: string; stderr: string; code: number };
 
 function execCapture(

@@ -47,8 +47,15 @@ function wmoLabel(code: number): string {
   return `код погоды ${code}`;
 }
 
-async function fetchText(url: string, ms = 10_000): Promise<string> {
+async function fetchText(
+  url: string,
+  ms = 10_000,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (signal?.aborted) throw new Error("Отменено");
   const ac = new AbortController();
+  const onExt = () => ac.abort();
+  signal?.addEventListener("abort", onExt, { once: true });
   const t = setTimeout(() => ac.abort(), ms);
   try {
     const res = await fetch(url, {
@@ -59,11 +66,16 @@ async function fetchText(url: string, ms = 10_000): Promise<string> {
     return await res.text();
   } finally {
     clearTimeout(t);
+    signal?.removeEventListener("abort", onExt);
   }
 }
 
-async function fetchJson(url: string, ms = 10_000): Promise<unknown> {
-  const text = await fetchText(url, ms);
+async function fetchJson(
+  url: string,
+  ms = 10_000,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  const text = await fetchText(url, ms, signal);
   return JSON.parse(text) as unknown;
 }
 
@@ -91,15 +103,18 @@ export function resolvePlace(
   return { name: q, query: q, lat: 55.7558, lon: 37.6173, known: false };
 }
 
-async function fromWttr(place: { name: string; query: string }): Promise<WeatherBrief | null> {
+async function fromWttr(
+  place: { name: string; query: string },
+  signal?: AbortSignal,
+): Promise<WeatherBrief | null> {
   const enc = encodeURIComponent(place.query);
   // Compact one-liner first (fast / reliable).
-  const line = (await fetchText(`https://wttr.in/${enc}?format=3`)).trim();
+  const line = (await fetchText(`https://wttr.in/${enc}?format=3`, 10_000, signal)).trim();
   if (!line || /unknown/i.test(line)) return null;
   let detail = "";
   try {
     // Keep j1 short — one-liner is enough if detail is slow.
-    const j = (await fetchJson(`https://wttr.in/${enc}?format=j1`, 3_000)) as {
+    const j = (await fetchJson(`https://wttr.in/${enc}?format=j1`, 3_000, signal)) as {
       current_condition?: Array<{
         temp_C?: string;
         FeelsLikeC?: string;
@@ -139,16 +154,19 @@ async function fromWttr(place: { name: string; query: string }): Promise<Weather
   return { place: place.name, summary };
 }
 
-async function fromOpenMeteo(place: {
-  name: string;
-  lat: number;
-  lon: number;
-}): Promise<WeatherBrief | null> {
+async function fromOpenMeteo(
+  place: {
+    name: string;
+    lat: number;
+    lon: number;
+  },
+  signal?: AbortSignal,
+): Promise<WeatherBrief | null> {
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${place.lat}&longitude=${place.lon}` +
     `&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m` +
     `&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=1`;
-  const data = (await fetchJson(url, 8_000)) as {
+  const data = (await fetchJson(url, 8_000, signal)) as {
     timezone?: string;
     current?: {
       time?: string;
@@ -178,18 +196,24 @@ async function fromOpenMeteo(place: {
 }
 
 /** Returns a Russian brief for the model, or null if not resolvable. */
-export async function fetchWeatherBrief(userQuery: string): Promise<WeatherBrief | null> {
+export async function fetchWeatherBrief(
+  userQuery: string,
+  opts?: { signal?: AbortSignal },
+): Promise<WeatherBrief | null> {
+  if (opts?.signal?.aborted) throw new Error("Отменено");
   const place = resolvePlace(userQuery);
   try {
-    const wttr = await fromWttr(place);
+    const wttr = await fromWttr(place, opts?.signal);
     if (wttr) return wttr;
-  } catch {
+  } catch (err) {
+    if (opts?.signal?.aborted) throw err instanceof Error ? err : new Error("Отменено");
     /* try open-meteo only for known cities (coords are trustworthy) */
   }
   if (!place.known) return null;
   try {
-    return await fromOpenMeteo(place);
-  } catch {
+    return await fromOpenMeteo(place, opts?.signal);
+  } catch (err) {
+    if (opts?.signal?.aborted) throw err instanceof Error ? err : new Error("Отменено");
     return null;
   }
 }
