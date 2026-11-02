@@ -17,6 +17,7 @@
     "typecheck": "pnpm -r run typecheck",
     "pack": "node scripts/pack-portable.mjs",
     "pack:win": "node scripts/pack-portable.mjs",
+    "pack:setup": "node scripts/pack-portable.mjs",
     "postinstall": "pnpm build:shared && pnpm build:core",
     "playwright:install": "pnpm --filter @kovi/core exec playwright install chromium",
     "smoke:lfm3": "node scripts/smoke-lfm3.mjs"

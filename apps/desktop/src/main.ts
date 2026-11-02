@@ -31,21 +31,38 @@ function appIconPath(): string | undefined {
   return candidates.find((p) => p && fs.existsSync(p));
 }
 
-function portableRoot(): string {
+/** True when running the portable layout (data next to EXE), not NSIS install. */
+function isPortableLayout(): boolean {
+  if (!app.isPackaged) return false;
+  if (process.env.PORTABLE_EXECUTABLE_DIR) return true;
+  const exeDir = path.dirname(process.execPath);
+  return fs.existsSync(path.join(exeDir, ".kovi-portable"));
+}
+
+function appInstallRoot(): string {
   if (app.isPackaged) {
     return path.dirname(process.execPath);
   }
   return path.join(__dirname, "..");
 }
 
-function configurePortablePaths(): void {
-  const root = portableRoot();
-  const dataDir = path.join(root, "data");
+/**
+ * Portable: data/ + playwright-browsers/ beside EXE.
+ * Installed (NSIS): %APPDATA%/KoviAIsoft (Electron userData).
+ */
+function configureAppPaths(): void {
+  if (isPortableLayout() || !app.isPackaged) {
+    const root = appInstallRoot();
+    const dataDir = path.join(root, "data");
+    setAppDataDir(dataDir);
+    app.setPath("userData", dataDir);
+    process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(root, "playwright-browsers");
+    return;
+  }
+  // NSIS / installed: keep default userData under AppData.
+  const dataDir = app.getPath("userData");
   setAppDataDir(dataDir);
-  app.setPath("userData", dataDir);
-
-  const browsers = path.join(root, "playwright-browsers");
-  process.env.PLAYWRIGHT_BROWSERS_PATH = browsers;
+  process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(dataDir, "playwright-browsers");
 }
 
 function uiPath(): string {
@@ -589,7 +606,7 @@ if (!gotLock) {
   });
 
   app.whenReady().then(async () => {
-    configurePortablePaths();
+    configureAppPaths();
     service = new AppService();
     // Secrets before init — auto runtime update / MCP need GitHub token when present.
     const appData = getAppDataDir();

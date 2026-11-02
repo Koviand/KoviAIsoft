@@ -1,6 +1,6 @@
 # Установка и сборка KoviAIsoft
 
-Инструкция для разработчиков и тех, кто собирает portable EXE из исходников.  
+Инструкция для разработчиков и тех, кто собирает **Setup EXE** или portable из исходников.  
 Описание программы — в [README.md](README.md).
 
 ---
@@ -32,7 +32,8 @@ pnpm install
 pnpm playwright:install
 ```
 
-В portable-сборке Chromium кладётся в `playwright-browsers\` рядом с EXE.
+В portable-сборке Chromium кладётся в `playwright-browsers\` рядом с EXE.  
+В установленной (Setup) версии — в `%APPDATA%\KoviAIsoft\playwright-browsers\`.
 
 ---
 
@@ -64,12 +65,13 @@ CI на push/PR: `.github/workflows/ci.yml` (runner `windows-latest`).
 
 ---
 
-## Сборка portable EXE
+## Сборка Setup и portable
 
-Одна папка, которую можно копировать на другой Windows x64 ПК:
+Одна команда собирает **установочный NSIS Setup EXE** и portable-папку:
 
 ```bash
 pnpm pack
+# или: pnpm pack:win / pnpm pack:setup
 ```
 
 Перед упаковкой скрипт может завершить запущенный `KoviAIsoft.exe` (`taskkill`), чтобы разблокировать `release\`.
@@ -78,23 +80,30 @@ pnpm pack
 
 | Путь | Содержимое |
 |------|------------|
-| `release\KoviAIsoft-Portable\KoviAIsoft.exe` | Запуск |
-| `release\KoviAIsoft-Portable\data\` | Настройки, чаты, скачанный runtime |
-| `release\KoviAIsoft-Portable\tools\hf\` | Встроенный Hugging Face CLI (preseed при pack) |
+| `release\KoviAIsoft-Setup-0.1.0.exe` | **Установщик** (ярлыки, выбор папки, данные в `%APPDATA%\KoviAIsoft`) |
+| `release\KoviAIsoft-Portable\KoviAIsoft.exe` | Portable-запуск (данные рядом с EXE) |
+| `release\KoviAIsoft-Portable\.kovi-portable` | Маркер portable-режима |
+| `release\KoviAIsoft-Portable\data\` | Настройки, чаты, runtime (только portable) |
+| `release\KoviAIsoft-Portable\tools\hf\` | Встроенный Hugging Face CLI |
 | `release\KoviAIsoft-Portable\playwright-browsers\` | Chromium для агента |
-| `release\KoviAIsoft-Portable\resources\ui\` | Собранный UI |
-| `release\builder-out\` | Дополнительно: unpacked и single-file portable от electron-builder |
+| `release\builder-out\` | Unpacked, portable single-file, исходный Setup от electron-builder |
 
-Скопируйте **всю** папку `KoviAIsoft-Portable` на целевой ПК и запустите EXE.  
-Для работы HF CLI / обновления runtime на чистом ПК нужна сеть при первом скачивании.
+**Setup:** запустите `KoviAIsoft-Setup-*.exe` → мастер установки → ярлык на рабочем столе / в меню Пуск.  
+Данные: `%APPDATA%\KoviAIsoft\`.
+
+**Portable:** скопируйте **всю** папку `KoviAIsoft-Portable` и запустите EXE.  
+Данные: `.\data\` рядом с программой.
+
+Для HF CLI / обновления runtime на чистом ПК нужна сеть при первом скачивании.
 
 ### Что делает pack
 
 1. `pnpm build` (shared → core → ui → desktop)
 2. esbuild main/preload в stage
-3. electron-builder (dir + portable)
-4. Сборка `KoviAIsoft-Portable` с сохранением существующих `data\` / `playwright-browsers\`
-5. Preseed встроенного HF CLI в `tools\hf\`
+3. electron-builder (`dir` + `portable` + `nsis`)
+4. Копирование Setup в `release\`
+5. Сборка `KoviAIsoft-Portable` (+ маркер `.kovi-portable`)
+6. Preseed HF CLI в `tools\hf\`
 
 Скрипт: [`scripts/pack-portable.mjs`](scripts/pack-portable.mjs).
 
@@ -105,7 +114,7 @@ pnpm pack
 | Команда | Назначение |
 |---------|------------|
 | `pnpm build` | Полная сборка пакетов |
-| `pnpm pack` / `pnpm pack:win` | Portable EXE |
+| `pnpm pack` / `pnpm pack:win` / `pnpm pack:setup` | Setup EXE + portable |
 | `pnpm test` | Vitest |
 | `pnpm typecheck` | TypeScript во всех пакетах |
 | `pnpm smoke:lfm3` | Smoke-скрипт (см. `scripts/`) |

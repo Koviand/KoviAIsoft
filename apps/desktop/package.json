@@ -55,13 +55,21 @@
     ],
     "asar": true,
     "win": {
-      "target": ["nsis"],
+      "target": ["nsis", "portable", "dir"],
       "icon": "build/icon.png",
-      "artifactName": "KoviAIsoft-Setup-${version}.${ext}"
+      "artifactName": "KoviAIsoft-${version}-portable.${ext}"
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "KoviAIsoft",
+      "artifactName": "KoviAIsoft-Setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "KoviAIsoft-${version}-portable.${ext}"
     }
   }
 }

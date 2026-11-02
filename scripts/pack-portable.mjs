@@ -220,13 +220,24 @@ function stagePackageJson() {
         target: [
           { target: "dir", arch: ["x64"] },
           { target: "portable", arch: ["x64"] },
+          { target: "nsis", arch: ["x64"] },
         ],
         icon: path.join(root, "apps", "desktop", "build", "icon.png"),
+        // Default for non-nsis targets; nsis overrides via nsis.artifactName.
         artifactName: "KoviAIsoft-${version}-portable.${ext}",
         signAndEditExecutable: false,
       },
       portable: {
         artifactName: "KoviAIsoft-${version}-portable.${ext}",
+      },
+      nsis: {
+        oneClick: false,
+        perMachine: false,
+        allowToChangeInstallationDirectory: true,
+        createDesktopShortcut: true,
+        createStartMenuShortcut: true,
+        shortcutName: "KoviAIsoft",
+        artifactName: "KoviAIsoft-Setup-${version}.${ext}",
       },
       npmRebuild: false,
       nodeGypRebuild: false,
@@ -290,7 +301,33 @@ function installStageDeps() {
 
 function buildElectron() {
   // Reads the "build" field from package.json by default.
-  run("npx", ["electron-builder", "--win", "dir", "portable", "--x64"], stage);
+  run("npx", ["electron-builder", "--win", "dir", "portable", "nsis", "--x64"], stage);
+}
+
+function copySetupInstaller() {
+  const rootPkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  const version = rootPkg.version || "0.1.0";
+  const setupName = `KoviAIsoft-Setup-${version}.exe`;
+  const builderOut = path.join(outDir, "builder-out");
+  const candidates = [
+    path.join(builderOut, setupName),
+    // electron-builder may nest under win-unpacked sibling
+    ...fs.existsSync(builderOut)
+      ? fs
+          .readdirSync(builderOut)
+          .filter((f) => /^KoviAIsoft-Setup-.*\.exe$/i.test(f))
+          .map((f) => path.join(builderOut, f))
+      : [],
+  ];
+  const src = candidates.find((p) => fs.existsSync(p));
+  if (!src) {
+    console.warn(`[pack] NSIS Setup EXE not found in ${builderOut}`);
+    return null;
+  }
+  const dest = path.join(outDir, path.basename(src));
+  fs.copyFileSync(src, dest);
+  console.log(`[pack] Setup installer: ${dest}`);
+  return dest;
 }
 
 function assemblePortableFolder() {
@@ -342,6 +379,11 @@ function assemblePortableFolder() {
       copyDir(browsersBackup, path.join(alt, "playwright-browsers"));
       rmrf(browsersBackup);
     }
+    fs.writeFileSync(
+      path.join(alt, ".kovi-portable"),
+      "KoviAIsoft portable layout\n",
+      "utf8",
+    );
     console.log(`\nPortable app ready (alternate path):\n  ${alt}`);
     return;
   }
@@ -376,6 +418,13 @@ function assemblePortableFolder() {
     console.warn("Playwright Chromium install failed — browser tools may need first-run download.");
   }
 
+  // Marker so main.ts keeps data/ next to EXE (not AppData).
+  fs.writeFileSync(
+    path.join(portableDir, ".kovi-portable"),
+    "KoviAIsoft portable layout\n",
+    "utf8",
+  );
+
   fs.writeFileSync(
     path.join(portableDir, "README-PORTABLE.txt"),
     [
@@ -390,6 +439,7 @@ function assemblePortableFolder() {
       "Модели по умолчанию сканируются из C:\\Models\\LFM (настраивается в UI).",
       "Браузер для агента: .\\playwright-browsers\\",
       "",
+      "Установщик (NSIS Setup): release\\KoviAIsoft-Setup-*.exe",
       "Один файл portable EXE также лежит в release\\builder-out\\",
       "",
     ].join("\r\n"),
@@ -428,12 +478,17 @@ async function main() {
   await bundleMain();
   installStageDeps();
   buildElectron();
+  const setupPath = copySetupInstaller();
   assemblePortableFolder();
   await preseedHfCli();
 
   console.log("\nPortable app ready:");
   console.log(`  ${portableDir}`);
   console.log(`  EXE: ${path.join(portableDir, "KoviAIsoft.exe")}`);
+  if (setupPath) {
+    console.log("\nSetup installer ready:");
+    console.log(`  ${setupPath}`);
+  }
 }
 
 /** Install portable HF CLI into release/.../tools/hf so users don't need pip. */
