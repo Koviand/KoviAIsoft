@@ -221,6 +221,43 @@ function projectedRealPath(target: string): string {
   }
 }
 
+/**
+ * Block agent writes into Kovi internal dirs (semantic index, etc.).
+ * Models sometimes invent paths like `.kovi/codebase-index/main.py` or `__.__kovi/...`.
+ */
+export function assertNotInternalProjectPath(target: string): void {
+  const resolved = normalizePath(target);
+  const norm = resolved.replace(/\\/g, "/").toLowerCase();
+  const baseSegs = norm.split("/").filter(Boolean);
+  const hasCodebaseIndex = baseSegs.includes("codebase-index");
+  // .kovi, .__.__kovi, __.__kovi — models often mangle the index folder name.
+  // Do NOT match bare "kovi" (username / project folder segments).
+  const hasKovi = baseSegs.some(
+    (s) =>
+      s === ".kovi" ||
+      /^\.__\.kovi$/.test(s) ||
+      /^\.?_{1,4}\.?kovi$/.test(s) ||
+      /^_+\.?kovi$/.test(s),
+  );
+  if (hasCodebaseIndex) {
+    throw new Error(
+      "Нельзя писать в индекс @codebase (.kovi/codebase-index). " +
+        "Создай обычный файл проекта, например tetris/main.py или src/main.py.",
+    );
+  }
+  if (hasKovi) {
+    const onlyRules = baseSegs.includes(".kovi")
+      ? baseSegs.includes("rules")
+      : false;
+    // Allow only real `.kovi/rules/*`; block mangled kovi dirs entirely.
+    if (!onlyRules) {
+      throw new Error(
+        "Папка .kovi служебная (кроме .kovi/rules). Не пиши туда код приложения — используй tetris/… или src/…",
+      );
+    }
+  }
+}
+
 export function assertAllowedPath(
   target: string,
   mode: FileAccessMode,
@@ -232,6 +269,7 @@ export function assertAllowedPath(
   if (isDangerousSystemDir(resolved)) {
     throw new Error(`Запрещённый системный путь: ${resolved}`);
   }
+  assertNotInternalProjectPath(resolved);
 
   const real = projectedRealPath(resolved);
   if (mode === "project") {

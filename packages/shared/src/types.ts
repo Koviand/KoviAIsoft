@@ -583,7 +583,7 @@ export function createDefaultSettings(appData: string): AppSettings {
     openaiProxyPort: 3928,
     webSearchProvider: "duckduckgo",
     mcpServers: [],
-    agentMaxSteps: 40,
+    agentMaxSteps: 0,
     defaultParams: { ...DEFAULT_GENERATION_PARAMS },
     hfDownloadMethod: "auto",
     hfToken: "",

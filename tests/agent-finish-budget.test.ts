@@ -3,21 +3,34 @@ import {
   AGENT_FINISH_WINDOW,
   AGENT_NON_ADVANCING_MAX,
   AGENT_REPAIR_MAX,
+  AGENT_STEPS_SAFETY_CAP,
   AGENT_TRUNCATION_MAX,
+  agentHasPendingWork,
   buildAgentResumePrompt,
   clampAgentMaxSteps,
   inFinishWindow,
+  normalizeAgentMaxStepsSetting,
   synthesizeBudgetExhaustedAnswer,
   toolFingerprint,
 } from "../packages/core/src/agent/finishPolicy";
 import { createWorkingMemory } from "../packages/core/src/agent/workingMemory";
 
+describe("normalizeAgentMaxStepsSetting", () => {
+  it("keeps 0 as unlimited preference", () => {
+    expect(normalizeAgentMaxStepsSetting(0)).toBe(0);
+    expect(normalizeAgentMaxStepsSetting(-1)).toBe(0);
+    expect(normalizeAgentMaxStepsSetting(40)).toBe(40);
+    expect(normalizeAgentMaxStepsSetting(999999)).toBe(2000);
+    expect(normalizeAgentMaxStepsSetting("nope")).toBe(0);
+  });
+});
+
 describe("clampAgentMaxSteps", () => {
-  it("clamps to 8…128", () => {
-    expect(clampAgentMaxSteps(0)).toBe(8);
-    expect(clampAgentMaxSteps(999999)).toBe(128);
+  it("maps 0 to safety cap; clamps positive to 1…2000", () => {
+    expect(clampAgentMaxSteps(0)).toBe(AGENT_STEPS_SAFETY_CAP);
+    expect(clampAgentMaxSteps(999999)).toBe(2000);
     expect(clampAgentMaxSteps(40)).toBe(40);
-    expect(clampAgentMaxSteps("nope")).toBe(40);
+    expect(clampAgentMaxSteps("nope")).toBe(AGENT_STEPS_SAFETY_CAP);
   });
 });
 
@@ -27,6 +40,35 @@ describe("inFinishWindow", () => {
     expect(inFinishWindow(38, 40)).toBe(true);
     expect(inFinishWindow(39, 40)).toBe(true);
     expect(inFinishWindow(37, 40)).toBe(false);
+  });
+});
+
+describe("agentHasPendingWork", () => {
+  it("true when plan pending or coding incomplete", () => {
+    expect(
+      agentHasPendingWork({
+        steps: [{ id: "1", title: "a", status: "pending" }],
+        wantsFiles: false,
+        filesWritten: 0,
+        substantialWrite: false,
+      }),
+    ).toBe(true);
+    expect(
+      agentHasPendingWork({
+        steps: [{ id: "1", title: "a", status: "done" }],
+        wantsFiles: true,
+        filesWritten: 0,
+        substantialWrite: false,
+      }),
+    ).toBe(true);
+    expect(
+      agentHasPendingWork({
+        steps: [{ id: "1", title: "a", status: "done" }],
+        wantsFiles: true,
+        filesWritten: 1,
+        substantialWrite: true,
+      }),
+    ).toBe(false);
   });
 });
 
@@ -65,7 +107,7 @@ describe("synthesizeBudgetExhaustedAnswer", () => {
     });
     expect(r.incomplete).toBe(false);
     expect(r.content).toMatch(/main\.py/);
-    expect(r.content).toMatch(/промежуточный|итог/i);
+    expect(r.content).toMatch(/итог|лимит/i);
   });
 });
 

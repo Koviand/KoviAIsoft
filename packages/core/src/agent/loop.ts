@@ -51,7 +51,6 @@ import {
   defaultPlanForTask,
   executePhaseHint,
   markCurrentPlanDone,
-  markCurrentPlanFailed,
   normalizePlanDraft,
   PLAN_PHASE_MAX_ATTEMPTS,
   planPhaseInstruction,
@@ -64,10 +63,14 @@ import {
 } from "./parseAction.js";
 import { toolsPromptBlock } from "./toolsCatalog.js";
 import {
+  AGENT_AUTO_EXTEND_BATCH,
+  AGENT_AUTO_EXTEND_MAX,
   AGENT_IDENTICAL_TOOL_MAX,
   AGENT_NON_ADVANCING_MAX,
   AGENT_REPAIR_MAX,
+  AGENT_STEPS_SAFETY_CAP,
   AGENT_TRUNCATION_MAX,
+  agentHasPendingWork,
   clampAgentMaxSteps,
   inFinishWindow,
   synthesizeBudgetExhaustedAnswer,
@@ -582,32 +585,67 @@ export class AgentLoop {
       let identicalToolStreak = 0;
       let lastToolFp: string | null = null;
       let nonAdvancingStreak = 0;
-      const maxSteps = clampAgentMaxSteps(settings.agentMaxSteps);
+      const userStepsPref =
+        typeof settings.agentMaxSteps === "number" ? settings.agentMaxSteps : 0;
+      const showStepCap = userStepsPref > 0;
+      let stepBudget = clampAgentMaxSteps(settings.agentMaxSteps);
+      let autoExtends = 0;
 
-      for (let i = 0; i < maxSteps; i++) {
+      for (let i = 0; ; i++) {
         if (this.cancelled) {
           this.emit(sessionId, { type: "cancelled" });
           return;
         }
-        const finishOnly = inFinishWindow(i, maxSteps);
+        const pendingWork = agentHasPendingWork({
+          steps,
+          wantsFiles,
+          filesWritten,
+          substantialWrite,
+        });
+        // Soft limit: keep going while plan/coding work remains (up to safety cap).
+        if (i >= stepBudget) {
+          if (
+            pendingWork &&
+            autoExtends < AGENT_AUTO_EXTEND_MAX &&
+            stepBudget < AGENT_STEPS_SAFETY_CAP
+          ) {
+            const add = Math.min(
+              AGENT_AUTO_EXTEND_BATCH,
+              AGENT_STEPS_SAFETY_CAP - stepBudget,
+            );
+            stepBudget += add;
+            autoExtends += 1;
+            this.emit(sessionId, {
+              type: "thinking",
+              text: `Автопродолжение ${autoExtends}: ещё ${add} шагов…`,
+            });
+          } else {
+            break;
+          }
+        }
+        // Never force finish-only while the plan / coding task is still open.
+        const finishOnly = inFinishWindow(i, stepBudget) && !pendingWork;
         const planFrozen = Boolean(workingMemory.planFrozen) && steps.length > 0;
         const curPlan = currentPlanStep(steps);
         // Match plan step ids ("1","2",…) so ChatPage checklist updates.
         const stepId = planFrozen && curPlan ? curPlan.id : `p${i + 1}`;
+        const stepLabel = showStepCap
+          ? `Шаг ${i + 1}/${stepBudget}`
+          : `Шаг ${i + 1}`;
         this.emit(sessionId, { type: "step_start", stepId });
         this.emit(sessionId, {
           type: "thinking",
           text: finishOnly
-            ? `Шаг ${i + 1}/${maxSteps}: финальный ответ…`
+            ? `${stepLabel}: финальный ответ…`
             : planFrozen
-              ? `Шаг ${i + 1}/${maxSteps}: исполнение плана…`
-              : `Шаг ${i + 1}/${maxSteps}: составление плана…`,
+              ? `${stepLabel}: исполнение плана…`
+              : `${stepLabel}: составление плана…`,
         });
         if (finishOnly && planFrozen) {
           transcript.push({
             role: "user",
             content:
-              "Лимит шагов почти исчерпан. ЗАПРЕЩЕНЫ новые tool. Верни JSON с final (краткий итог по сделанному) или tool finish. Если файлы не созданы — честно скажи об этом в final.",
+              "Работа по плану завершена. ЗАПРЕЩЕНЫ новые tool. Верни JSON с final (краткий итог) или tool finish.",
           });
         }
 
@@ -670,7 +708,7 @@ export class AgentLoop {
           const usedTok = estimateMessagesTokens(packed);
           this.emit(sessionId, {
             type: "thinking",
-            text: `Шаг ${i + 1}/${maxSteps}: контекст ~${usedTok}/${ctx} tok · жду модель…`,
+            text: `${stepLabel}: контекст ~${usedTok}/${ctx} tok · жду модель…`,
           });
           try {
             raw = await this.chat.completeJson(packed, callParams, sessionId, {
@@ -899,7 +937,7 @@ export class AgentLoop {
           const mustWork =
             noFileYet ||
             (!finishOnly &&
-              i < maxSteps - 1 &&
+              i < stepBudget - 1 &&
               (stubOnly ||
                 (!wantsFiles && toolsUsed === 0 && steps.length > 0) ||
                 (pendingLeft && !currentIsFinalish && toolsUsed === 0)));
@@ -910,14 +948,17 @@ export class AgentLoop {
               stepId,
               detail: "final_blocked",
             });
+            const curTitle = current
+              ? ` Пункт [${current.id}]: ${current.title}.`
+              : "";
             transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
             transcript.push({
               role: "user",
               content: wantsFiles
                 ? filesWritten === 0
-                  ? "Рано для final. Сначала создай файлы через write_file (полный код в args.content). list_dir/read_file не считаются выполнением. final только после записи рабочих файлов."
-                  : `Рано для final: запись похожа на stub. Допиши полный код через write_file или apply_patch (цель ≥${MIN_CODING_WRITE_CHARS} символов на ключевой файл), затем final.`
-                : "Рано для final. Сначала выполни текущий пункт плана инструментом.",
+                  ? `Рано для final.${curTitle} Сначала создай файлы через write_file (полный код в args.content). list_dir/read_file не считаются выполнением.`
+                  : `Рано для final: запись похожа на stub.${curTitle} Допиши полный код через write_file/apply_patch (цель ≥${MIN_CODING_WRITE_CHARS} символов), затем final.`
+                : `Рано для final.${curTitle} Сначала выполни текущий пункт плана инструментом.`,
             });
             continue;
           }
@@ -946,14 +987,18 @@ export class AgentLoop {
 
         if (!parsed.tool?.name) {
           this.emit(sessionId, { type: "step_done", stepId, detail: "no tool" });
+          const cur = currentPlanStep(steps);
+          const curHint = cur
+            ? `Текущий пункт плана [${cur.id}]: ${cur.title}.`
+            : "Пункты плана уже закрыты — можно final.";
           transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
           transcript.push({
             role: "user",
             content: finishOnly
               ? "Нужен final или finish. Tool на этом шаге запрещён."
               : wantsFiles
-                ? "Нужен tool (write_file) или final. Для кода сначала write_file."
-                : "Нужен tool или final. Продолжай.",
+                ? `${curHint} Ты вернул thought без tool. Сейчас ОБЯЗАТЕЛЕН tool.write_file (или apply_patch) с полным кодом в args — не описывай файлы в thought/final. Пример: {"thought":"создаю main","tool":{"name":"write_file","args":{"path":"tetris/main.py","content":"..."}},"final":null}`
+                : `${curHint} Нужен один tool или final. Не отвечай только thought.`,
           });
           continue;
         }
@@ -991,6 +1036,35 @@ export class AgentLoop {
         }
         const args = argCheck.args;
         parsed.tool = { name: toolName, args };
+
+        // Fingerprint before emitting tool_call so identical retries don't spam the UI.
+        const fp = toolFingerprint(toolName, args);
+        if (fp === lastToolFp) identicalToolStreak += 1;
+        else {
+          identicalToolStreak = 1;
+          lastToolFp = fp;
+        }
+        if (toolName !== "finish" && identicalToolStreak > AGENT_IDENTICAL_TOOL_MAX) {
+          this.emit(sessionId, {
+            type: "step_done",
+            stepId,
+            detail: "identical tool",
+          });
+          const badPath = String(args.path || "");
+          const pathHint =
+            /codebase-index|\.kovi|__.__kovi/i.test(badPath)
+              ? " Путь похож на служебный индекс — пиши в tetris/main.py или src/main.py."
+              : "";
+          transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+          transcript.push({
+            role: "user",
+            content:
+              `Ты повторяешь тот же ${toolName} с теми же аргументами — он уже не сработал.${pathHint} ` +
+              `Смени path/args или верни final с честным итогом.`,
+          });
+          continue;
+        }
+
         const callId = uuid();
         this.emit(sessionId, { type: "tool_call", name: toolName, args, callId });
 
@@ -1002,7 +1076,7 @@ export class AgentLoop {
             !substantialWrite &&
             stubNudgeCount < 2 &&
             !finishOnly &&
-            i < maxSteps - 1;
+            i < stepBudget - 1;
           if (blockFinishNoFile || blockFinishStub) {
             if (blockFinishStub) stubNudgeCount += 1;
             const deny = blockFinishNoFile
@@ -1041,32 +1115,6 @@ export class AgentLoop {
           return;
         }
 
-        const fp = toolFingerprint(toolName, args);
-        if (fp === lastToolFp) identicalToolStreak += 1;
-        else {
-          identicalToolStreak = 1;
-          lastToolFp = fp;
-        }
-        if (identicalToolStreak > AGENT_IDENTICAL_TOOL_MAX) {
-          this.emit(sessionId, {
-            type: "tool_result",
-            callId,
-            result: "Повтор того же tool отклонён",
-            isError: true,
-          });
-          this.emit(sessionId, {
-            type: "step_done",
-            stepId,
-            detail: "identical tool",
-          });
-          transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
-          transcript.push({
-            role: "user",
-            content:
-              "Ты повторяешь тот же инструмент с теми же аргументами. Сделай другой tool или верни final с итогом.",
-          });
-          continue;
-        }
         if (!PLAN_ADVANCING_TOOLS.has(toolName)) {
           nonAdvancingStreak += 1;
           if (nonAdvancingStreak > AGENT_NON_ADVANCING_MAX) {
@@ -1181,10 +1229,8 @@ export class AgentLoop {
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           rememberToolError(workingMemory, toolName, message);
-          if (steps.length) {
-            steps = markCurrentPlanFailed(steps, message.slice(0, 120));
-            this.emit(sessionId, { type: "plan", steps });
-          }
+          // Do NOT mark the plan step failed on a single tool error — the model may retry
+          // with a fixed path. Premature "failed" made the checklist skip the real work.
           persistScratchpad();
           this.emit(sessionId, {
             type: "tool_result",
@@ -1192,11 +1238,14 @@ export class AgentLoop {
             result: message,
             isError: true,
           });
-          this.emit(sessionId, { type: "step_done", stepId, detail: message });
+          this.emit(sessionId, { type: "step_done", stepId, detail: message.slice(0, 160) });
+          const pathHint = /codebase-index|\.kovi|служебн/i.test(message)
+            ? "\nИсправь path: пиши в tetris/main.py или src/main.py — НЕ в .kovi/codebase-index."
+            : "";
           transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
           transcript.push({
             role: "user",
-            content: `Ошибка инструмента ${toolName}: ${message}`,
+            content: `Ошибка инструмента ${toolName}: ${message}${pathHint}`,
           });
         }
       }

@@ -56,7 +56,8 @@ function applyTier(
       context,
       flashAttn: base.flashAttn || (vramGb != null && vramGb >= 6 && backend === "cuda"),
       maxTokens: suggestedMaxTokens(context, "fast"),
-      agentMaxSteps: Math.max(12, Math.floor(base.agentMaxSteps * 0.75)),
+      agentMaxSteps:
+        base.agentMaxSteps <= 0 ? 0 : Math.max(12, Math.floor(base.agentMaxSteps * 0.75)),
       temperature: Math.min(base.temperature, 0.6),
     };
   }
@@ -76,7 +77,8 @@ function applyTier(
       base.flashAttn ||
       (vramGb != null && vramGb >= 8 && (backend === "cuda" || backend === "vulkan")),
     maxTokens: suggestedMaxTokens(context, "quality"),
-    agentMaxSteps: Math.min(56, Math.floor(base.agentMaxSteps * 1.15)),
+    agentMaxSteps:
+      base.agentMaxSteps <= 0 ? 0 : Math.min(2000, Math.floor(base.agentMaxSteps * 1.15)),
     temperature: Math.max(base.temperature, 0.7),
   };
 }
@@ -152,11 +154,8 @@ export function estimateLoadPlan(
   }
 
   let maxTokens = suggestedMaxTokens(context, "balanced");
-  let agentMaxSteps = 24;
-  if (vramGb != null && vramGb >= 16 && ramGb >= 32) agentMaxSteps = 48;
-  else if (vramGb != null && vramGb >= 10) agentMaxSteps = 40;
-  else if (vramGb != null && vramGb >= 6) agentMaxSteps = 32;
-  else if (vramGb == null || vramGb <= 0) agentMaxSteps = 16;
+  // 0 = без лимита: агент сам продолжает, пока есть работа (safety cap в finishPolicy).
+  const agentMaxSteps = 0;
   let temperature = vramGb != null && vramGb >= 8 ? 0.7 : 0.6;
 
   const tuned = applyTier(
@@ -177,7 +176,10 @@ export function estimateLoadPlan(
   if (tier !== "balanced") {
     rationale += ` Уровень «${tierLabel}»: ctx ${tuned.context}, maxTokens ${tuned.maxTokens}.`;
   }
-  rationale += ` Чат: ctx ${tuned.context}, maxTokens ${tuned.maxTokens}, ngl ${tuned.gpuLayers}; агент до ${tuned.agentMaxSteps} шагов.`;
+  rationale +=
+    tuned.agentMaxSteps <= 0
+      ? ` Чат: ctx ${tuned.context}, maxTokens ${tuned.maxTokens}, ngl ${tuned.gpuLayers}; агент без лимита шагов.`
+      : ` Чат: ctx ${tuned.context}, maxTokens ${tuned.maxTokens}, ngl ${tuned.gpuLayers}; агент до ${tuned.agentMaxSteps} шагов.`;
 
   return {
     gpuLayers: tuned.gpuLayers,

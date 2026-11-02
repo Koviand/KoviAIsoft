@@ -14,7 +14,7 @@
 |---------|--------|-----------|
 | init / dispose | pass | AppService lifecycle |
 | getSystemInfo | fix | VRAM registry + pickMaxVram |
-| getSettings / saveSettings | fix | clamp agentMaxSteps 8…128; githubToken via safeStorage |
+| getSettings / saveSettings | fix | agentMaxSteps 0=без лимита (safety 2000); githubToken via safeStorage |
 | onboarding wizard | pass | Движок/папки/тема |
 
 ### Runtime
@@ -98,7 +98,7 @@
 - final/finish на последнем шаге даже без файлов (+ пометка)
 - Budget exhaust → synthesize итог из working memory
 - completeJson: boost до throw + schema hint
-- clamp agentMaxSteps 8…128
+- agentMaxSteps 0=без лимита; auto-extend пока есть работа; finishOnly только без pending work
 - step_done на repair/truncation/blocked ветках
 
 ---

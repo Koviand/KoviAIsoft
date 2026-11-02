@@ -1,3 +1,4 @@
+import type { AgentPlanStep } from "@kovi/shared";
 import type { AgentWorkingMemory } from "./workingMemory.js";
 
 /** Hard caps so large tasks cannot burn the whole step budget on repair/loops. */
@@ -18,21 +19,58 @@ export function buildAgentResumePrompt(goalHint?: string): string {
     `Один JSON-шаг: tool или final.`
   );
 }
-/** Last N steps: only final/summary (no new tools). */
-export const AGENT_FINISH_WINDOW = 2;
-export const AGENT_MAX_STEPS_MIN = 8;
-export const AGENT_MAX_STEPS_MAX = 128;
 
-export function clampAgentMaxSteps(n: unknown): number {
+/** Last N steps: only final/summary (no new tools) — only when work is done. */
+export const AGENT_FINISH_WINDOW = 2;
+/** 0 in settings = без лимита (runtime uses safety ceiling). */
+export const AGENT_MAX_STEPS_MIN = 0;
+export const AGENT_MAX_STEPS_MAX = 2000;
+export const AGENT_MAX_STEPS_DEFAULT = 0;
+/** Absolute safety ceiling for unlimited / auto-extend. */
+export const AGENT_STEPS_SAFETY_CAP = 2000;
+/** How many times we may auto-extend past the user budget while work remains. */
+export const AGENT_AUTO_EXTEND_MAX = 40;
+/** Steps added per auto-extend batch. */
+export const AGENT_AUTO_EXTEND_BATCH = 64;
+
+/**
+ * Persistable preference: 0 = unlimited.
+ * Does not expand 0 into the safety cap (that is runtime-only).
+ */
+export function normalizeAgentMaxStepsSetting(n: unknown): number {
   const v = typeof n === "number" ? n : Number(n);
-  if (!Number.isFinite(v)) return 40;
-  return Math.max(AGENT_MAX_STEPS_MIN, Math.min(AGENT_MAX_STEPS_MAX, Math.floor(v)));
+  if (!Number.isFinite(v)) return AGENT_MAX_STEPS_DEFAULT;
+  if (v <= 0) return 0;
+  return Math.max(1, Math.min(AGENT_MAX_STEPS_MAX, Math.floor(v)));
+}
+
+/** Runtime step budget (never 0 — unlimited becomes safety cap). */
+export function clampAgentMaxSteps(n: unknown): number {
+  const pref = normalizeAgentMaxStepsSetting(n);
+  if (pref <= 0) return AGENT_STEPS_SAFETY_CAP;
+  return pref;
 }
 
 /** True when this step index is in the finish-only window. */
 export function inFinishWindow(stepIndex: number, agentMaxSteps: number): boolean {
   const max = Math.max(1, agentMaxSteps);
   return stepIndex >= max - AGENT_FINISH_WINDOW;
+}
+
+/** Plan / coding work still needs tools — do not force final-only mode. */
+export function agentHasPendingWork(opts: {
+  steps: AgentPlanStep[];
+  wantsFiles: boolean;
+  filesWritten: number;
+  substantialWrite: boolean;
+}): boolean {
+  const pending = opts.steps.some(
+    (s) => s.status === "pending" || s.status === "running",
+  );
+  if (pending) return true;
+  if (opts.wantsFiles && opts.filesWritten === 0) return true;
+  if (opts.wantsFiles && opts.filesWritten > 0 && !opts.substantialWrite) return true;
+  return false;
 }
 
 export function toolFingerprint(toolName: string, args: Record<string, unknown>): string {
@@ -70,7 +108,7 @@ export function synthesizeBudgetExhaustedAnswer(
     wm.filesTouched.length > 0 ||
     wm.plan.some((p) => p.status === "done" || p.status === "failed");
 
-  lines.push("## Итог (лимит шагов агента)");
+  lines.push("## Итог");
   if (wm.goal) lines.push(`**Цель:** ${wm.goal}`);
 
   if (wm.plan.length) {
@@ -97,7 +135,7 @@ export function synthesizeBudgetExhaustedAnswer(
   if (!hadProgress) {
     lines.push(
       "",
-      "Прогресса почти не было. Уточните задачу или увеличьте лимит шагов в настройках, затем повторите с @agent.",
+      "Прогресса почти не было. Уточните задачу или нажмите Стоп и сформулируйте запрос иначе.",
     );
     return { content: lines.join("\n"), incomplete: true };
   }
@@ -105,17 +143,14 @@ export function synthesizeBudgetExhaustedAnswer(
   if (opts.wantsFiles && opts.filesWritten === 0) {
     lines.push(
       "",
-      "Код/файлы так и не были созданы до исчерпания лимита. Повторите запрос, попросив начать с одного короткого `write_file`.",
+      "Код/файлы так и не были созданы. Можно уточнить путь (например tetris/main.py) и повторить.",
     );
   } else if (opts.wantsFiles && !opts.substantialWrite) {
-    lines.push(
-      "",
-      "Записи были, но похожи на заготовки (stub). Можно продолжить: «допиши файлы через @agent».",
-    );
+    lines.push("", "Записи были, но похожи на заготовки (stub).");
   } else {
     lines.push(
       "",
-      "Это промежуточный итог по сделанному. Если нужно продолжить — напишите «продолжи @agent».",
+      "Достигнут внутренний лимит безопасности. Нажмите «Продолжить», если нужно добить задачу.",
     );
   }
 

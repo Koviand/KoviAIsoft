@@ -39,3 +39,29 @@ export function statusRu(status: string): string {
       return status;
   }
 }
+
+/**
+ * Agent `step_done.detail` is often English telemetry.
+ * Soft details must NOT complete the checklist — only tool success via `plan` event does.
+ */
+export function isSoftAgentStepDetail(detail: string | undefined): boolean {
+  if (!detail) return true;
+  return /^(no tool|repair|truncated|final_blocked|identical tool|non-advancing|Жду план|finish window)/i.test(
+    detail.trim(),
+  );
+}
+
+export function agentStepDetailRu(detail: string | undefined): string | undefined {
+  if (!detail) return undefined;
+  const t = detail.trim();
+  if (/^no tool$/i.test(t)) return "модель не вызвала tool";
+  if (/^repair$/i.test(t)) return "починка JSON";
+  if (/^truncated$/i.test(t)) return "ответ обрезан";
+  if (/^final_blocked$/i.test(t)) return "final рано";
+  if (/^identical tool$/i.test(t)) return "повтор tool";
+  if (/non-advancing/i.test(t)) return "только разведка";
+  if (/finish window/i.test(t)) return "только итог";
+  if (/^final$/i.test(t)) return "итог";
+  if (/ ok$/i.test(t)) return t.replace(/ ok$/i, " · ок");
+  return t;
+}

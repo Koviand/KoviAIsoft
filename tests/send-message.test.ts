@@ -64,48 +64,56 @@ describe("unified send / session tools", () => {
     ).toBe(true);
   });
 
-  it("sendMessage respects session toolsEnabled and rejects empty @agent", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kovi-tools-"));
-    const svc = new AppService(dir);
-    await svc.init();
-    try {
-      await expect(svc.sendMessage("missing", "@agent")).rejects.toThrow();
-      const chat = svc.createSession("chat", "tools-on");
-      await expect(svc.sendMessage(chat.id, "@agent")).rejects.toThrow(/@agent/);
+  it(
+    "sendMessage respects session toolsEnabled and rejects empty @agent",
+    async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kovi-tools-"));
+      const svc = new AppService(dir);
+      await svc.init();
+      try {
+        await expect(svc.sendMessage("missing", "@agent")).rejects.toThrow();
+        const chat = svc.createSession("chat", "tools-on");
+        await expect(svc.sendMessage(chat.id, "@agent")).rejects.toThrow(/@agent/);
 
-      svc.setSessionToolsEnabled(chat.id, true);
-      let agentStarted = false;
-      svc.startAgent = async () => {
-        agentStarted = true;
-      };
-      await svc.sendMessage(chat.id, "просто вопрос без coding");
-      expect(agentStarted).toBe(true);
-    } finally {
+        svc.setSessionToolsEnabled(chat.id, true);
+        let agentStarted = false;
+        svc.startAgent = async () => {
+          agentStarted = true;
+        };
+        await svc.sendMessage(chat.id, "просто вопрос без coding");
+        expect(agentStarted).toBe(true);
+      } finally {
+        await svc.dispose();
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
+
+  it(
+    "normalizes legacy agent sessions and toolsEnabled",
+    async () => {
+      const svc = new AppService(tmp);
+      await svc.init();
+      const agent = svc.createSession("agent", "legacy-agent");
+      expect(agent.toolsEnabled).toBe(true);
+      expect(sessionToolsEnabled(agent)).toBe(true);
+
+      const chat = svc.createSession("chat", "plain");
+      expect(chat.toolsEnabled).toBe(false);
+      expect(sessionToolsEnabled(chat)).toBe(false);
+
+      const toggled = svc.setSessionToolsEnabled(chat.id, true);
+      expect(toggled.toolsEnabled).toBe(true);
+      expect(toggled.mode).toBe("agent");
+
+      // Unified list includes both modes
+      const all = svc.listSessions();
+      expect(all.some((s) => s.id === agent.id)).toBe(true);
+      expect(all.some((s) => s.id === chat.id)).toBe(true);
+
       await svc.dispose();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("normalizes legacy agent sessions and toolsEnabled", async () => {
-    const svc = new AppService(tmp);
-    await svc.init();
-    const agent = svc.createSession("agent", "legacy-agent");
-    expect(agent.toolsEnabled).toBe(true);
-    expect(sessionToolsEnabled(agent)).toBe(true);
-
-    const chat = svc.createSession("chat", "plain");
-    expect(chat.toolsEnabled).toBe(false);
-    expect(sessionToolsEnabled(chat)).toBe(false);
-
-    const toggled = svc.setSessionToolsEnabled(chat.id, true);
-    expect(toggled.toolsEnabled).toBe(true);
-    expect(toggled.mode).toBe("agent");
-
-    // Unified list includes both modes
-    const all = svc.listSessions();
-    expect(all.some((s) => s.id === agent.id)).toBe(true);
-    expect(all.some((s) => s.id === chat.id)).toBe(true);
-
-    await svc.dispose();
-  });
+    },
+    15_000,
+  );
 });

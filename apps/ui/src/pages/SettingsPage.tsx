@@ -197,18 +197,22 @@ export function SettingsPage(props: {
           ))}
         </div>
         <label className="field">
-          <span className="field-label">Максимум шагов за один запуск</span>
+          <span className="field-label">Максимум шагов за один запуск (0 = без лимита)</span>
           <input
             className="input"
             type="number"
             value={s.agentMaxSteps}
             onChange={(e) => {
               const n = Number(e.target.value);
-              const clamped = Math.max(8, Math.min(128, Number.isFinite(n) ? Math.floor(n) : 40));
+              const clamped = !Number.isFinite(n)
+                ? 0
+                : n <= 0
+                  ? 0
+                  : Math.min(2000, Math.floor(n));
               queueSave({ ...s, agentMaxSteps: clamped });
             }}
-            min={8}
-            max={128}
+            min={0}
+            max={2000}
           />
         </label>
       </SettingsSection>
@@ -484,7 +488,9 @@ export function SettingsPage(props: {
                 ctx {hwPreview.defaultParams.context} · maxTokens {hwPreview.defaultParams.maxTokens}{" "}
                 · ngl {hwPreview.defaultParams.gpuLayers}
                 {hwPreview.defaultParams.flashAttn ? " · flash" : ""} · агент{" "}
-                {hwPreview.agentMaxSteps} шагов
+                {hwPreview.agentMaxSteps <= 0
+                  ? "без лимита"
+                  : `${hwPreview.agentMaxSteps} шагов`}
               </dd>
             </dl>
             <p style={{ margin: "8px 0 0", fontSize: "0.82rem" }}>{hwPreview.rationale}</p>

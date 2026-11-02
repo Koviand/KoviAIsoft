@@ -404,7 +404,10 @@ export function ModelsPage(props: {
               <dt>чат</dt>
               <dd>
                 ctx {hwPreview.defaultParams.context} · maxTokens {hwPreview.defaultParams.maxTokens}{" "}
-                · агент {hwPreview.agentMaxSteps} шагов
+                · агент{" "}
+                {hwPreview.agentMaxSteps <= 0
+                  ? "без лимита"
+                  : `${hwPreview.agentMaxSteps} шагов`}
               </dd>
             </dl>
             <p style={{ margin: "8px 0 0", fontSize: "0.82rem" }}>{hwPreview.rationale}</p>

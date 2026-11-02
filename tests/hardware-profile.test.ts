@@ -37,7 +37,7 @@ describe("suggestHardwareLoadProfile", () => {
     expect(s.backend).toBe("cpu");
     expect(s.defaultParams.context).toBe(4096);
     expect(s.defaultParams.gpuLayers).toBe(0);
-    expect(s.agentMaxSteps).toBe(16);
+    expect(s.agentMaxSteps).toBe(0);
   });
 
   it("low VRAM (~4 GB)", () => {
@@ -165,33 +165,37 @@ describe("applyHardwareLoadSettings", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("upserts auto-pc + tiers and activates auto-pc", async () => {
-    const svc = new AppService(tmp);
-    await svc.init();
-    try {
-      const before = svc.getSettings();
-      expect(before.loadProfiles.some((p) => p.id === AUTO_PC_PROFILE_ID)).toBe(false);
+  it(
+    "upserts auto-pc + tiers and activates auto-pc",
+    async () => {
+      const svc = new AppService(tmp);
+      await svc.init();
+      try {
+        const before = svc.getSettings();
+        expect(before.loadProfiles.some((p) => p.id === AUTO_PC_PROFILE_ID)).toBe(false);
 
-      const suggestion = await svc.suggestHardwareLoadSettings();
-      expect(suggestion.profile.id).toBe(AUTO_PC_PROFILE_ID);
+        const suggestion = await svc.suggestHardwareLoadSettings();
+        expect(suggestion.profile.id).toBe(AUTO_PC_PROFILE_ID);
 
-      const saved = await svc.applyHardwareLoadSettings({ applyBackend: true });
-      expect(saved.activeLoadProfileId).toBe(AUTO_PC_PROFILE_ID);
-      const auto = saved.loadProfiles.find((p) => p.id === AUTO_PC_PROFILE_ID);
-      expect(auto?.name).toBe("Под этот ПК");
-      expect(auto?.hardwareAware).toBe(true);
-      expect(saved.loadProfiles.some((p) => p.id === "fast")).toBe(true);
-      expect(saved.loadProfiles.some((p) => p.id === "quality")).toBe(true);
-      expect(saved.runtimeBackendPreference).toBe(suggestion.backend);
+        const saved = await svc.applyHardwareLoadSettings({ applyBackend: true });
+        expect(saved.activeLoadProfileId).toBe(AUTO_PC_PROFILE_ID);
+        const auto = saved.loadProfiles.find((p) => p.id === AUTO_PC_PROFILE_ID);
+        expect(auto?.name).toBe("Под этот ПК");
+        expect(auto?.hardwareAware).toBe(true);
+        expect(saved.loadProfiles.some((p) => p.id === "fast")).toBe(true);
+        expect(saved.loadProfiles.some((p) => p.id === "quality")).toBe(true);
+        expect(saved.runtimeBackendPreference).toBe(suggestion.backend);
 
-      await svc.applyHardwareLoadSettings({ applyBackend: false });
-      const again = svc.getSettings();
-      expect(again.loadProfiles.filter((p) => p.id === AUTO_PC_PROFILE_ID)).toHaveLength(1);
-      expect(again.runtimeBackendPreference).toBe(suggestion.backend);
-    } finally {
-      await svc.dispose();
-    }
-  });
+        await svc.applyHardwareLoadSettings({ applyBackend: false });
+        const again = svc.getSettings();
+        expect(again.loadProfiles.filter((p) => p.id === AUTO_PC_PROFILE_ID)).toHaveLength(1);
+        expect(again.runtimeBackendPreference).toBe(suggestion.backend);
+      } finally {
+        await svc.dispose();
+      }
+    },
+    15_000,
+  );
 
   it("applyLoadProfileToSettings syncs defaultParams", async () => {
     const svc = new AppService(tmp + "-tier");

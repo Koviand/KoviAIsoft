@@ -18,7 +18,7 @@ import {
   buildMentionItems,
   mentionQueryAt,
 } from "../components/MentionPicker";
-import { paramLabel } from "../lib/labels";
+import { agentStepDetailRu, isSoftAgentStepDetail, paramLabel } from "../lib/labels";
 
 const RESUME_PROMPT =
   "Продолжи задачу с того места, где остановился. Не начинай план заново — используй рабочую память и уже записанные файлы. Один JSON-шаг: tool или final.";
@@ -266,16 +266,36 @@ export function ChatPage(props: {
         setCurrentStep(ev.stepId);
         setModelOutput("");
         setPlan((prev) =>
-          prev.map((s) => (s.id === ev.stepId ? { ...s, status: "running" as const } : s)),
+          prev.map((s) => {
+            if (s.id === ev.stepId) {
+              // Highlight current checklist item; clear stale soft hints.
+              return { ...s, status: "running" as const, detail: undefined };
+            }
+            // Only one running item; don't demote real done/failed/skipped.
+            if (s.status === "running") {
+              return { ...s, status: "pending" as const };
+            }
+            return s;
+          }),
         );
       }
       if (ev.type === "step_done") {
+        // Checklist "готово" comes only from `plan` after a real advancing tool.
+        // Soft step_done ("no tool", repair, …) must NOT mark the item done.
+        const soft = isSoftAgentStepDetail(ev.detail);
+        const label = agentStepDetailRu(ev.detail);
         setPlan((prev) =>
-          prev.map((s) =>
-            s.id === ev.stepId
-              ? { ...s, status: "done" as const, detail: ev.detail }
-              : s,
-          ),
+          prev.map((s) => {
+            if (s.id !== ev.stepId) return s;
+            if (soft) {
+              return {
+                ...s,
+                detail: label,
+                status: s.status === "done" ? "running" : s.status,
+              };
+            }
+            return { ...s, detail: label ?? s.detail };
+          }),
         );
       }
       if (ev.type === "tool_call") {

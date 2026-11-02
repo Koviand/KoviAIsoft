@@ -196,6 +196,7 @@ export function toolsPromptBlock(
   • НЕЛЬЗЯ: export, VAR=value cmd, <<EOF, $(…), backticks, /Users/…, /tmp/…, 2>/dev/null, ls|grep|cat>file
   • Одиночные ls/cat/rm/pwd система может адаптировать; цепочки пиши сразу на cmd.
 - Пути в args: относительно проекта или C:/Users/Name/proj (слэш /). В JSON один \\ = "\\\\". Не учетверяй слэши. Unix-пути в command не исправляются — используй relative или C:/.
+- ЗАПРЕЩЕНО писать в .kovi/, .kovi/codebase-index/, node_modules/. Это служебные папки, не код игры/приложения.
 - Пустой cwd = папка проекта. Не удаляй корень проекта.
 - Код пиши только через write_file/apply_patch, не через echo/cat/heredoc в shell.
 - В system уже есть карта проекта и семантический @codebase (CPU-эмбеддинги) + keyword/rg. Пиши @codebase в запросе пользователя или опирайся на retrieved. Уточняй через search/read_file.`;

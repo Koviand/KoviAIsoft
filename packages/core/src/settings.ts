@@ -7,7 +7,7 @@ import {
   isThemePreset,
   migrateLoadProfileId,
 } from "@kovi/shared";
-import { clampAgentMaxSteps } from "./agent/finishPolicy.js";
+import { normalizeAgentMaxStepsSetting } from "./agent/finishPolicy.js";
 import { writeFileAtomic, writeFileAtomicSync } from "./fsAtomic.js";
 import { getSettingsPath, ensureDir, getModelsDir } from "./paths.js";
 
@@ -64,7 +64,7 @@ export class SettingsStore {
 
   async save(next: AppSettings): Promise<AppSettings> {
     const cloned = structuredClone(next);
-    cloned.agentMaxSteps = clampAgentMaxSteps(cloned.agentMaxSteps);
+    cloned.agentMaxSteps = normalizeAgentMaxStepsSetting(cloned.agentMaxSteps);
     this.settings = cloned;
     await writeFileAtomic(
       getSettingsPath(this.appData),
@@ -135,7 +135,7 @@ export class SettingsStore {
         parsed.embeddingModelId === "minilm" || parsed.embeddingModelId === "lfm25"
           ? parsed.embeddingModelId
           : defaults.embeddingModelId,
-      agentMaxSteps: clampAgentMaxSteps(
+      agentMaxSteps: normalizeAgentMaxStepsSetting(
         parsed.agentMaxSteps ?? defaults.agentMaxSteps,
       ),
     };

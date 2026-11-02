@@ -1,6 +1,7 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  assertNotInternalProjectPath,
   assertNotReservedWinName,
   collapseOverEscapedWinPath,
   isDangerousSystemDir,
@@ -54,5 +55,25 @@ describe("Windows agent path resolution", () => {
     expect(isDangerousSystemDir("C:\\Windows\\System32")).toBe(true);
     expect(isDangerousSystemDir("C:\\")).toBe(true);
     expect(isDangerousSystemDir("C:\\Users\\Kovi\\proj")).toBe(false);
+  });
+
+  it("blocks writes into .kovi codebase-index and mangled .__.__kovi", () => {
+    expect(() =>
+      assertNotInternalProjectPath(path.join(root, ".kovi", "codebase-index", "main.py")),
+    ).toThrow(/codebase-index|индекс/i);
+    // Exact mangled segment from failing agent runs: .__.__kovi
+    const mangled = "." + "__" + ".kovi";
+    expect(() =>
+      assertNotInternalProjectPath(path.join(root, mangled, "codebase-index", "main.py")),
+    ).toThrow(/codebase-index|индекс|служебн/i);
+    expect(() =>
+      assertNotInternalProjectPath(path.join(root, mangled, "main.py")),
+    ).toThrow(/\.kovi|служебн/i);
+    expect(() =>
+      assertNotInternalProjectPath(path.join(root, ".kovi", "cache.bin")),
+    ).toThrow(/\.kovi|служебн/i);
+    expect(() =>
+      assertNotInternalProjectPath(path.join(root, "tetris", "main.py")),
+    ).not.toThrow();
   });
 });
