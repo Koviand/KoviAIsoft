@@ -53,6 +53,10 @@ describe("IPC contract", () => {
       "reindexCodebase",
       "applyHardwareLoadSettings",
       "checkMcpHealth",
+      "openPath",
+      "listCheckpoints",
+      "restoreCheckpoint",
+      "exportSessionFolder",
     ]) {
       expect(keys).toContain(required);
     }

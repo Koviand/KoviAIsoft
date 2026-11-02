@@ -63,9 +63,16 @@ export class SettingsStore {
   }
 
   async save(next: AppSettings): Promise<AppSettings> {
-    const cloned = structuredClone(next);
-    cloned.agentMaxSteps = normalizeAgentMaxStepsSetting(cloned.agentMaxSteps);
-    this.settings = cloned;
+    // Merge through defaults so partial/legacy payloads keep new fields.
+    const merged = this.mergePartial(createDefaultSettings(this.appData), next);
+    merged.downloadDir =
+      typeof next.downloadDir === "string" && next.downloadDir.trim()
+        ? next.downloadDir.trim()
+        : merged.downloadDir;
+    merged.agentMaxSteps = normalizeAgentMaxStepsSetting(
+      next.agentMaxSteps ?? merged.agentMaxSteps,
+    );
+    this.settings = structuredClone(merged);
     await writeFileAtomic(
       getSettingsPath(this.appData),
       JSON.stringify(this.settings, null, 2),
@@ -138,6 +145,47 @@ export class SettingsStore {
       agentMaxSteps: normalizeAgentMaxStepsSetting(
         parsed.agentMaxSteps ?? defaults.agentMaxSteps,
       ),
+      agentAutoExtendEnabled:
+        typeof parsed.agentAutoExtendEnabled === "boolean"
+          ? parsed.agentAutoExtendEnabled
+          : defaults.agentAutoExtendEnabled,
+      agentAutoExtendMax: Math.max(
+        0,
+        Math.min(
+          40,
+          Number.isFinite(Number(parsed.agentAutoExtendMax))
+            ? Math.floor(Number(parsed.agentAutoExtendMax))
+            : defaults.agentAutoExtendMax,
+        ),
+      ),
+      agentMaxRunMinutes: Math.max(
+        0,
+        Math.min(
+          240,
+          Number.isFinite(Number(parsed.agentMaxRunMinutes))
+            ? Math.floor(Number(parsed.agentMaxRunMinutes))
+            : defaults.agentMaxRunMinutes,
+        ),
+      ),
+      agentConfirmTimeoutSec: Math.max(
+        0,
+        Math.min(
+          600,
+          Number.isFinite(Number(parsed.agentConfirmTimeoutSec))
+            ? Math.floor(Number(parsed.agentConfirmTimeoutSec))
+            : defaults.agentConfirmTimeoutSec,
+        ),
+      ),
+      webSearchProvider:
+        parsed.webSearchProvider === "duckduckgo" ||
+        parsed.webSearchProvider === "searxng" ||
+        parsed.webSearchProvider === "tavily"
+          ? parsed.webSearchProvider
+          : defaults.webSearchProvider,
+      webSearchApiKey:
+        typeof parsed.webSearchApiKey === "string"
+          ? parsed.webSearchApiKey
+          : defaults.webSearchApiKey,
     };
   }
 

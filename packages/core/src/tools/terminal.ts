@@ -16,11 +16,11 @@ const MAX_BUFFER = 4 * 1024 * 1024;
 /** Active shell child PIDs (for AgentLoop.cancel → kill process tree). */
 const activeShellPids = new Set<number>();
 
-function trackShellPid(pid: number | undefined): void {
+export function trackShellPid(pid: number | undefined): void {
   if (typeof pid === "number" && pid > 0) activeShellPids.add(pid);
 }
 
-function untrackShellPid(pid: number | undefined): void {
+export function untrackShellPid(pid: number | undefined): void {
   if (typeof pid === "number") activeShellPids.delete(pid);
 }
 
@@ -33,7 +33,7 @@ export function cancelActiveTerminals(): void {
   }
 }
 
-function killProcessTree(pid: number): void {
+export function killProcessTree(pid: number): void {
   try {
     if (process.platform === "win32") {
       spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
@@ -338,6 +338,40 @@ export function adaptCommandForWindows(command: string, cwd?: string): string {
     .join(" ");
 }
 
+/** Heuristic hints after a failed shell command. */
+export function diagnoseShellFailure(
+  command: string,
+  exitCode: number,
+  stdout: string,
+  stderr: string,
+): string | null {
+  if (exitCode === 0) return null;
+  const blob = `${stderr}\n${stdout}\n${command}`.toLowerCase();
+  const hints: string[] = [];
+  if (/modulenotfounderror|no module named/.test(blob)) {
+    hints.push("Python: установите модуль (pip install …) или проверьте venv.");
+  }
+  if (/cannot find module|err_module_not_found/.test(blob)) {
+    hints.push("Node: выполните npm/pnpm install или проверьте путь к скрипту.");
+  }
+  if (/is not recognized as an internal or external command|command not found|не является внутренней/.test(blob)) {
+    hints.push("Команда не найдена: проверьте PATH или используйте полный путь / call npm.");
+  }
+  if (/eacces|permission denied|отказано в доступе/.test(blob)) {
+    hints.push("Нет прав доступа к файлу/папке.");
+  }
+  if (/syntaxerror|indentationerror|unexpected token/.test(blob)) {
+    hints.push("Синтаксическая ошибка — исправьте файл через apply_patch/write_file.");
+  }
+  if (/enoent|no such file/.test(blob)) {
+    hints.push("Файл/папка не найдены — проверьте cwd и пути.");
+  }
+  if (!hints.length) {
+    hints.push("Ненулевой exit — прочитайте stderr и исправьте код/команду.");
+  }
+  return `Диагностика:\n- ${hints.join("\n- ")}`;
+}
+
 function formatResult(
   command: string,
   cwd: string,
@@ -352,6 +386,8 @@ function formatResult(
     stdout?.trimEnd() ? stdout.trimEnd() : "",
     stderr?.trimEnd() ? `stderr:\n${stderr.trimEnd()}` : "",
   ].filter(Boolean);
+  const diag = diagnoseShellFailure(command, exitCode, stdout || "", stderr || "");
+  if (diag) parts.push(diag);
   return parts.join("\n");
 }
 
@@ -361,11 +397,13 @@ function execCapture(
   file: string,
   args: string[],
   cwd: string,
+  spawnOpts?: { windowsVerbatimArguments?: boolean },
 ): Promise<ShellResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(file, args, {
       cwd,
       windowsHide: true,
+      windowsVerbatimArguments: spawnOpts?.windowsVerbatimArguments,
       env: {
         ...process.env,
         PYTHONUTF8: "1",
@@ -508,8 +546,11 @@ async function runViaPowerShell(command: string, cwd: string): Promise<ShellResu
 
 async function runViaCmd(command: string, cwd: string): Promise<ShellResult> {
   const comspec = process.env.ComSpec || "cmd.exe";
+  // /s + quoted command + windowsVerbatimArguments: Node must not turn " into \".
   const wrapped = `chcp 65001>nul & ${command}`;
-  return execCapture(comspec, ["/d", "/s", "/c", wrapped], cwd);
+  return execCapture(comspec, ["/d", "/s", "/c", `"${wrapped}"`], cwd, {
+    windowsVerbatimArguments: true,
+  });
 }
 
 /**

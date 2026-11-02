@@ -10,11 +10,18 @@ import { ModelsPage } from "./pages/ModelsPage";
 import { OnboardingWizard } from "./pages/OnboardingWizard";
 import { RuntimePage } from "./pages/RuntimePage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { setUiLanguage } from "./i18n";
 
 export function App() {
   const state = useAppState();
   const [logHint, setLogHint] = useState<string | null>(null);
   const rejectBtnRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (state.settings?.language) {
+      setUiLanguage(state.settings.language === "en" ? "en" : "ru");
+    }
+  }, [state.settings?.language]);
 
   useEffect(() => {
     if (state.pendingConfirm) {
@@ -68,6 +75,7 @@ export function App() {
         generating={state.generating}
         booting={state.booting}
         models={state.models}
+        lang={state.settings?.language}
         onLoadModel={(modelId) => {
           void api
             .loadModel(modelId)
@@ -140,6 +148,7 @@ export function App() {
             onDismiss={state.clearAgentChanges}
             onAccept={(item) => void state.resolveChangeItem(item, true)}
             onReject={(item) => void state.resolveChangeItem(item, false)}
+            onRestore={(item) => void state.restoreChangeItem(item)}
           />
         )}
         {state.pendingConfirm && (

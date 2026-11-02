@@ -1,9 +1,20 @@
-import { BUILTIN_TOOL_SPECS } from "./toolsCatalog.js";
+import {
+  BATCHABLE_TOOL_NAMES,
+  BUILTIN_TOOL_SPECS,
+  MAX_BATCH_TOOLS,
+} from "./toolsCatalog.js";
+
+export interface ParsedToolCall {
+  name: string;
+  args?: Record<string, unknown>;
+}
 
 export interface ParsedAction {
   thought?: string;
   plan?: Array<{ id: string; title: string }>;
-  tool?: { name: string; args?: Record<string, unknown> } | null;
+  tool?: ParsedToolCall | null;
+  /** Parallel read-only batch (max MAX_BATCH_TOOLS). */
+  tools?: ParsedToolCall[] | null;
   final?: string | null;
 }
 
@@ -58,8 +69,35 @@ function hasTool(obj: ParsedAction): boolean {
   return Boolean(obj.tool && typeof obj.tool === "object" && obj.tool.name);
 }
 
+function hasToolsBatch(obj: ParsedAction): boolean {
+  return Array.isArray(obj.tools) && obj.tools.length > 0;
+}
+
 function hasFinal(obj: ParsedAction): boolean {
   return typeof obj.final === "string" && obj.final.trim().length > 0;
+}
+
+/** Normalize and validate a tools[] batch; returns filtered list or error. */
+export function normalizeToolsBatch(
+  tools: ParsedToolCall[] | null | undefined,
+): { ok: true; tools: ParsedToolCall[] } | { ok: false; error: string } {
+  if (!tools?.length) return { ok: false, error: "пустой tools[]" };
+  if (tools.length > MAX_BATCH_TOOLS) {
+    return { ok: false, error: `tools[]: максимум ${MAX_BATCH_TOOLS}` };
+  }
+  const out: ParsedToolCall[] = [];
+  for (const t of tools) {
+    if (!t?.name) continue;
+    if (!BATCHABLE_TOOL_NAMES.has(t.name)) {
+      return {
+        ok: false,
+        error: `tools[] только read-only: ${[...BATCHABLE_TOOL_NAMES].join(", ")} (не ${t.name})`,
+      };
+    }
+    out.push({ name: t.name, args: t.args && typeof t.args === "object" ? t.args : {} });
+  }
+  if (!out.length) return { ok: false, error: "tools[] без валидных элементов" };
+  return { ok: true, tools: out };
 }
 
 /** Reject empty / junk objects that are not real agent actions. */
@@ -69,9 +107,10 @@ export function isValidAgentAction(
 ): obj is ParsedAction {
   if (!obj || typeof obj !== "object") return false;
   if (phase === "plan") {
-    return hasPlan(obj) || hasTool(obj) || hasFinal(obj);
+    // Plan phase requires a plan array — tool/final alone are invalid here.
+    return hasPlan(obj);
   }
-  return hasTool(obj) || hasFinal(obj) || hasPlan(obj);
+  return hasTool(obj) || hasToolsBatch(obj) || hasFinal(obj) || hasPlan(obj);
 }
 
 function tryParse(piece: string): ParsedAction | null {
@@ -192,6 +231,17 @@ export function validateToolArgs(
       error: `Инструмент ${toolName}: не хватает args.${missing.join(", args.")}`,
     };
   }
+  if (toolName === "apply_patch") {
+    const hasPair =
+      typeof safe.oldText === "string" && String(safe.oldText).length > 0;
+    const hasRepl = Array.isArray(safe.replacements) && safe.replacements.length > 0;
+    if (!hasPair && !hasRepl) {
+      return {
+        ok: false,
+        error: "Инструмент apply_patch: нужен oldText/newText или replacements[]",
+      };
+    }
+  }
   return { ok: true, args: safe };
 }
 
@@ -201,6 +251,10 @@ export const PLAN_ADVANCING_TOOLS = new Set([
   "apply_patch",
   "delete_path",
   "run_terminal",
+  "git_commit",
+  "git_push",
+  "git_pull",
+  "git_branch",
   "browser_navigate",
   "browser_click",
   "browser_type",

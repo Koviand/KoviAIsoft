@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 import { IPC, type KoviApi, type MonitorSnapshot } from "@kovi/shared";
 
 const api: KoviApi = {
@@ -47,7 +47,26 @@ const api: KoviApi = {
   openMonitorWindow: () => ipcRenderer.invoke(IPC.openMonitorWindow),
   setMonitorAlwaysOnTop: (flag) => ipcRenderer.invoke(IPC.setMonitorAlwaysOnTop, flag),
   exportSession: (sessionId) => ipcRenderer.invoke(IPC.exportSession, sessionId),
+  exportSessionFolder: (folder) => ipcRenderer.invoke(IPC.exportSessionFolder, folder),
   importSession: (bundle) => ipcRenderer.invoke(IPC.importSession, bundle),
+  openPath: (targetPath) => ipcRenderer.invoke(IPC.openPath, targetPath),
+  listCheckpoints: () => ipcRenderer.invoke(IPC.listCheckpoints),
+  restoreCheckpoint: (checkpointPath) =>
+    ipcRenderer.invoke(IPC.restoreCheckpoint, checkpointPath),
+  verifyGithubToken: () => ipcRenderer.invoke(IPC.verifyGithubToken),
+  addChatAttachment: (sourcePath) => ipcRenderer.invoke(IPC.addChatAttachment, sourcePath),
+  pathsFromFileList: (files) => {
+    const out: string[] = [];
+    for (const f of files || []) {
+      try {
+        const p = webUtils.getPathForFile(f);
+        if (p && p.trim()) out.push(p);
+      } catch {
+        /* ignore */
+      }
+    }
+    return out;
+  },
   getErrorLog: () => ipcRenderer.invoke(IPC.getErrorLog),
   checkMcpHealth: (server) => ipcRenderer.invoke(IPC.checkMcpHealth, server),
   verifyGguf: (modelId) => ipcRenderer.invoke(IPC.verifyGguf, modelId),

@@ -1,7 +1,7 @@
 # NEED2FIX — аудит KoviAIsoft
 
-Дата: 2026-10-30 (Cursor-like stability + anti-loop)  
-Область: params consistency, agent finish/JSON, @picker/rules/diffs, retrieve cache, safeStorage.
+Дата: 2026-11-02 (High+Mid+Verify + audit pass-2)  
+Область: safeStorage secrets, git_pull/askpass, attachments, stop reasons, watcher, resume/goal, git timeout/GCM, cmd quoting, constraint overflow, UI races.
 
 Легенда: **pass** ок · **fix** исправлено в этой волне · **smoke** ручная проверка
 
@@ -14,7 +14,7 @@
 |---------|--------|-----------|
 | init / dispose | pass | AppService lifecycle |
 | getSystemInfo | fix | VRAM registry + pickMaxVram |
-| getSettings / saveSettings | fix | agentMaxSteps 0=без лимита (safety 2000); githubToken via safeStorage |
+| getSettings / saveSettings | fix | agentMaxSteps 0; auto-extend/maxRunMinutes; Tavily key; githubToken safeStorage |
 | onboarding wizard | pass | Движок/папки/тема |
 
 ### Runtime
@@ -48,7 +48,9 @@
 | session params UI | fix | только gen (temp/topP/maxTokens); ctx/ngl — read-only статус |
 | Continue (resume) | fix | после стопа/бюджета без полного replan |
 | @-picker | fix | listProjectMentions + dropdown файлов/@codebase/@agent |
-| export/import session | pass | ipcValidate |
+| export/import session | pass | + exportSessionFolder |
+| pin / pinned-only filter | fix | Chat sidebar |
+| openPath (клик по пути) | fix | shell.openPath / showItemInFolder |
 | chatToken event | pass | |
 
 ### Agent
@@ -56,13 +58,14 @@
 |---------|--------|-----------|
 | startAgent / cancelAgent | pass | stopGeneration alias |
 | resolveConfirmation | pass | |
-| multi-diff review panel | fix | Accept/Reject по файлу поверх confirm |
-| plan/parse/tools | fix | finish window, repair/truncation/identical/non-advancing=4 |
-| budget exhaust | fix | synthesize summary |
-| completeJson | fix | balanced draft emit + schema hint on boost |
+| multi-diff review panel | fix | Accept/Reject + Откатить (checkpoint) |
+| plan/parse/tools | fix | plan↔tool; tools[]≤3 RO; git_*; fingerprint |
+| budget exhaust | fix | incomplete + banner «Продолжить»; auto-extend settings |
+| completeJson | fix | tools → json_schema → grammar → Hermes |
+| checkpoints | fix | `.kovi/checkpoints/<runId>/…` + restore IPC |
 | project memory rules | fix | AGENTS.md + `.cursor/rules` + `.kovi/rules` ≤6k |
 | write → @codebase | fix | await invalidateIndexPaths + invalidateRoot |
-| files/shell/browser/web | pass | sandbox/ssrf/redirect tests |
+| files/shell/browser/web | pass | stderr Диагностика; Tavily+DDG harden |
 
 ### Embeddings / @codebase
 | Функция | Статус | Примечание |
@@ -113,10 +116,25 @@
 
 ---
 
+## Verify 2026-11-02 (shipped)
+
+| Фича | Статус |
+|------|--------|
+| Anti-loop / finishPolicy | pass |
+| Checkpoints + Откатить | pass |
+| git_* (+ git_pull, askpass env) | pass |
+| tools[] batch ≤3 | pass |
+| native tool_calls cascade | pass |
+| Tavily | pass |
+| SQLite migrate | pass |
+| pin / export folder | pass |
+| openPath | pass |
+| Monitor push-only | pass |
+
 ## Открыто / у пользователя
 
-### P0-8. GitHub push без auth
-`gh auth login` / PAT / SSH. (Токен в Движке — только для API Releases llama.cpp, не для git push.)
+### P0-8. GitHub push auth
+PAT в Settings + «Проверить token»; SSH/`gh auth login` по желанию. Askpass больше не пишет PAT в файл.
 
 ---
 
@@ -127,7 +145,11 @@
 | P2-18 | shamefully-hoist |
 | P2-IDE | Monaco / Tab / Cmd+K — вне скоупа (отдельный продукт) |
 
-Закрыто в этой волне: P2-7 (invalidateRoot), P2-10 (safeStorage), P2-17 (Monitor push), P1-14 (balanced JSON draft).
+Закрыто в High+Mid+Verify: hf/Tavily safeStorage, git_pull, attachments, incomplete reasons, confirm timeout, FS watcher, i18n chrome, rejectProseReasoning, loop phases, CI build.
+
+Закрыто в audit pass-2: confirm resolve types; HF save без plaintext secrets; soft-resume goal; plan/repair hard-stop; non-advancing nudge→×3 stop; git timeout+GCM+validation; cmd verbatim args; context-overflow ≠ constraint reject; chat abort race; importSession id remap; sendMessage intent без attachments; secrets before init; updateSession preserves scratchpad; limitBanner/folderDraft UI.
+
+Закрыто в P2 residual: MCP withTimeout+mcpSyncChain; agent вне loadModelChain; tool persist 20KB; assertSessionPatch; Settings dirty/saveSeq; HF recursive+Link; import folder bundle; confirmation timeoutSec; rg `-e`.
 
 ---
 
@@ -138,17 +160,22 @@
 3. Параметры чата: нет ctx/ngl; статус «Загружено: ctx=… ngl=…»
 4. Advanced → gen sync в **активную** сессию
 5. @agent маленькая задача → final
-6. @agent большая → итог без бесконечного repair
+6. @agent большая → итог / banner лимита → «Продолжить»
 7. Stop mid-flight → кнопка «Продолжить»
 8. @-picker файлов + @codebase
 9. @codebase после write агента — свежий текст
 10. AGENTS.md + `.cursor/rules/*.md` подхватываются
-11. Confirm → панель «Изменения агента» Accept/Reject
-12. HF search + download
-13. Движок: embedding MiniLM/LFM
-14. MCP health
-15. Под этот ПК → reload модели
-16. GitHub token сохраняется (desktop safeStorage), не ломает проверку runtime
+11. Confirm → панель «Изменения агента» Accept/Reject/Откатить
+12. Клик по пути в чате → openPath
+13. Pin сессии + «только закреплённые» + экспорт папки
+14. Settings: auto-extend / max run minutes / Tavily
+15. HF search + download
+16. Движок: embedding MiniLM/LFM
+17. MCP health
+18. Под этот ПК → reload модели
+19. GitHub token сохраняется (desktop safeStorage)
+
+Авто: `tests/e2e-agent-smoke.test.ts`, `git-tools`, `sqlite-store`.
 
 ---
 
@@ -156,6 +183,6 @@
 
 - `pnpm build:shared` + `pnpm build:core`
 - `pnpm typecheck` — green
-- `pnpm test` — 191 passed
+- `pnpm test` — e2e/git/sqlite + прежние
 
-*Обновлено при Cursor-like stability.*
+*Обновлено при High+Mid sprint.*

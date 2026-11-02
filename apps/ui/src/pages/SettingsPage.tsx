@@ -38,6 +38,10 @@ export function SettingsPage(props: {
   );
   const [profileHint, setProfileHint] = useState<string | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const dirty = useRef(false);
+  const saveSeq = useRef(0);
+  const draftRef = useRef<AppSettings | null>(props.settings);
+  draftRef.current = draft;
 
   useEffect(() => {
     if (props.models) setModels(props.models);
@@ -62,41 +66,59 @@ export function SettingsPage(props: {
   }
 
   useEffect(() => {
-    setDraft(props.settings);
+    if (!dirty.current) setDraft(props.settings);
   }, [props.settings]);
 
   useEffect(() => {
     return () => {
       if (timer.current) clearTimeout(timer.current);
+      // Flush pending local edits so navigating away does not drop them.
+      if (dirty.current && draftRef.current) {
+        void api.saveSettings(draftRef.current).catch(() => undefined);
+      }
     };
   }, []);
 
   if (!draft) return <div className="stack-page">Загрузка…</div>;
 
   function queueSave(next: AppSettings): void {
+    dirty.current = true;
     setDraft(next);
     if (timer.current) clearTimeout(timer.current);
+    const mySeq = ++saveSeq.current;
     timer.current = setTimeout(() => {
       setSaving(true);
       void api
         .saveSettings(next)
-        .then((saved) => props.setSettings(saved))
+        .then((saved) => {
+          if (mySeq !== saveSeq.current) return;
+          dirty.current = false;
+          props.setSettings(saved);
+          setDraft(saved);
+        })
         .catch((e) => props.setError(e instanceof Error ? e.message : String(e)))
-        .finally(() => setSaving(false));
+        .finally(() => {
+          if (mySeq === saveSeq.current) setSaving(false);
+        });
     }, 400);
   }
 
   async function saveNow(next: AppSettings): Promise<void> {
     if (timer.current) clearTimeout(timer.current);
+    dirty.current = true;
+    const mySeq = ++saveSeq.current;
     setDraft(next);
     setSaving(true);
     try {
       const saved = await api.saveSettings(next);
+      if (mySeq !== saveSeq.current) return;
+      dirty.current = false;
       props.setSettings(saved);
+      setDraft(saved);
     } catch (e) {
       props.setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setSaving(false);
+      if (mySeq === saveSeq.current) setSaving(false);
     }
   }
 
@@ -116,6 +138,20 @@ export function SettingsPage(props: {
         description="Готовая палитра или своя тема (акцент и фон)."
         elevated
       >
+        <label className="field">
+          <span className="field-label">Язык интерфейса / UI language</span>
+          <select
+            className="select"
+            value={s.language || "ru"}
+            onChange={(e) => {
+              const language = e.target.value === "en" ? "en" : "ru";
+              void saveNow({ ...s, language });
+            }}
+          >
+            <option value="ru">Русский</option>
+            <option value="en">English</option>
+          </select>
+        </label>
         <div className="choice-grid">
           {THEME_PRESET_OPTIONS.map(({ id, label }) => (
             <button
@@ -215,6 +251,71 @@ export function SettingsPage(props: {
             max={2000}
           />
         </label>
+        <label className="field" style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <input
+            type="checkbox"
+            checked={s.agentAutoExtendEnabled !== false}
+            onChange={(e) =>
+              void saveNow({ ...s, agentAutoExtendEnabled: e.target.checked })
+            }
+          />
+          <span className="field-label" style={{ margin: 0 }}>
+            Автопродолжение при незакрытом плане
+          </span>
+        </label>
+        <label className="field">
+          <span className="field-label">Таймаут подтверждения (сек, 0 = без авто-отклонения)</span>
+          <input
+            className="input"
+            type="number"
+            value={s.agentConfirmTimeoutSec ?? 120}
+            onChange={(e) => {
+              const n = Number(e.target.value);
+              const clamped = !Number.isFinite(n)
+                ? 120
+                : Math.max(0, Math.min(600, Math.floor(n)));
+              queueSave({ ...s, agentConfirmTimeoutSec: clamped });
+            }}
+            min={0}
+            max={600}
+          />
+        </label>
+        <div className="grid-2">
+          <label className="field">
+            <span className="field-label">Макс. автопродолжений</span>
+            <input
+              className="input"
+              type="number"
+              value={s.agentAutoExtendMax ?? 10}
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                const clamped = !Number.isFinite(n)
+                  ? 10
+                  : Math.max(0, Math.min(40, Math.floor(n)));
+                queueSave({ ...s, agentAutoExtendMax: clamped });
+              }}
+              min={0}
+              max={40}
+            />
+          </label>
+          <label className="field">
+            <span className="field-label">Лимит времени запуска (мин, 0 = выкл)</span>
+            <input
+              className="input"
+              type="number"
+              value={s.agentMaxRunMinutes ?? 30}
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                const clamped = !Number.isFinite(n)
+                  ? 30
+                  : Math.max(0, Math.min(240, Math.floor(n)));
+                queueSave({ ...s, agentMaxRunMinutes: clamped });
+              }}
+              min={0}
+              max={240}
+            />
+          </label>
+        </div>
       </SettingsSection>
 
       <SettingsSection
@@ -282,6 +383,7 @@ export function SettingsPage(props: {
             >
               <option value="duckduckgo">DuckDuckGo</option>
               <option value="searxng">SearXNG</option>
+              <option value="tavily">Tavily</option>
             </select>
           </label>
           <label className="field">
@@ -294,6 +396,17 @@ export function SettingsPage(props: {
             />
           </label>
         </div>
+        <label className="field">
+          <span className="field-label">Tavily API key</span>
+          <input
+            className="input"
+            type="password"
+            autoComplete="off"
+            placeholder="tvly-… (для провайдера Tavily)"
+            value={s.webSearchApiKey || ""}
+            onChange={(e) => queueSave({ ...s, webSearchApiKey: e.target.value })}
+          />
+        </label>
       </SettingsSection>
 
       <SettingsSection

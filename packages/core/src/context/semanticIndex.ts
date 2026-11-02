@@ -55,18 +55,38 @@ export interface SemanticHit {
 type ProgressFn = (msg: string) => void;
 
 const indexJobs = new Map<string, Promise<void>>();
-let globalStatus: CodebaseIndexStatus = {
-  ready: false,
-  indexing: false,
-  root: null,
-  chunkCount: 0,
-  modelId: "",
-  updatedAt: null,
-  error: null,
-};
+/** Per-project status — avoids races when switching projectRoot. */
+const statusByRoot = new Map<string, CodebaseIndexStatus>();
+let lastActiveRootKey: string | null = null;
 
-export function getCodebaseIndexStatus(): CodebaseIndexStatus {
-  return { ...globalStatus };
+function emptyStatus(root: string | null = null): CodebaseIndexStatus {
+  return {
+    ready: false,
+    indexing: false,
+    root,
+    chunkCount: 0,
+    modelId: "",
+    updatedAt: null,
+    error: null,
+  };
+}
+
+function setRootStatus(key: string, next: CodebaseIndexStatus): void {
+  statusByRoot.set(key, { ...next });
+  lastActiveRootKey = key;
+}
+
+export function getCodebaseIndexStatus(projectRoot?: string | null): CodebaseIndexStatus {
+  if (projectRoot) {
+    const key = normalizeRoot(path.resolve(projectRoot));
+    const st = statusByRoot.get(key);
+    return st ? { ...st } : emptyStatus(path.resolve(projectRoot));
+  }
+  if (lastActiveRootKey) {
+    const st = statusByRoot.get(lastActiveRootKey);
+    if (st) return { ...st };
+  }
+  return emptyStatus(null);
 }
 
 function hashRoot(root: string): string {
@@ -333,18 +353,15 @@ export async function ensureProjectIndex(
   opts?: { force?: boolean; onProgress?: ProgressFn },
 ): Promise<CodebaseIndexStatus> {
   const root = path.resolve(projectRoot);
+  const key = normalizeRoot(root);
   if (!fs.existsSync(root)) {
-    globalStatus = {
-      ...globalStatus,
-      ready: false,
-      indexing: false,
-      root,
+    setRootStatus(key, {
+      ...emptyStatus(root),
       error: "Папка проекта не найдена",
-    };
-    return getCodebaseIndexStatus();
+    });
+    return getCodebaseIndexStatus(root);
   }
 
-  const key = normalizeRoot(root);
   const existing = indexJobs.get(key);
   if (existing) {
     await existing;
@@ -357,17 +374,19 @@ export async function ensureProjectIndex(
       !meta ||
       meta.modelId !== spec.metaModelId ||
       meta.dim !== spec.dim;
-    if (!needsAgain) return getCodebaseIndexStatus();
+    if (!needsAgain) return getCodebaseIndexStatus(root);
     // Fall through to a new job (map entry cleared by previous finally).
   }
 
   const job = (async () => {
-    globalStatus = {
-      ...globalStatus,
+    const prev = statusByRoot.get(key) || emptyStatus(root);
+    setRootStatus(key, {
+      ...prev,
       indexing: true,
       root,
       error: null,
-    };
+    });
+    opts?.onProgress?.(`Индексация ${root}…`);
     const dir = indexDirForProject(root);
     try {
       const meta = readMeta(dir);
@@ -386,7 +405,7 @@ export async function ensureProjectIndex(
       }
       const next = readMeta(dir);
       const active = getActiveEmbeddingSpec();
-      globalStatus = {
+      setRootStatus(key, {
         ready: true,
         indexing: false,
         root,
@@ -394,14 +413,19 @@ export async function ensureProjectIndex(
         modelId: next?.modelId || active.metaModelId,
         updatedAt: next?.updatedAt || null,
         error: null,
-      };
+      });
+      opts?.onProgress?.(`Индекс готов (${next?.chunkCount || 0} чанков)`);
     } catch (err) {
-      globalStatus = {
-        ...globalStatus,
+      const prevErr = statusByRoot.get(key) || emptyStatus(root);
+      setRootStatus(key, {
+        ...prevErr,
         ready: false,
         indexing: false,
         error: err instanceof Error ? err.message : String(err),
-      };
+      });
+      opts?.onProgress?.(
+        `Ошибка индекса: ${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       indexJobs.delete(key);
     }
@@ -409,7 +433,7 @@ export async function ensureProjectIndex(
 
   indexJobs.set(key, job);
   await job;
-  return getCodebaseIndexStatus();
+  return getCodebaseIndexStatus(root);
 }
 
 export async function reindexCodebase(
@@ -429,8 +453,8 @@ export async function invalidateIndexPaths(
   const dir = indexDirForProject(root);
   const meta = readMeta(dir);
   if (!meta) {
-    // Lazy: schedule soft ensure without blocking forever
-    void ensureProjectIndex(root);
+    // Sync ensure so retrieve after write sees fresh chunks.
+    await ensureProjectIndex(root);
     return;
   }
   // Touch mtimes map to force incremental on next ensure; also do quick incremental now.

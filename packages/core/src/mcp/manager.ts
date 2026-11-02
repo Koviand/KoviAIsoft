@@ -15,7 +15,22 @@ type McpClient = {
   close: () => Promise<void>;
 };
 
+const MCP_CONNECT_TIMEOUT_MS = 10_000;
+const MCP_CLOSE_TIMEOUT_MS = 3_000;
+
 const requireFromHere = createRequire(__filename);
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label}: timeout ${ms}ms`)), ms);
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
 
 function loadMcp(): {
   Client: new (info: { name: string; version: string }) => McpClient;
@@ -34,6 +49,31 @@ function loadMcp(): {
     StdioClientTransport: stdioMod.StdioClientTransport,
     SSEClientTransport: sseMod.SSEClientTransport,
   };
+}
+
+function buildSafeEnv(cfgEnv?: Record<string, string>): Record<string, string> {
+  const allowKeys = [
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "TEMP",
+    "TMP",
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "LANG",
+    "ComSpec",
+  ];
+  const safeEnv: Record<string, string> = {};
+  for (const k of allowKeys) {
+    const v = process.env[k];
+    if (typeof v === "string") safeEnv[k] = v;
+  }
+  for (const [k, v] of Object.entries(cfgEnv || {})) {
+    if (typeof v === "string") safeEnv[k] = v;
+  }
+  return safeEnv;
 }
 
 export class McpManager {
@@ -55,56 +95,59 @@ export class McpManager {
       return;
     }
 
-    for (const cfg of configs.filter((c) => c.enabled)) {
-      try {
+    const enabled = configs.filter((c) => c.enabled);
+    const settled = await Promise.allSettled(
+      enabled.map(async (cfg) => {
         const client = new sdk.Client({ name: "KoviAIsoft", version: "0.1.0" });
-        if (cfg.transport === "stdio") {
-          if (!cfg.command) continue;
-          // Allowlist env — never pass full process.env (tokens/secrets) (P1-17).
-          const allowKeys = [
-            "PATH",
-            "PATHEXT",
-            "SystemRoot",
-            "TEMP",
-            "TMP",
-            "HOME",
-            "USERPROFILE",
-            "APPDATA",
-            "LOCALAPPDATA",
-            "LANG",
-            "ComSpec",
-          ];
-          const safeEnv: Record<string, string> = {};
-          for (const k of allowKeys) {
-            const v = process.env[k];
-            if (typeof v === "string") safeEnv[k] = v;
+        try {
+          if (cfg.transport === "stdio") {
+            if (!cfg.command) return;
+            const transport = new sdk.StdioClientTransport({
+              command: cfg.command,
+              args: cfg.args || [],
+              env: buildSafeEnv(cfg.env),
+            });
+            await withTimeout(
+              client.connect(transport),
+              MCP_CONNECT_TIMEOUT_MS,
+              `MCP ${cfg.name} connect`,
+            );
+          } else {
+            if (!cfg.url) return;
+            const transport = new sdk.SSEClientTransport(new URL(cfg.url));
+            await withTimeout(
+              client.connect(transport),
+              MCP_CONNECT_TIMEOUT_MS,
+              `MCP ${cfg.name} connect`,
+            );
           }
-          for (const [k, v] of Object.entries(cfg.env || {})) {
-            if (typeof v === "string") safeEnv[k] = v;
+          const listed = await withTimeout(
+            client.listTools(),
+            MCP_CONNECT_TIMEOUT_MS,
+            `MCP ${cfg.name} listTools`,
+          );
+          this.clients.set(cfg.id, client);
+          for (const t of listed.tools || []) {
+            this.tools.push({
+              serverId: cfg.id,
+              name: `mcp_${cfg.id}_${t.name}`,
+              description: t.description,
+              inputSchema: t.inputSchema,
+            });
           }
-          const transport = new sdk.StdioClientTransport({
-            command: cfg.command,
-            args: cfg.args || [],
-            env: safeEnv,
-          });
-          await client.connect(transport);
-        } else {
-          if (!cfg.url) continue;
-          const transport = new sdk.SSEClientTransport(new URL(cfg.url));
-          await client.connect(transport);
+        } catch (err) {
+          console.error(`MCP connect failed for ${cfg.name}`, err);
+          try {
+            await withTimeout(client.close(), MCP_CLOSE_TIMEOUT_MS, `MCP ${cfg.name} close`);
+          } catch {
+            /* ignore */
+          }
         }
-        this.clients.set(cfg.id, client);
-        const listed = await client.listTools();
-        for (const t of listed.tools || []) {
-          this.tools.push({
-            serverId: cfg.id,
-            name: `mcp_${cfg.id}_${t.name}`,
-            description: t.description,
-            inputSchema: t.inputSchema,
-          });
-        }
-      } catch (err) {
-        console.error(`MCP connect failed for ${cfg.name}`, err);
+      }),
+    );
+    for (const r of settled) {
+      if (r.status === "rejected") {
+        console.error("MCP sync worker failed", r.reason);
       }
     }
   }
@@ -124,15 +167,18 @@ export class McpManager {
   }
 
   async closeAll(): Promise<void> {
-    for (const client of this.clients.values()) {
-      try {
-        await client.close();
-      } catch {
-        // ignore
-      }
-    }
+    const clients = [...this.clients.values()];
     this.clients.clear();
     this.tools = [];
+    await Promise.all(
+      clients.map(async (client) => {
+        try {
+          await withTimeout(client.close(), MCP_CLOSE_TIMEOUT_MS, "mcp close");
+        } catch {
+          /* ignore */
+        }
+      }),
+    );
   }
 
   /** Probe one or more MCP servers without mutating the live tool set. */
@@ -163,15 +209,27 @@ export class McpManager {
           const transport = new sdk.StdioClientTransport({
             command: cfg.command,
             args: cfg.args || [],
-            env: { ...process.env, ...(cfg.env || {}) } as Record<string, string>,
+            env: buildSafeEnv(cfg.env),
           });
-          await client.connect(transport);
+          await withTimeout(
+            client.connect(transport),
+            MCP_CONNECT_TIMEOUT_MS,
+            `MCP health ${cfg.name}`,
+          );
         } else {
           if (!cfg.url) throw new Error("Не задан URL SSE");
           const transport = new sdk.SSEClientTransport(new URL(cfg.url));
-          await client.connect(transport);
+          await withTimeout(
+            client.connect(transport),
+            MCP_CONNECT_TIMEOUT_MS,
+            `MCP health ${cfg.name}`,
+          );
         }
-        const listed = await client.listTools();
+        const listed = await withTimeout(
+          client.listTools(),
+          MCP_CONNECT_TIMEOUT_MS,
+          `MCP health ${cfg.name} listTools`,
+        );
         const toolCount = listed.tools?.length || 0;
         results.push({
           serverId: cfg.id,
@@ -192,7 +250,9 @@ export class McpManager {
         });
       } finally {
         try {
-          await client?.close();
+          if (client) {
+            await withTimeout(client.close(), MCP_CLOSE_TIMEOUT_MS, "mcp health close");
+          }
         } catch {
           // ignore
         }

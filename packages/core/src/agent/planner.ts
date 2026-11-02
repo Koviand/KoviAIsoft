@@ -1,8 +1,11 @@
 import type { AgentPlanStep } from "@kovi/shared";
 
+import { PLAN_ADVANCING_TOOLS } from "./parseAction.js";
+
 export const PLAN_MIN_STEPS = 3;
 export const PLAN_MAX_STEPS = 7;
-export const PLAN_PHASE_MAX_ATTEMPTS = 2;
+/** Extra targeted repair before falling back to a template plan. */
+export const PLAN_PHASE_MAX_ATTEMPTS = 3;
 
 export type PlanDraftItem = { id: string; title: string };
 
@@ -86,6 +89,88 @@ export function markCurrentPlanDone(
   return steps.map((s, j) =>
     j === idx ? { ...s, status: "done" as const, detail: detail || s.detail } : s,
   );
+}
+
+/**
+ * Whether a successful tool should advance the current plan checklist item.
+ * Avoids marking "write main file" done after an unrelated run_terminal / browser call.
+ */
+export function shouldAdvancePlanOnTool(
+  step: AgentPlanStep | null,
+  toolName: string,
+  args: Record<string, unknown> = {},
+): boolean {
+  if (!step) return false;
+  if (!PLAN_ADVANCING_TOOLS.has(toolName)) return false;
+
+  const t = step.title.toLowerCase();
+  // Avoid \\b — it does not treat Cyrillic as word chars in JS.
+  const isFinalish =
+    /(итог|final|finish|отчет|отчёт|резюме)/i.test(t) &&
+    !(/(исправ|допис|созда|напис|файл|код)/i.test(t));
+  if (isFinalish) return false;
+
+  // Avoid matching «запускаемый» inside coding titles.
+  const wantsRun =
+    /(запустить|запуск(?!аем)|terminal|shell|cmd|проверь|проверить|тест|run_)/i.test(t);
+  const wantsWrite =
+    /(файл|созда|напис|допис|модул|логик|код|write|patch|исправ|реализ|skeleton|скелет)/i.test(
+      t,
+    );
+  const wantsBrowse = /(браузер|browser|сайт|http|навиг|клик)/i.test(t);
+  const wantsDelete = /(удал|delete)/i.test(t);
+
+  if (wantsRun && !wantsWrite) return toolName === "run_terminal";
+  if (wantsBrowse && !wantsWrite) return toolName.startsWith("browser_");
+  if (wantsDelete && !wantsWrite) return toolName === "delete_path";
+
+  if (wantsWrite) {
+    if (toolName === "write_file" || toolName === "apply_patch") {
+      const pathRaw = String(args.path ?? "")
+        .replace(/\\/g, "/")
+        .toLowerCase();
+      if (pathRaw) {
+        const base = pathRaw.split("/").pop() || "";
+        if (base && t.includes(base)) return true;
+        const parts = pathRaw.split("/").filter((p) => p.length > 2);
+        if (parts.some((p) => t.includes(p))) return true;
+      }
+      return true;
+    }
+    // Shell during a coding step only advances if the step also mentions run/check.
+    if (toolName === "run_terminal" && wantsRun) return true;
+    return false;
+  }
+
+  // Generic / exploratory step titles: any advancing tool is OK.
+  return true;
+}
+
+/** Detect soft resume / continue prompts that should keep the frozen plan. */
+export function isSoftResumeGoal(freshGoal: string, previousGoal: string): boolean {
+  const fresh = freshGoal.toLowerCase().trim();
+  const prev = previousGoal.toLowerCase().trim();
+  if (!fresh || !prev) return false;
+  if (fresh === prev) return true;
+  if (fresh.includes(prev.slice(0, Math.min(80, prev.length)))) return true;
+  if (
+    /^(продолж|докажи|добь|ещё|еще|добавь|допиши|исправ|почин|resume|continue|keep going)/i.test(
+      fresh,
+    )
+  ) {
+    return true;
+  }
+  // Shared significant tokens (≥4 chars) — "tetris score" after "make tetris".
+  const tokenize = (s: string) =>
+    s
+      .split(/[^\p{L}\p{N}]+/u)
+      .map((x) => x.toLowerCase())
+      .filter((x) => x.length >= 4);
+  const a = new Set(tokenize(prev));
+  const b = tokenize(fresh);
+  if (!a.size || !b.length) return false;
+  const overlap = b.filter((t) => a.has(t)).length;
+  return overlap >= 1 && overlap / Math.max(b.length, 1) >= 0.4;
 }
 
 /** Mark the first pending step failed (after a tool error). */

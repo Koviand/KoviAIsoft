@@ -3,6 +3,7 @@ import type {
   AgentEvent,
   AppSettings,
   AppView,
+  ChatAttachment,
   ChatMessage,
   ChatSession,
   CodebaseIndexStatus,
@@ -68,7 +69,13 @@ export const IPC = {
   openMonitorWindow: "kovi:openMonitorWindow",
   setMonitorAlwaysOnTop: "kovi:setMonitorAlwaysOnTop",
   exportSession: "kovi:exportSession",
+  exportSessionFolder: "kovi:exportSessionFolder",
   importSession: "kovi:importSession",
+  openPath: "kovi:openPath",
+  restoreCheckpoint: "kovi:restoreCheckpoint",
+  listCheckpoints: "kovi:listCheckpoints",
+  verifyGithubToken: "kovi:verifyGithubToken",
+  addChatAttachment: "kovi:addChatAttachment",
   getErrorLog: "kovi:getErrorLog",
   checkMcpHealth: "kovi:checkMcpHealth",
   verifyGguf: "kovi:verifyGguf",
@@ -152,6 +159,7 @@ export interface SendMessageRequest {
   content: string;
   useAgent?: boolean;
   params?: Partial<GenerationParams>;
+  attachments?: ChatAttachment[];
 }
 
 export interface ResolveConfirmationRequest {
@@ -204,7 +212,9 @@ export interface KoviApi {
   unloadModel(): Promise<void>;
   listSessions(): Promise<ChatSession[]>;
   createSession(mode?: "chat" | "agent", title?: string): Promise<ChatSession>;
-  updateSession(session: ChatSession): Promise<ChatSession>;
+  updateSession(
+    session: import("./ipcValidate.js").SessionPatch | (Partial<ChatSession> & { id: string }),
+  ): Promise<ChatSession>;
   deleteSession(sessionId: string): Promise<void>;
   getMessages(sessionId: string): Promise<ChatMessage[]>;
   /** @deprecated Prefer sendMessage. */
@@ -224,7 +234,22 @@ export interface KoviApi {
   openMonitorWindow(): Promise<void>;
   setMonitorAlwaysOnTop(flag: boolean): Promise<boolean>;
   exportSession(sessionId: string): Promise<SessionExportBundle>;
+  exportSessionFolder(folder: string): Promise<SessionExportBundle[]>;
   importSession(bundle: SessionExportBundle): Promise<ChatSession>;
+  /** Open file/folder in OS (explorer / default app). */
+  openPath(targetPath: string): Promise<{ ok: boolean; error?: string }>;
+  restoreCheckpoint(checkpointPath: string): Promise<string>;
+  listCheckpoints(): Promise<
+    Array<{ runId: string; relPath: string; checkpointPath: string; mtimeMs: number }>
+  >;
+  verifyGithubToken(): Promise<{ ok: boolean; login?: string; error?: string }>;
+  /** Copy a local file into app attachments dir and return ChatAttachment meta. */
+  addChatAttachment(sourcePath: string): Promise<ChatAttachment>;
+  /**
+   * Resolve OS paths for File objects from drag-drop (Electron webUtils).
+   * Sync; no IPC. Returns only non-empty paths.
+   */
+  pathsFromFileList(files: File[]): string[];
   getErrorLog(): Promise<string>;
   checkMcpHealth(server?: McpServerConfig): Promise<McpHealthResult[]>;
   verifyGguf(modelId: string): Promise<LocalModel>;

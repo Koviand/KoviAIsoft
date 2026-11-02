@@ -1,5 +1,5 @@
 import { v4 as uuid } from "uuid";
-import type { ChatMessage, GenerationParams } from "@kovi/shared";
+import type { ChatAttachment, ChatMessage, GenerationParams } from "@kovi/shared";
 import type { RuntimeManager } from "../runtime/manager.js";
 import type { Store } from "../db/store.js";
 import { condenseTranscript } from "../context/summarize.js";
@@ -10,9 +10,11 @@ import {
 } from "./contextBudget.js";
 import {
   buildAgentActionGbnf,
+  buildOpenAiTools,
   nextConstraintModeAfterFailure,
   pickConstraintMode,
   responseFormatJsonSchema,
+  toolCallsToActionJson,
   type ConstraintMode,
 } from "../agent/actionSchema.js";
 import {
@@ -50,7 +52,6 @@ export class ChatEngine {
   private abort: AbortController | null = null;
   private onToken?: TokenHandler;
   private activeSessionId: string | null = null;
-
   constructor(runtime: RuntimeManager, store: Store) {
     this.runtime = runtime;
     this.store = store;
@@ -83,6 +84,7 @@ export class ChatEngine {
     userContent: string,
     params: GenerationParams,
     systemPrompt: string,
+    attachments?: ChatAttachment[],
   ): Promise<ChatMessage> {
     let base: string;
     try {
@@ -92,7 +94,11 @@ export class ChatEngine {
     }
 
     this.stop();
-    this.store.addMessage(sessionId, { role: "user", content: userContent });
+    this.store.addMessage(sessionId, {
+      role: "user",
+      content: userContent,
+      attachments: attachments?.length ? attachments : undefined,
+    });
     const history = this.store.getMessages(sessionId);
     // Skip orphan tool rows from agent turns — plain chat has no tool_calls protocol.
     const ctx = Math.max(512, params.context || 4096);
@@ -289,8 +295,8 @@ export class ChatEngine {
         if ((err as Error).name === "AbortError" || signal.aborted) {
           // fall through
         } else {
-          this.abort = null;
-          this.activeSessionId = null;
+          if (this.abort?.signal === signal) this.abort = null;
+          if (this.activeSessionId === sessionId) this.activeSessionId = null;
           throw err;
         }
       }
@@ -311,8 +317,8 @@ export class ChatEngine {
           thinking: thinking || undefined,
         });
       }
-      this.abort = null;
-      this.activeSessionId = null;
+      if (this.abort?.signal === signal) this.abort = null;
+      if (this.activeSessionId === sessionId) this.activeSessionId = null;
       throw new Error("Отменено");
     }
 
@@ -331,8 +337,8 @@ export class ChatEngine {
       content: finalContent,
       thinking: thinking || undefined,
     });
-    this.abort = null;
-    this.activeSessionId = null;
+    if (this.abort?.signal === signal) this.abort = null;
+    if (this.activeSessionId === sessionId) this.activeSessionId = null;
     return assistant;
   }
 
@@ -383,7 +389,10 @@ export class ChatEngine {
         max_tokens: tokenBudget,
         stream,
       };
-      if (mode === "json_schema") {
+      if (mode === "tools") {
+        body.tools = buildOpenAiTools(opts?.extraToolNames || []);
+        body.tool_choice = "auto";
+      } else if (mode === "json_schema") {
         body.response_format = responseFormatJsonSchema(opts?.extraToolNames || []);
       } else if (mode === "grammar") {
         body.grammar = buildAgentActionGbnf();
@@ -419,6 +428,11 @@ export class ChatEngine {
       let content = "";
       let reasoning = "";
       let truncated = false;
+      /** Accumulator for native OpenAI tool_calls deltas (tools mode). */
+      const toolAcc = new Map<
+        number,
+        { id?: string; name: string; arguments: string }
+      >();
       /** Only emit balanced JSON prefixes to the UI (avoid mid-token broken drafts). */
       let draftEmitted = 0;
       const reader = res.body.getReader();
@@ -455,6 +469,11 @@ export class ChatEngine {
                   reasoning_content?: string;
                   reasoning?: string;
                   text?: string;
+                  tool_calls?: Array<{
+                    index?: number;
+                    id?: string;
+                    function?: { name?: string; arguments?: string };
+                  }>;
                 };
               }>;
             };
@@ -464,10 +483,20 @@ export class ChatEngine {
             // Never mix thinking into JSON content — models often stream reasoning first.
             const reason = delta?.reasoning_content || delta?.reasoning || "";
             if (reason) reasoning += reason;
+            if (mode === "tools" && delta?.tool_calls?.length) {
+              for (const tc of delta.tool_calls) {
+                const idx = typeof tc.index === "number" ? tc.index : 0;
+                const cur = toolAcc.get(idx) || { name: "", arguments: "" };
+                if (tc.id) cur.id = tc.id;
+                if (tc.function?.name) cur.name += tc.function.name;
+                if (tc.function?.arguments) cur.arguments += tc.function.arguments;
+                toolAcc.set(idx, cur);
+              }
+            }
             const piece = delta?.content || delta?.text || "";
             if (!piece) continue;
             content += piece;
-            emitBalancedDraft();
+            if (mode !== "tools") emitBalancedDraft();
           } catch {
             // ignore bad chunk
           }
@@ -489,9 +518,22 @@ export class ChatEngine {
       if (signal.aborted) {
         throw new Error("Отменено");
       }
+      // Prefer assembled native tool_calls when present.
+      if (mode === "tools" && toolAcc.size > 0) {
+        const ordered = [...toolAcc.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .map(([, v]) => ({
+            function: { name: v.name, arguments: v.arguments || "{}" },
+          }));
+        content = toolCallsToActionJson(ordered);
+        if (sessionId) {
+          this.onToken?.({ sessionId, text: content, draft: true });
+        }
+      }
+
       // Fallback if stream content empty — try reasoning, then non-stream once.
       if (!content.trim()) {
-        if (reasoning.trim()) {
+        if (reasoning.trim() && mode !== "tools") {
           content = reasoning;
           if (sessionId) {
             this.onToken?.({ sessionId, text: content, draft: true });
@@ -516,38 +558,57 @@ export class ChatEngine {
                 content?: string;
                 reasoning_content?: string;
                 reasoning?: string;
+                tool_calls?: Array<{
+                  function?: { name?: string; arguments?: string };
+                }>;
               };
               finish_reason?: string;
             }>;
           };
           const choice = json.choices?.[0];
-          content = pickCompletionText(choice?.message);
+          if (mode === "tools" && choice?.message?.tool_calls?.length) {
+            content = toolCallsToActionJson(choice.message.tool_calls);
+          } else {
+            content = pickCompletionText(choice?.message);
+          }
           if (choice?.finish_reason === "length") truncated = true;
           if (sessionId && content) {
             this.onToken?.({ sessionId, text: content, draft: true });
           }
         }
       }
-      const cleaned = preferBalancedJson(stripThinkTags(content));
+      const cleaned =
+        mode === "tools" && content.trim().startsWith("{")
+          ? content.trim()
+          : preferBalancedJson(stripThinkTags(content));
       // Do not throw here — caller boosts max_tokens first, then may throw.
       return { content: cleaned, truncated, mode };
     };
 
     const markConstraintFailure = (mode: ConstraintMode): void => {
+      if (mode === "tools") this.runtime.toolsOk = false;
       if (mode === "json_schema") this.runtime.jsonSchemaOk = false;
       if (mode === "grammar") this.runtime.grammarOk = false;
     };
 
     const markConstraintSuccess = (mode: ConstraintMode): void => {
+      if (mode === "tools") this.runtime.toolsOk = true;
       if (mode === "json_schema") this.runtime.jsonSchemaOk = true;
       if (mode === "grammar") this.runtime.grammarOk = true;
     };
 
     const isConstraintReject = (err: unknown): boolean => {
+      // Context overflow / truncation are not "unsupported constraint" — do not disable modes.
+      if (isContextOverflowError(err) || isLlmTruncatedError(err)) return false;
       const status = (err as { status?: number })?.status;
-      if (status === 400 || status === 422) return true;
       const msg = err instanceof Error ? err.message : String(err);
-      return /json_schema|response_format|grammar|unknown field|invalid.*schema/i.test(msg);
+      if (isContextOverflowError(msg) || isContextOverflowError(`Ошибка: ${msg}`)) {
+        return false;
+      }
+      if (status === 400 || status === 422) return true;
+      return /json_schema|response_format|grammar|tool_choice|unknown field|invalid.*schema|tools?\b/i.test(
+        msg,
+      );
     };
 
     const resolveAttempt = async (
@@ -555,6 +616,7 @@ export class ChatEngine {
       msgs: OpenAiMessage[],
     ): Promise<string> => {
       let mode = pickConstraintMode({
+        toolsOk: this.runtime.toolsOk,
         jsonSchemaOk: this.runtime.jsonSchemaOk,
         grammarOk: this.runtime.grammarOk,
       });

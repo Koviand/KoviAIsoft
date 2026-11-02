@@ -113,11 +113,20 @@ export function annotateHfFilesWithFit(
 }
 
 export async function listHfGgufFiles(modelId: string): Promise<HfFile[]> {
-  const res = await fetch(`${HF_API}/models/${modelId}/tree/main`, {
-    headers: { "User-Agent": "KoviAIsoft" },
-  });
-  if (!res.ok) throw new Error(`HF tree failed: ${res.status}`);
-  const data = (await res.json()) as Array<{ path: string; size?: number; type?: string }>;
+  type TreeItem = { path: string; size?: number; type?: string };
+  const data: TreeItem[] = [];
+  let url: string | null = `${HF_API}/models/${modelId}/tree/main?recursive=true`;
+  while (url) {
+    const res = await fetch(url, {
+      headers: { "User-Agent": "KoviAIsoft" },
+    });
+    if (!res.ok) throw new Error(`HF tree failed: ${res.status}`);
+    const page = (await res.json()) as TreeItem[];
+    data.push(...page);
+    const link = res.headers.get("link") || "";
+    const next = /<([^>]+)>;\s*rel="next"/.exec(link);
+    url = next?.[1] || null;
+  }
   const files: HfFile[] = [];
   for (const item of data) {
     if (item.type && item.type !== "file") continue;
@@ -129,8 +138,6 @@ export async function listHfGgufFiles(modelId: string): Promise<HfFile[]> {
       isGguf,
     });
   }
-
-  // Also flatten nested via recursive? HF tree/main is often flat enough for GGUF repos.
   return files.sort((a, b) => a.path.localeCompare(b.path));
 }
 

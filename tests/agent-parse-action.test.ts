@@ -81,9 +81,19 @@ describe("actionSchema", () => {
   });
 
   it("pickConstraintMode and fallback chain", () => {
-    expect(pickConstraintMode({ jsonSchemaOk: null, grammarOk: null })).toBe("json_schema");
-    expect(pickConstraintMode({ jsonSchemaOk: false, grammarOk: null })).toBe("grammar");
-    expect(pickConstraintMode({ jsonSchemaOk: false, grammarOk: false })).toBe("none");
+    expect(pickConstraintMode({ toolsOk: null, jsonSchemaOk: null, grammarOk: null })).toBe(
+      "tools",
+    );
+    expect(pickConstraintMode({ toolsOk: false, jsonSchemaOk: null, grammarOk: null })).toBe(
+      "json_schema",
+    );
+    expect(pickConstraintMode({ toolsOk: false, jsonSchemaOk: false, grammarOk: null })).toBe(
+      "grammar",
+    );
+    expect(pickConstraintMode({ toolsOk: false, jsonSchemaOk: false, grammarOk: false })).toBe(
+      "none",
+    );
+    expect(nextConstraintModeAfterFailure("tools")).toBe("json_schema");
     expect(nextConstraintModeAfterFailure("json_schema")).toBe("grammar");
     expect(nextConstraintModeAfterFailure("grammar")).toBe("none");
     expect(nextConstraintModeAfterFailure("none")).toBeNull();

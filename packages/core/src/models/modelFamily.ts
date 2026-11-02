@@ -28,9 +28,21 @@ export type AgentFamilyTuning = {
   rejectProseReasoning: boolean;
 };
 
-export function agentTuningForFamily(family: ModelFamily): AgentFamilyTuning {
+/** Heuristic: tiny / unknown GGUF names get stricter JSON enforcement. */
+export function looksLikeSmallOrUnknownModel(nameOrPath: string): boolean {
+  const s = nameOrPath.toLowerCase();
+  if (/\b(0\.5b|0\.6b|1b|1\.5b|1\.7b|2b|3b|3\.5b|4b)\b/.test(s)) return true;
+  if (/tiny|mini(?!lm)|nano|smol/.test(s)) return true;
+  return detectModelFamily(nameOrPath) === "other";
+}
+
+export function agentTuningForFamily(
+  family: ModelFamily,
+  nameOrPath = "",
+): AgentFamilyTuning {
   const jsonNudge =
-    "Отвечай ТОЛЬКО одним JSON-объектом {\"thought\",\"tool\"|null,\"final\"|null} без markdown и без XML tool_call.";
+    "Отвечай ТОЛЬКО одним JSON-объектом {\"thought\",\"tool\"|null,\"tools\"?,\"final\"|null} без markdown и без XML tool_call.";
+  const weak = nameOrPath ? looksLikeSmallOrUnknownModel(nameOrPath) : family === "other";
   switch (family) {
     case "deepseek":
       return {
@@ -46,14 +58,14 @@ export function agentTuningForFamily(family: ModelFamily): AgentFamilyTuning {
         temperatureCap: 0.35,
         minP: 0.05,
         jsonNudge,
-        rejectProseReasoning: false,
+        rejectProseReasoning: weak,
       };
     case "lfm":
       return {
         temperatureCap: 0.35,
         minP: 0.08,
         jsonNudge,
-        rejectProseReasoning: false,
+        rejectProseReasoning: weak,
       };
     case "llama":
     case "mistral":
@@ -62,14 +74,15 @@ export function agentTuningForFamily(family: ModelFamily): AgentFamilyTuning {
         temperatureCap: 0.4,
         minP: 0.05,
         jsonNudge,
-        rejectProseReasoning: false,
+        rejectProseReasoning: weak,
       };
     default:
       return {
-        temperatureCap: 0.4,
+        temperatureCap: 0.35,
         minP: 0.05,
-        jsonNudge,
-        rejectProseReasoning: false,
+        jsonNudge:
+          jsonNudge + " Никакого обычного текста вне JSON — иначе шаг будет отклонён.",
+        rejectProseReasoning: true,
       };
   }
 }

@@ -1,19 +1,21 @@
 import fs from "node:fs";
 import path from "node:path";
-import { app, BrowserWindow, dialog, ipcMain, nativeImage } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, shell } from "electron";
 import type { AppSettings, McpServerConfig } from "@kovi/shared";
 import {
   IPC,
   assertAppSettingsDeep,
   assertResolveConfirmation,
   assertSessionExportBundle,
+  assertSessionPatch,
 } from "@kovi/shared";
 import { AppService, getAppDataDir, setAppDataDir } from "@kovi/core";
 import {
   isSecureTokenAvailable,
-  loadGithubTokenSecure,
-  saveGithubTokenSecure,
+  loadSecret,
+  saveSecret,
 } from "./secureToken";
+import { verifyGithubToken } from "@kovi/core";
 
 let mainWindow: BrowserWindow | null = null;
 let monitorWindow: BrowserWindow | null = null;
@@ -94,6 +96,7 @@ function assertSendRequest(req: unknown): {
   content: string;
   useAgent?: boolean;
   params?: unknown;
+  attachments?: import("@kovi/shared").ChatAttachment[];
 } {
   if (!req || typeof req !== "object") throw new Error("Некорректный запрос");
   const r = req as Record<string, unknown>;
@@ -103,11 +106,15 @@ function assertSendRequest(req: unknown): {
   if (typeof r.content !== "string") {
     throw new Error("content должен быть строкой");
   }
+  const attachments = Array.isArray(r.attachments)
+    ? (r.attachments as import("@kovi/shared").ChatAttachment[])
+    : undefined;
   return {
     sessionId: r.sessionId,
     content: r.content,
     useAgent: typeof r.useAgent === "boolean" ? r.useAgent : undefined,
     params: r.params,
+    attachments,
   };
 }
 
@@ -335,28 +342,67 @@ function registerIpc(svc: AppService): void {
   ipcMain.handle(IPC.getSystemInfo, () => svc.getSystemInfo());
   ipcMain.handle(IPC.getSettings, () => {
     const s = svc.getSettings();
-    const secure = loadGithubTokenSecure(getAppDataDir());
-    if (secure != null && secure !== "") {
-      return { ...s, githubToken: secure };
-    }
-    return s;
+    const appData = getAppDataDir();
+    const github = loadSecret(appData, "github-token");
+    const hf = loadSecret(appData, "hf-token");
+    const web = loadSecret(appData, "websearch-api-key");
+    return {
+      ...s,
+      githubToken: github || s.githubToken || "",
+      hfToken: hf || s.hfToken || "",
+      webSearchApiKey: web || s.webSearchApiKey || "",
+    };
   });
   ipcMain.handle(IPC.saveSettings, (_e, settings) => {
     const shaped = assertSettingsShape(settings);
-    const token = typeof shaped.githubToken === "string" ? shaped.githubToken : "";
     const appData = getAppDataDir();
-    let stored = shaped;
-    if (isSecureTokenAvailable() && saveGithubTokenSecure(appData, token)) {
-      // Keep settings.json free of plaintext token when OS encryption works.
-      stored = { ...shaped, githubToken: token ? "__secure__" : "" };
-      svc.setGithubTokenOverride(token || null);
-    } else {
-      svc.setGithubTokenOverride(null);
-    }
+    const github = typeof shaped.githubToken === "string" ? shaped.githubToken : "";
+    const hf = typeof shaped.hfToken === "string" ? shaped.hfToken : "";
+    const web = typeof shaped.webSearchApiKey === "string" ? shaped.webSearchApiKey : "";
+    let stored = { ...shaped };
+    const applySecret = (
+      id: "github-token" | "hf-token" | "websearch-api-key",
+      value: string,
+      setOverride: (v: string | null) => void,
+      assign: (placeholder: string) => void,
+    ) => {
+      if (!isSecureTokenAvailable()) {
+        setOverride(null);
+        return;
+      }
+      if (saveSecret(appData, id, value)) {
+        assign(value ? "__secure__" : "");
+        if (value === "__secure__") {
+          setOverride(loadSecret(appData, id));
+        } else {
+          setOverride(value || null);
+        }
+      } else if (value && value !== "__secure__") {
+        // Encryption failed — keep plaintext in settings + memory override.
+        setOverride(value);
+      } else {
+        setOverride(value === "__secure__" ? loadSecret(appData, id) : null);
+      }
+    };
+    applySecret("github-token", github, (v) => svc.setGithubTokenOverride(v), (p) => {
+      stored.githubToken = p;
+    });
+    applySecret("hf-token", hf, (v) => svc.setHfTokenOverride(v), (p) => {
+      stored.hfToken = p;
+    });
+    applySecret("websearch-api-key", web, (v) => svc.setWebSearchApiKeyOverride(v), (p) => {
+      stored.webSearchApiKey = p;
+    });
     return svc.saveSettings(stored).then((saved) => ({
       ...saved,
-      githubToken: token,
+      githubToken: github === "__secure__" ? loadSecret(appData, "github-token") || "" : github,
+      hfToken: hf === "__secure__" ? loadSecret(appData, "hf-token") || "" : hf,
+      webSearchApiKey: web === "__secure__" ? loadSecret(appData, "websearch-api-key") || "" : web,
     }));
+  });
+  ipcMain.handle(IPC.verifyGithubToken, async () => {
+    const s = svc.getEffectiveSettings();
+    return verifyGithubToken(s.githubToken || "");
   });
   ipcMain.handle(IPC.getRuntimeStatus, () => svc.getRuntimeStatus());
   ipcMain.handle(IPC.detectRuntimeAsset, (_e, backend) => svc.detectRuntimeAsset(backend));
@@ -394,7 +440,9 @@ function registerIpc(svc: AppService): void {
   ipcMain.handle(IPC.unloadModel, () => svc.unloadModel());
   ipcMain.handle(IPC.listSessions, () => svc.listSessions());
   ipcMain.handle(IPC.createSession, (_e, mode, title) => svc.createSession(mode, title));
-  ipcMain.handle(IPC.updateSession, (_e, session) => svc.updateSession(session));
+  ipcMain.handle(IPC.updateSession, (_e, session) =>
+    svc.updateSession(assertSessionPatch(session)),
+  );
   ipcMain.handle(IPC.deleteSession, (_e, sessionId) => svc.deleteSession(sessionId));
   ipcMain.handle(IPC.getMessages, (_e, sessionId) => svc.getMessages(sessionId));
   // Deprecated thin wrappers — UI uses sendMessage / stopGeneration.
@@ -409,6 +457,7 @@ function registerIpc(svc: AppService): void {
       .sendMessage(r.sessionId, r.content, {
         useAgent: r.useAgent,
         params: r.params as never,
+        attachments: r.attachments,
       })
       .catch((err) => {
         const message = err instanceof Error ? err.message : String(err);
@@ -465,9 +514,43 @@ function registerIpc(svc: AppService): void {
     return monitorWindow.isAlwaysOnTop();
   });
   ipcMain.handle(IPC.exportSession, (_e, sessionId: string) => svc.exportSession(sessionId));
+  ipcMain.handle(IPC.exportSessionFolder, (_e, folder: string) => {
+    if (typeof folder !== "string" || !folder.trim()) throw new Error("folder обязателен");
+    return svc.exportSessionFolder(folder.trim());
+  });
   ipcMain.handle(IPC.importSession, (_e, bundle) =>
     svc.importSession(assertSessionExportBundle(bundle)),
   );
+  ipcMain.handle(IPC.openPath, async (_e, targetPath: string) => {
+    if (typeof targetPath !== "string" || !targetPath.trim()) {
+      return { ok: false, error: "path обязателен" };
+    }
+    try {
+      const resolved = svc.resolveOpenPath(targetPath.trim());
+      const st = await import("node:fs").then((fs) => fs.promises.stat(resolved));
+      if (st.isDirectory()) {
+        const err = await shell.openPath(resolved);
+        return err ? { ok: false, error: err } : { ok: true };
+      }
+      shell.showItemInFolder(resolved);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+  ipcMain.handle(IPC.listCheckpoints, () => svc.listCheckpoints());
+  ipcMain.handle(IPC.restoreCheckpoint, (_e, checkpointPath: string) => {
+    if (typeof checkpointPath !== "string" || !checkpointPath.trim()) {
+      throw new Error("checkpointPath обязателен");
+    }
+    return svc.restoreCheckpoint(checkpointPath.trim());
+  });
+  ipcMain.handle(IPC.addChatAttachment, (_e, sourcePath: string) => {
+    if (typeof sourcePath !== "string" || !sourcePath.trim()) {
+      throw new Error("sourcePath обязателен");
+    }
+    return svc.addChatAttachment(sourcePath.trim());
+  });
   ipcMain.handle(IPC.getErrorLog, () => svc.getErrorLog());
   ipcMain.handle(IPC.checkMcpHealth, (_e, server) => svc.checkMcpHealth(assertMcpServer(server)));
   ipcMain.handle(IPC.verifyGguf, (_e, modelId: string) => svc.verifyGguf(modelId));
@@ -508,9 +591,15 @@ if (!gotLock) {
   app.whenReady().then(async () => {
     configurePortablePaths();
     service = new AppService();
+    // Secrets before init — auto runtime update / MCP need GitHub token when present.
+    const appData = getAppDataDir();
+    const securedGh = loadSecret(appData, "github-token");
+    if (securedGh) service.setGithubTokenOverride(securedGh);
+    const securedHf = loadSecret(appData, "hf-token");
+    if (securedHf) service.setHfTokenOverride(securedHf);
+    const securedWeb = loadSecret(appData, "websearch-api-key");
+    if (securedWeb) service.setWebSearchApiKeyOverride(securedWeb);
     await service.init();
-    const secured = loadGithubTokenSecure(getAppDataDir());
-    if (secured) service.setGithubTokenOverride(secured);
     registerIpc(service);
     await createWindow();
 

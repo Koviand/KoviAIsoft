@@ -1,3 +1,5 @@
+export type TextReplaceHunk = { oldText: string; newText: string };
+
 /** Literal replace (no $& / $$ interpretation) with CRLF/LF tolerance. */
 export function applyTextReplace(current: string, oldText: string, newText: string): string {
   if (!oldText) {
@@ -30,4 +32,67 @@ export function applyTextReplace(current: string, oldText: string, newText: stri
   }
 
   throw new Error("Фрагмент для замены не найден");
+}
+
+/** Apply several search/replace hunks sequentially (multi-hunk patch). */
+export function applyTextReplaceHunks(
+  current: string,
+  hunks: TextReplaceHunk[],
+): string {
+  if (!hunks.length) {
+    throw new Error("apply_patch: пустой список replacements");
+  }
+  let next = current;
+  for (let i = 0; i < hunks.length; i++) {
+    const h = hunks[i]!;
+    try {
+      next = applyTextReplace(next, h.oldText, h.newText);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Хунк ${i + 1}/${hunks.length}: ${msg}`);
+    }
+  }
+  return next;
+}
+
+/**
+ * Normalize apply_patch args into ordered hunks.
+ * Supports `replacements: [{oldText,newText},…]` or classic oldText/newText,
+ * and delimiter `<<<HUNK>>>` inside oldText/newText pairs of equal count.
+ */
+export function normalizePatchHunks(args: {
+  oldText?: unknown;
+  newText?: unknown;
+  replacements?: unknown;
+}): TextReplaceHunk[] {
+  if (Array.isArray(args.replacements)) {
+    const hunks: TextReplaceHunk[] = [];
+    for (const raw of args.replacements) {
+      if (!raw || typeof raw !== "object") continue;
+      const o = raw as Record<string, unknown>;
+      const oldText = String(o.oldText ?? o.old ?? "");
+      const newText = String(o.newText ?? o.new ?? "");
+      if (!oldText) continue;
+      hunks.push({ oldText, newText });
+    }
+    if (hunks.length) return hunks;
+  }
+
+  const oldText = typeof args.oldText === "string" ? args.oldText : "";
+  const newText = typeof args.newText === "string" ? args.newText : "";
+  if (!oldText) return [];
+
+  const sep = "<<<HUNK>>>";
+  if (oldText.includes(sep) || newText.includes(sep)) {
+    const olds = oldText.split(sep);
+    const news = newText.split(sep);
+    if (olds.length !== news.length) {
+      throw new Error(
+        `apply_patch: число hunks в oldText (${olds.length}) ≠ newText (${news.length})`,
+      );
+    }
+    return olds.map((o, i) => ({ oldText: o, newText: news[i] ?? "" }));
+  }
+
+  return [{ oldText, newText }];
 }

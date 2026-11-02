@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   AppSettings,
   CodebaseIndexStatus,
@@ -54,6 +54,7 @@ export function RuntimePage(props: {
   const [indexStatus, setIndexStatus] = useState<CodebaseIndexStatus | null>(null);
   const [indexBusy, setIndexBusy] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
+  const githubSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     return api.onRuntimeProgress(setProgress);
@@ -334,13 +335,45 @@ export function RuntimePage(props: {
                 onChange={(e) => {
                   const next = { ...s, githubToken: e.target.value };
                   props.setSettings(next);
-                  void api.saveSettings(next).then(props.setSettings).catch(() => undefined);
+                  if (githubSaveTimer.current) clearTimeout(githubSaveTimer.current);
+                  githubSaveTimer.current = setTimeout(() => {
+                    void api.saveSettings(next).then(props.setSettings).catch(() => undefined);
+                  }, 600);
+                }}
+                onBlur={() => {
+                  if (githubSaveTimer.current) {
+                    clearTimeout(githubSaveTimer.current);
+                    githubSaveTimer.current = null;
+                  }
+                  void api.saveSettings(s).then(props.setSettings).catch(() => undefined);
                 }}
               />
               <span className="muted" style={{ display: "block", marginTop: 6, fontSize: "0.78rem" }}>
-                В desktop-сборке токен по возможности хранится через OS safeStorage, не в открытом
-                settings.json. Для git push нужна отдельная авторизация (`gh auth login` / SSH).
+                В desktop-сборке токен хранится через OS safeStorage. Для git push/pull агент
+                передаёт его через env askpass (не пишет PAT в файл). Также можно SSH (`gh auth login`).
               </span>
+              <button
+                type="button"
+                className="btn"
+                style={{ marginTop: 8 }}
+                onClick={() => {
+                  void api
+                    .verifyGithubToken()
+                    .then((r) => {
+                      if (r.ok) props.setError(null);
+                      props.setError(
+                        r.ok
+                          ? `GitHub token OK (${r.login || "user"})`
+                          : `GitHub token: ${r.error || "ошибка"}`,
+                      );
+                    })
+                    .catch((e) =>
+                      props.setError(e instanceof Error ? e.message : String(e)),
+                    );
+                }}
+              >
+                Проверить GitHub token
+              </button>
             </label>
           </div>
         )}

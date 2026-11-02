@@ -77,7 +77,7 @@ describe("toolFingerprint", () => {
     const a = toolFingerprint("write_file", { path: "a.ts", content: "x".repeat(200) });
     const b = toolFingerprint("write_file", { path: "a.ts", content: "x".repeat(200) });
     expect(a).toBe(b);
-    expect(a).toContain("#200");
+    expect(a).toMatch(/h:[a-f0-9]+#200/);
   });
 });
 

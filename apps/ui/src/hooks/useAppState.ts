@@ -87,15 +87,26 @@ export function useAppState() {
       .finally(() => setBooting(false));
   }, [refresh]);
 
+  // Push-style status: refresh on focus / visibility; light fallback poll (was 3s).
   useEffect(() => {
-    const t = setInterval(() => {
+    const refreshStatus = () => {
       api.getRuntimeStatus().then(setRuntime).catch(() => undefined);
       api
         .getStatusBar()
         .then((bar) => setStatus({ ...bar, view: viewRef.current }))
         .catch(() => undefined);
-    }, 3000);
-    return () => clearInterval(t);
+    };
+    const onVis = () => {
+      if (document.visibilityState === "visible") refreshStatus();
+    };
+    window.addEventListener("focus", refreshStatus);
+    document.addEventListener("visibilitychange", onVis);
+    const t = setInterval(refreshStatus, 12_000);
+    return () => {
+      window.removeEventListener("focus", refreshStatus);
+      document.removeEventListener("visibilitychange", onVis);
+      clearInterval(t);
+    };
   }, []);
 
   useEffect(() => {
@@ -145,29 +156,71 @@ export function useAppState() {
         setViewRaw("chat");
         setGenerating(true);
       }
-      if (ev.type === "tool_call" && (ev.name === "write_file" || ev.name === "apply_patch")) {
+      // Track file tools as pending until tool_result — never mark applied on tool_call alone.
+      if (
+        ev.type === "tool_call" &&
+        (ev.name === "write_file" || ev.name === "apply_patch") &&
+        (ev.status === "running" || ev.status === "awaiting_confirm" || !ev.status)
+      ) {
         const pathGuess = typeof ev.args.path === "string" ? ev.args.path : ev.name;
         setAgentChanges((cur) => {
-          if (cur.some((c) => c.path === pathGuess && c.status === "pending")) return cur;
-          if (cur.some((c) => c.path === pathGuess && c.status === "applied")) {
-            return cur.map((c) =>
-              c.path === pathGuess ? { ...c, summary: `${ev.name}…`, status: "applied" } : c,
-            );
+          if (cur.some((c) => c.confirmationId && c.path === pathGuess && c.status === "pending")) {
+            return cur;
           }
           const item: AgentChangeItem = {
             id: ev.callId,
             path: pathGuess,
-            summary: ev.name,
-            status: "applied",
+            summary:
+              ev.status === "awaiting_confirm"
+                ? `${ev.name} (ожидает подтверждения)`
+                : `${ev.name}…`,
+            status: "pending",
           };
-          return [...cur.filter((c) => c.path !== pathGuess), item];
+          return [
+            ...cur.filter(
+              (c) =>
+                !(c.path === pathGuess && (c.status === "pending" || c.id === ev.callId)),
+            ),
+            item,
+          ];
         });
+      }
+      if (ev.type === "tool_result" && !ev.isError) {
+        const cpMatch = /checkpoint:\s*(\S+)/i.exec(ev.result || "");
+        const checkpointPath = cpMatch?.[1];
+        setAgentChanges((cur) =>
+          cur.map((c) => {
+            if (c.id === ev.callId) {
+              return {
+                ...c,
+                status: "applied",
+                summary: c.summary,
+                checkpointPath: checkpointPath || c.checkpointPath,
+              };
+            }
+            if (c.status === "accepted") {
+              return {
+                ...c,
+                status: "applied",
+                checkpointPath: checkpointPath || c.checkpointPath,
+              };
+            }
+            return c;
+          }),
+        );
       }
       if (ev.type === "confirmation_timeout") {
         setPendingConfirm((cur) => (cur?.id === ev.confirmationId ? null : cur));
         setConfirmBusy(false);
         setError(
-          `Подтверждение «${ev.toolName}» истекло (120 с) — действие отклонено`,
+          `Подтверждение «${ev.toolName}» истекло (${ev.timeoutSec ?? 120} с) — действие отклонено`,
+        );
+      }
+      if (ev.type === "incomplete") {
+        setError(
+          ev.reason === "no_progress"
+            ? `Незавершено: почти не было прогресса`
+            : `Лимит безопасности — можно нажать «Продолжить»`,
         );
       }
       if (ev.type === "step_start" || ev.type === "tool_call" || ev.type === "plan") {
@@ -247,6 +300,38 @@ export function useAppState() {
     [confirmBusy],
   );
 
+  const restoreChangeItem = useCallback(
+    async (item: AgentChangeItem) => {
+      if (confirmBusy) return;
+      setConfirmBusy(true);
+      try {
+        let cp = item.checkpointPath;
+        if (!cp) {
+          const list = await api.listCheckpoints();
+          const hit = list.find(
+            (c) =>
+              c.relPath.replace(/\\/g, "/") === item.path.replace(/\\/g, "/") ||
+              c.checkpointPath.endsWith(item.path.replace(/\\/g, "/")),
+          );
+          cp = hit?.checkpointPath;
+        }
+        if (!cp) throw new Error("Checkpoint для этого файла не найден");
+        await api.restoreCheckpoint(cp);
+        setError(null);
+        setAgentChanges((cur) =>
+          cur.map((c) =>
+            c.id === item.id ? { ...c, summary: `${c.summary} · откат` } : c,
+          ),
+        );
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setConfirmBusy(false);
+      }
+    },
+    [confirmBusy],
+  );
+
   useEffect(() => {
     if (!activeSessionId) {
       setMessages([]);
@@ -315,6 +400,7 @@ export function useAppState() {
     confirmBusy,
     resolvePendingConfirm,
     resolveChangeItem,
+    restoreChangeItem,
     error,
     setError,
     booting,

@@ -21,6 +21,7 @@
     "@modelcontextprotocol/sdk": "^1.6.1",
     "extract-zip": "^2.0.1",
     "playwright": "^1.50.1",
+    "sql.js": "^1.15.2",
     "uuid": "^11.0.5",
     "zod": "^3.24.1"
   },

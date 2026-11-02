@@ -1,12 +1,16 @@
+import { createHash } from "node:crypto";
 import type { AgentPlanStep } from "@kovi/shared";
 import type { AgentWorkingMemory } from "./workingMemory.js";
 
 /** Hard caps so large tasks cannot burn the whole step budget on repair/loops. */
 export const AGENT_REPAIR_MAX = 3;
+/** After this many consecutive repair failures → soft-stop (no_progress). */
+export const AGENT_REPAIR_HARD_STOP = AGENT_REPAIR_MAX * 2;
 export const AGENT_TRUNCATION_MAX = 3;
 export const AGENT_IDENTICAL_TOOL_MAX = 2;
-/** Tighter for 3–7B GGUF — leave finish window sooner. */
+/** Nudge after this many scout tools; hard-stop at HARD_STOP. */
 export const AGENT_NON_ADVANCING_MAX = 4;
+export const AGENT_NON_ADVANCING_HARD_STOP = AGENT_NON_ADVANCING_MAX * 3;
 
 /** User turn to resume after stop / budget without full replan. */
 export function buildAgentResumePrompt(goalHint?: string): string {
@@ -73,13 +77,29 @@ export function agentHasPendingWork(opts: {
   return false;
 }
 
+function digestString(s: string): string {
+  return createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16);
+}
+
+/**
+ * Stable fingerprint for identical-tool detection.
+ * Long strings use content hash (not prefix+len) so iterative write_file edits don't collide.
+ */
 export function toolFingerprint(toolName: string, args: Record<string, unknown>): string {
   const keys = Object.keys(args).sort();
   const compact: Record<string, unknown> = {};
   for (const k of keys) {
     const v = args[k];
     if (typeof v === "string" && v.length > 120) {
-      compact[k] = `${v.slice(0, 80)}…#${v.length}`;
+      compact[k] = `h:${digestString(v)}#${v.length}`;
+    } else if (Array.isArray(v)) {
+      try {
+        const raw = JSON.stringify(v);
+        compact[k] =
+          raw.length > 120 ? `h:${digestString(raw)}#${raw.length}` : v;
+      } catch {
+        compact[k] = "[array]";
+      }
     } else {
       compact[k] = v;
     }

@@ -11,9 +11,18 @@ import {
   realPathSafe,
   resolveAgentPath,
 } from "./sandbox.js";
-import { applyTextReplace } from "./textReplace.js";
+import { saveFileCheckpoint } from "./checkpoints.js";
+import {
+  applyTextReplaceHunks,
+  normalizePatchHunks,
+} from "./textReplace.js";
 
-export { applyTextReplace } from "./textReplace.js";
+export { applyTextReplace, applyTextReplaceHunks, normalizePatchHunks } from "./textReplace.js";
+export {
+  listCheckpoints,
+  restoreCheckpoint,
+  saveFileCheckpoint,
+} from "./checkpoints.js";
 
 export { runTerminal } from "./terminal.js";
 
@@ -86,6 +95,7 @@ export async function writeFileTool(
   filePath: string,
   content: string,
   settings: AppSettings,
+  opts?: { checkpointRunId?: string },
 ): Promise<string> {
   if (typeof content !== "string") {
     throw new Error("write_file: content должен быть строкой с полным текстом файла");
@@ -94,9 +104,18 @@ export async function writeFileTool(
     throw new Error("write_file: пустой content запрещён — передайте полный код файла");
   }
   const resolved = resolveToolPath(filePath, settings);
+  let checkpointNote = "";
+  if (opts?.checkpointRunId) {
+    const cp = await saveFileCheckpoint({
+      projectRoot: settings.projectRoot,
+      targetAbs: resolved,
+      runId: opts.checkpointRunId,
+    });
+    if (cp) checkpointNote = `\ncheckpoint: ${cp}`;
+  }
   await fsp.mkdir(path.dirname(resolved), { recursive: true });
   await writeFileAtomic(resolved, content);
-  return `Written ${content.length} chars to ${resolved}`;
+  return `Written ${content.length} chars to ${resolved}${checkpointNote}`;
 }
 
 export async function applyPatchTool(
@@ -104,14 +123,26 @@ export async function applyPatchTool(
   oldText: string,
   newText: string,
   settings: AppSettings,
+  replacements?: unknown,
+  opts?: { checkpointRunId?: string },
 ): Promise<string> {
-  if (typeof oldText !== "string" || typeof newText !== "string") {
-    throw new Error("apply_patch: oldText и newText должны быть строками");
+  const hunks = normalizePatchHunks({ oldText, newText, replacements });
+  if (!hunks.length) {
+    throw new Error("apply_patch: укажите oldText/newText или replacements[]");
   }
   const { path: resolved, text: current } = await readFileRawForPatch(filePath, settings);
-  const next = applyTextReplace(current, oldText, newText);
+  let checkpointNote = "";
+  if (opts?.checkpointRunId) {
+    const cp = await saveFileCheckpoint({
+      projectRoot: settings.projectRoot,
+      targetAbs: resolved,
+      runId: opts.checkpointRunId,
+    });
+    if (cp) checkpointNote = `\ncheckpoint: ${cp}`;
+  }
+  const next = applyTextReplaceHunks(current, hunks);
   await writeFileAtomic(resolved, next);
-  return `Patched ${resolved} (${current.length} → ${next.length} chars)`;
+  return `Patched ${resolved} (${hunks.length} hunk${hunks.length === 1 ? "" : "s"}, ${current.length} → ${next.length} chars)${checkpointNote}`;
 }
 
 /** Symlink or Windows junction / mount-point (reparse) — do not recurse into target. */
@@ -220,7 +251,9 @@ export async function searchFiles(
         "!node_modules",
         "--glob",
         "!.git",
+        "-e",
         query,
+        "--",
         resolvedRoot,
       ],
       { windowsHide: true, timeout: 15000, maxBuffer: 2 * 1024 * 1024 },

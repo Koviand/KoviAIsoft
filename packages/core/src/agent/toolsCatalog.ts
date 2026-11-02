@@ -32,15 +32,26 @@ export const BUILTIN_TOOL_SPECS = [
   },
   {
     name: "apply_patch",
-    description: "Заменить фрагмент в файле",
+    description:
+      "Заменить фрагмент(ы) в файле. Один hunk: oldText+newText; несколько: replacements:[{oldText,newText},…]",
     parameters: {
       type: "object",
       properties: {
         path: { type: "string" },
         oldText: { type: "string" },
         newText: { type: "string" },
+        replacements: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              oldText: { type: "string" },
+              newText: { type: "string" },
+            },
+          },
+        },
       },
-      required: ["path", "oldText", "newText"],
+      required: ["path"],
     },
   },
   {
@@ -62,6 +73,76 @@ export const BUILTIN_TOOL_SPECS = [
         path: { type: "string" },
       },
       required: ["query", "path"],
+    },
+  },
+  {
+    name: "git_status",
+    description: "git status --porcelain -b в корне проекта",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "git_diff",
+    description: "git diff (опционально staged / path)",
+    parameters: {
+      type: "object",
+      properties: {
+        staged: { type: "boolean" },
+        path: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "git_log",
+    description: "git log --oneline (n ≤ 50)",
+    parameters: {
+      type: "object",
+      properties: { n: { type: "number" } },
+    },
+  },
+  {
+    name: "git_branch",
+    description: "Список / create / checkout ветки (action: list|create|checkout, name)",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string" },
+        name: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "git_commit",
+    description: "git add + commit -m (paths опционально; иначе add -A). Требует подтверждения.",
+    parameters: {
+      type: "object",
+      properties: {
+        message: { type: "string" },
+        paths: { type: "array", items: { type: "string" } },
+      },
+      required: ["message"],
+    },
+  },
+  {
+    name: "git_push",
+    description: "git push (remote/ref опционально). Требует подтверждения. Token из настроек GitHub.",
+    parameters: {
+      type: "object",
+      properties: {
+        remote: { type: "string" },
+        ref: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "git_pull",
+    description:
+      "git pull --ff-only (remote/ref опционально). Только fast-forward; конфликты не решает. Требует подтверждения.",
+    parameters: {
+      type: "object",
+      properties: {
+        remote: { type: "string" },
+        ref: { type: "string" },
+      },
     },
   },
   {
@@ -152,9 +233,23 @@ const CORE_TOOL_NAMES = new Set([
   "write_file",
   "apply_patch",
   "search",
+  "git_status",
+  "git_diff",
   "run_terminal",
   "finish",
 ]);
+
+/** Read-only tools allowed in parallel `tools[]` batch (max 3). */
+export const BATCHABLE_TOOL_NAMES = new Set([
+  "list_dir",
+  "read_file",
+  "search",
+  "git_status",
+  "git_diff",
+  "git_log",
+]);
+
+export const MAX_BATCH_TOOLS = 3;
 
 export function toolsPromptBlock(
   extraTools: Array<{ name: string; description?: string }>,
@@ -169,21 +264,25 @@ export function toolsPromptBlock(
     ...extras.map((t) => `- ${t.name}: ${t.description || "MCP tool"}`),
   ];
   const rules = opts?.compact
-    ? `ТОЛЬКО один JSON {"thought","plan?","tool"|null,"final"|null} — без prose/markdown вокруг. Сначала plan (3–7, tool=null), потом один tool/шаг; plan не переписывать. Код — write_file кусками. Windows/cmd без bash.`
+    ? `ТОЛЬКО один JSON {"thought","plan?","tool"|null,"tools"?,"final"|null}. Сначала plan (3–7), потом tool или tools[]≤3 (list/read/search/git_status|diff|log). Код — write_file. Windows/cmd.`
     : `Формат ответа на каждом шаге — строго ОДИН JSON-объект без текста до/после (сервер может требовать schema):
 {
   "thought": "краткие рассуждения",
   "plan": [{"id":"1","title":"..."}],
   "tool": {"name":"tool_name","args":{...}} | null,
+  "tools": [{"name":"read_file","args":{...}}, ...] | null,
   "final": "текст пользователю если закончили" | null
 }
-Запрещены XML/Hermes tool_call, markdown-обёртки и bash-heredoc — только JSON с tool.name из списка ниже.
+Для разведки можно tools[] (до 3): list_dir, read_file, search, git_status, git_diff, git_log — параллельно.
+Мутации (write_file/apply_patch/shell/browser/git_commit/git_push/git_pull) — только одиночный tool.
+Предпочитай JSON; Hermes tool_call допускается как запасной разбор.
 
 Двухфазный режим:
 1) ФАЗА ПЛАНА (первый ответ): только plan из 3–7 коротких пунктов, tool=null, final=null.
-2) ФАЗА ИСПОЛНЕНИЯ: план УЖЕ зафиксирован системой — НЕ меняй plan. Один tool за шаг по current_step. final только когда пункты сделаны (или остался «итог»).
+2) ФАЗА ИСПОЛНЕНИЯ: план УЖЕ зафиксирован системой — НЕ меняй plan. Один tool (или batch tools[]) за шаг. final только когда пункты сделаны (или остался «итог»).
 
 Правила исполнения:
+- Git: используй git_status/git_diff/git_log/git_commit/git_pull/git_push вместо run_terminal для git.
 - Если нужно создать/изменить код или файлы — ОБЯЗАТЕЛЬНО write_file / apply_patch. Не клади длинный код в final.
 - Не пихай всю игру/приложение в один JSON-шаг: ~80–150 строк за write_file, дальше модули отдельными шагами.
 - list_dir / read_file не считаются выполнением кодинг-задачи. final/finish только после реальной записи рабочих файлов.

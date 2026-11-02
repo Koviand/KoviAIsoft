@@ -10,15 +10,25 @@ import type {
 import { DEFAULT_GENERATION_PARAMS } from "@kovi/shared";
 import { writeFileAtomic, writeFileAtomicSync } from "../fsAtomic.js";
 import { ensureDir } from "../paths.js";
-
-interface DbShape {
-  sessions: ChatSession[];
-  messages: Record<string, ChatMessage[]>;
-}
+import {
+  loadSqliteDb,
+  migrateJsonToSqlite,
+  persistSqliteBinary,
+  type DbShape,
+} from "./sqliteBackend.js";
 
 const AGENT_SYSTEM =
   "Ты локальный ассистент KoviAIsoft с доступом к инструментам. Когда включён режим агента — сначала составь план, затем вызывай инструменты. Работай только с разрешёнными путями. Отвечай на русском, если пользователь пишет по-русски.";
 const CHAT_SYSTEM = "Ты полезный локальный ассистент. Отвечай на языке пользователя.";
+
+/** Cap persisted tool payloads so huge terminal/read_file dumps do not freeze persist. */
+export const MAX_PERSISTED_TOOL_CHARS = 20_000;
+
+function clampToolContent(role: string, content: string): string {
+  if (role !== "tool" || content.length <= MAX_PERSISTED_TOOL_CHARS) return content;
+  const omitted = content.length - MAX_PERSISTED_TOOL_CHARS;
+  return `${content.slice(0, MAX_PERSISTED_TOOL_CHARS)}\n…[обрезано ${omitted} симв.]`;
+}
 
 function normalizeSession(session: ChatSession): ChatSession {
   const toolsEnabled =
@@ -28,61 +38,116 @@ function normalizeSession(session: ChatSession): ChatSession {
   return {
     ...session,
     toolsEnabled,
-    // Keep mode in sync for older builds reading the store.
     mode: toolsEnabled ? "agent" : "chat",
+    pinned: Boolean(session.pinned),
   };
 }
 
+type SqlDb = Awaited<ReturnType<typeof loadSqliteDb>>["db"];
+
 export class Store {
-  private filePath: string;
+  private jsonPath: string;
+  private sqlitePath: string;
   private data: DbShape;
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
   private dirty = false;
-  /** When true, refuse to overwrite disk with empty/new state (I/O failure on load). */
   private blockPersist = false;
+  private db: SqlDb | null = null;
+  private sqlReady: Promise<void>;
 
   constructor(appData: string) {
     ensureDir(appData);
-    this.filePath = path.join(appData, "store.json");
-    this.data = this.load();
+    this.jsonPath = path.join(appData, "store.json");
+    this.sqlitePath = path.join(appData, "store.sqlite");
+    this.data = this.loadJsonFallback();
+    this.sqlReady = this.initSqlite();
+  }
+
+  /** Await SQLite init / JSON→SQLite migration (call from AppService.init). */
+  async ready(): Promise<void> {
+    await this.sqlReady;
   }
 
   private emptyDb(): DbShape {
     return { sessions: [], messages: {} };
   }
 
-  private load(): DbShape {
-    if (!fs.existsSync(this.filePath)) {
-      return this.emptyDb();
-    }
-    let raw: string;
-    try {
-      raw = fs.readFileSync(this.filePath, "utf8");
-    } catch (err) {
-      // I/O failure: keep empty in-memory but never wipe the on-disk file.
-      this.blockPersist = true;
-      console.error("[store] failed to read store.json — persist disabled", err);
+  private loadJsonFallback(): DbShape {
+    if (!fs.existsSync(this.jsonPath)) {
       return this.emptyDb();
     }
     try {
+      const raw = fs.readFileSync(this.jsonPath, "utf8");
       const parsed = JSON.parse(raw) as DbShape;
       return {
         sessions: (parsed.sessions || []).map(normalizeSession),
         messages: parsed.messages || {},
       };
-    } catch {
-      // Corrupt JSON: backup then start fresh (safe to persist).
-      try {
-        const bak = `${this.filePath}.bak`;
-        fs.copyFileSync(this.filePath, bak);
-      } catch {
-        // ignore backup failure
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      // Corrupt JSON: backup and allow rewrite. Unreadable path (EISDIR/EACCES): block persist.
+      if (code === "EISDIR" || code === "EACCES" || code === "EPERM") {
+        this.blockPersist = true;
+        console.error("[store] failed to read store.json — persist disabled", err);
+        return this.emptyDb();
       }
+      try {
+        fs.copyFileSync(this.jsonPath, `${this.jsonPath}.bak`);
+      } catch {
+        /* ignore backup failure */
+      }
+      console.error("[store] corrupt store.json — backed up to .bak, starting empty", err);
       return this.emptyDb();
     }
   }
 
-  /** Sync write — used by close/flush. */
+  private async initSqlite(): Promise<void> {
+    try {
+      const { db } = await loadSqliteDb(this.sqlitePath);
+      this.db = db;
+      const migrated = migrateJsonToSqlite(this.jsonPath, this.sqlitePath, db);
+      if (migrated) {
+        this.data = {
+          sessions: migrated.sessions.map(normalizeSession),
+          messages: migrated.messages,
+        };
+        this.blockPersist = false;
+        return;
+      }
+      if (fs.existsSync(this.sqlitePath)) {
+        const { readDbShape } = await import("./sqliteBackend.js");
+        const fromSql = readDbShape(db);
+        const sqlHas =
+          fromSql.sessions.length > 0 || Object.keys(fromSql.messages).length > 0;
+        if (!sqlHas) return;
+        // Prefer whichever file is newer so a failed SQLite write cannot wipe fresher JSON.
+        let preferSql = true;
+        try {
+          if (fs.existsSync(this.jsonPath)) {
+            const jsonM = fs.statSync(this.jsonPath).mtimeMs;
+            const sqlM = fs.statSync(this.sqlitePath).mtimeMs;
+            preferSql = sqlM >= jsonM;
+          }
+        } catch {
+          preferSql = true;
+        }
+        if (preferSql) {
+          this.data = {
+            sessions: fromSql.sessions.map(normalizeSession),
+            messages: fromSql.messages,
+          };
+        } else {
+          // Keep JSON-loaded this.data; rewrite SQLite on next persist.
+          this.dirty = true;
+          this.persist();
+        }
+      }
+    } catch (err) {
+      console.error("[store] sqlite init failed — using JSON only", err);
+      this.db = null;
+    }
+  }
+
   private persistSync(): void {
     if (this.blockPersist) return;
     if (this.persistTimer) {
@@ -90,10 +155,20 @@ export class Store {
       this.persistTimer = null;
     }
     this.dirty = false;
-    writeFileAtomicSync(this.filePath, JSON.stringify(this.data, null, 2));
+    try {
+      writeFileAtomicSync(this.jsonPath, JSON.stringify(this.data, null, 2));
+    } catch {
+      /* keep trying sqlite */
+    }
+    if (this.db) {
+      try {
+        persistSqliteBinary(this.sqlitePath, this.db, this.data);
+      } catch (err) {
+        console.error("[store] sqlite persist failed", err);
+      }
+    }
   }
 
-  /** Debounced persist to avoid blocking the agent tool loop on every message. */
   private persist(): void {
     if (this.blockPersist) return;
     this.dirty = true;
@@ -103,10 +178,9 @@ export class Store {
       if (!this.dirty || this.blockPersist) return;
       this.dirty = false;
       try {
-        writeFileAtomicSync(this.filePath, JSON.stringify(this.data, null, 2));
+        this.persistSync();
       } catch {
         this.dirty = true;
-        // Retry once shortly after I/O failure.
         setTimeout(() => this.persist(), 250);
       }
     }, 40);
@@ -159,7 +233,6 @@ export class Store {
     if (!session) return null;
     session.toolsEnabled = enabled;
     session.mode = enabled ? "agent" : "chat";
-    // Refresh system prompt only if it still looks like a stock prompt.
     const stock =
       session.systemPrompt === CHAT_SYSTEM || session.systemPrompt === AGENT_SYSTEM;
     if (stock) {
@@ -185,7 +258,7 @@ export class Store {
     const full: ChatMessage = {
       id: message.id || uuid(),
       role: message.role,
-      content: message.content,
+      content: clampToolContent(message.role, message.content),
       thinking: message.thinking,
       toolCallId: message.toolCallId,
       toolName: message.toolName,
@@ -214,6 +287,14 @@ export class Store {
     };
   }
 
+  exportSessionFolder(folder: string): SessionExportBundle[] {
+    const name = folder.trim();
+    const ids = this.data.sessions
+      .filter((s) => (s.folder || "").trim() === name)
+      .map((s) => s.id);
+    return ids.map((id) => this.exportSession(id));
+  }
+
   importSession(bundle: SessionExportBundle): ChatSession {
     if (!bundle?.session || !Array.isArray(bundle.messages)) {
       throw new Error("Некорректный файл экспорта сессии");
@@ -230,25 +311,44 @@ export class Store {
       updatedAt: now,
     });
     this.data.sessions.unshift(session);
-    this.data.messages[id] = bundle.messages.map((m) => ({
-      ...m,
-      id: m.id || uuid(),
-      createdAt: m.createdAt || now,
-    }));
+    const idMap = new Map<string, string>();
+    for (const m of bundle.messages) {
+      if (m?.id) idMap.set(m.id, uuid());
+    }
+    this.data.messages[id] = bundle.messages.map((m) => {
+      const newId = (m.id && idMap.get(m.id)) || uuid();
+      const parentId =
+        m.parentId && idMap.has(m.parentId) ? idMap.get(m.parentId)! : undefined;
+      return {
+        ...m,
+        id: newId,
+        parentId,
+        createdAt: m.createdAt || now,
+      };
+    });
     this.persist();
     return session;
   }
 
   close(): void {
     this.persistSync();
+    try {
+      this.db?.close();
+    } catch {
+      /* ignore */
+    }
   }
 
   async flush(): Promise<void> {
+    await this.ready();
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
     }
     this.dirty = false;
-    await writeFileAtomic(this.filePath, JSON.stringify(this.data, null, 2));
+    await writeFileAtomic(this.jsonPath, JSON.stringify(this.data, null, 2));
+    if (this.db) {
+      persistSqliteBinary(this.sqlitePath, this.db, this.data);
+    }
   }
 }

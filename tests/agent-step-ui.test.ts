@@ -10,7 +10,9 @@ describe("agent step UI details", () => {
     expect(isSoftAgentStepDetail("repair")).toBe(true);
     expect(isSoftAgentStepDetail("final_blocked")).toBe(true);
     expect(isSoftAgentStepDetail("write_file ok")).toBe(false);
-    expect(isSoftAgentStepDetail("План: 5 шагов")).toBe(false);
+    // Plan freeze is soft — checklist advances via `plan` event, not step_done.
+    expect(isSoftAgentStepDetail("План: 5 шагов")).toBe(true);
+    expect(isSoftAgentStepDetail("identical tool")).toBe(true);
   });
 
   it("localizes no tool for the checklist", () => {

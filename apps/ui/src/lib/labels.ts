@@ -46,7 +46,7 @@ export function statusRu(status: string): string {
  */
 export function isSoftAgentStepDetail(detail: string | undefined): boolean {
   if (!detail) return true;
-  return /^(no tool|repair|truncated|final_blocked|identical tool|non-advancing|Жду план|finish window)/i.test(
+  return /^(no tool|repair|truncation|final_blocked|identical tool|non-advancing|Жду план|План:|План по шаблону|finish window|truncation →|deny|blocked)/i.test(
     detail.trim(),
   );
 }
@@ -56,12 +56,18 @@ export function agentStepDetailRu(detail: string | undefined): string | undefine
   const t = detail.trim();
   if (/^no tool$/i.test(t)) return "модель не вызвала tool";
   if (/^repair$/i.test(t)) return "починка JSON";
-  if (/^truncated$/i.test(t)) return "ответ обрезан";
+  if (/^truncation$/i.test(t)) return "ответ обрезан";
+  if (/truncation\s*→\s*final/i.test(t)) return "обрезка → итог";
   if (/^final_blocked$/i.test(t)) return "final рано";
   if (/^identical tool$/i.test(t)) return "повтор tool";
   if (/non-advancing/i.test(t)) return "только разведка";
   if (/finish window/i.test(t)) return "только итог";
+  if (/^Жду план$/i.test(t)) return "жду план";
+  if (/^План по шаблону$/i.test(t)) return "план по шаблону";
+  if (/^План:/i.test(t)) return t.replace(/^План:/i, "план:");
+  if (/^finish$/i.test(t)) return "finish";
   if (/^final$/i.test(t)) return "итог";
+  if (/отклон/i.test(t)) return t;
   if (/ ok$/i.test(t)) return t.replace(/ ok$/i, " · ок");
   return t;
 }

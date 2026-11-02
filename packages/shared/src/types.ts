@@ -351,11 +351,29 @@ export type AgentEvent =
   | { type: "plan"; steps: AgentPlanStep[] }
   | { type: "step_start"; stepId: string }
   | { type: "step_done"; stepId: string; detail?: string }
-  | { type: "tool_call"; name: string; args: Record<string, unknown>; callId: string }
+  | {
+      type: "tool_call";
+      name: string;
+      args: Record<string, unknown>;
+      callId: string;
+      /** Lifecycle: proposed → awaiting_confirm → running (done via tool_result). */
+      status?: "proposed" | "awaiting_confirm" | "running";
+    }
   | { type: "tool_result"; callId: string; result: string; isError?: boolean }
   | { type: "confirmation_required"; confirmation: AgentConfirmation }
   /** Auto-rejected because the user did not answer within the confirm timeout. */
-  | { type: "confirmation_timeout"; confirmationId: string; toolName: string }
+  | {
+      type: "confirmation_timeout";
+      confirmationId: string;
+      toolName: string;
+      timeoutSec: number;
+    }
+  /** Soft stop: budget / no progress — not a hard failure. */
+  | {
+      type: "incomplete";
+      message: string;
+      reason: "budget" | "no_progress" | "time_limit" | "confirm_timeout";
+    }
   /**
    * @deprecated Prefer `stream`. Agent no longer emits `token` (P0-4 / P2-11).
    * Kept for older UI builds.
@@ -441,11 +459,19 @@ export interface AppSettings {
   githubToken?: string;
   openaiProxyEnabled: boolean;
   openaiProxyPort: number;
-  webSearchProvider: "duckduckgo" | "searxng";
+  webSearchProvider: "duckduckgo" | "searxng" | "tavily";
   searxngUrl?: string;
   webSearchApiKey?: string;
   mcpServers: McpServerConfig[];
   agentMaxSteps: number;
+  /** Soft auto-extend while plan/coding work remains. */
+  agentAutoExtendEnabled: boolean;
+  /** Max auto-extend batches (each ~64 steps). */
+  agentAutoExtendMax: number;
+  /** Soft wall-clock limit for one agent run; 0 = off. */
+  agentMaxRunMinutes: number;
+  /** Confirm dialog timeout seconds; 0 = never auto-reject. */
+  agentConfirmTimeoutSec: number;
   defaultParams: GenerationParams;
   /**
    * Model download: auto = HF CLI if installed else HTTP;
@@ -584,6 +610,10 @@ export function createDefaultSettings(appData: string): AppSettings {
     webSearchProvider: "duckduckgo",
     mcpServers: [],
     agentMaxSteps: 0,
+    agentAutoExtendEnabled: true,
+    agentAutoExtendMax: 10,
+    agentMaxRunMinutes: 30,
+    agentConfirmTimeoutSec: 120,
     defaultParams: { ...DEFAULT_GENERATION_PARAMS },
     hfDownloadMethod: "auto",
     hfToken: "",

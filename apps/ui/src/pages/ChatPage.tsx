@@ -7,6 +7,7 @@ import type {
   RuntimeStatus,
 } from "@kovi/shared";
 import { api } from "../api";
+import { t } from "../i18n";
 import {
   ProcessTimeline,
   type ProcessMode,
@@ -18,6 +19,7 @@ import {
   buildMentionItems,
   mentionQueryAt,
 } from "../components/MentionPicker";
+import { ChatMarkdown } from "../components/ChatMarkdown";
 import { agentStepDetailRu, isSoftAgentStepDetail, paramLabel } from "../lib/labels";
 
 const RESUME_PROMPT =
@@ -158,17 +160,29 @@ export function ChatPage(props: {
     return [...new Set([...catalog, ...fromSessions])].sort((a, b) => a.localeCompare(b));
   }, [props.sessions, props.settings?.sessionFolders]);
 
+  const [pinnedOnly, setPinnedOnly] = useState(false);
+  const [limitBanner, setLimitBanner] = useState<{
+    sessionId: string;
+    text: string;
+  } | null>(null);
+  const [folderDraft, setFolderDraft] = useState("");
+  const [pendingAttachments, setPendingAttachments] = useState<
+    import("@kovi/shared").ChatAttachment[]
+  >([]);
+
   const filteredSessions = useMemo(() => {
     const q = sessionQuery.trim().toLowerCase();
     return props.sessions.filter((s) => {
+      if (pinnedOnly && !s.pinned) return false;
       if (folderFilter && (s.folder || "") !== folderFilter) return false;
       if (!q) return true;
       return s.title.toLowerCase().includes(q) || (s.folder || "").toLowerCase().includes(q);
     });
-  }, [props.sessions, sessionQuery, folderFilter]);
+  }, [props.sessions, sessionQuery, folderFilter, pinnedOnly]);
 
   useEffect(() => {
     if (!activeSession) return;
+    setFolderDraft(activeSession.folder || "");
     if (streamSessionRef.current && streamSessionRef.current === activeSession.id) {
       return;
     }
@@ -247,6 +261,7 @@ export function ChatPage(props: {
         setModelOutput("");
         setCurrentStep(null);
         setGenMode(ev.mode);
+        setLimitBanner(null);
         props.setBusy(true);
       }
       // Prefer stream only; ignore legacy token duplicates (P0-4).
@@ -258,6 +273,18 @@ export function ChatPage(props: {
       }
       if (ev.type === "thinking") {
         setThinking((t) => t + (t ? "\n" : "") + ev.text);
+      }
+      if (ev.type === "incomplete") {
+        const byReason: Record<string, string> = {
+          no_progress: "Агент остановился: почти не было прогресса — Продолжить",
+          time_limit: "Агент остановился по лимиту времени — Продолжить",
+          confirm_timeout: "Истекло время подтверждения — Продолжить",
+          budget: "Агент остановился по лимиту шагов — Продолжить",
+        };
+        setLimitBanner({
+          sessionId: p.sessionId,
+          text: byReason[ev.reason] || "Агент остановился — Продолжить",
+        });
       }
       if (ev.type === "plan") {
         setPlan(ev.steps);
@@ -353,9 +380,26 @@ export function ChatPage(props: {
     }, 400);
   }
 
+  async function attachPickedFiles(paths: string[]): Promise<void> {
+    for (const p of paths) {
+      try {
+        const att = await api.addChatAttachment(p);
+        setPendingAttachments((cur) => [...cur, att].slice(0, 8));
+      } catch (e) {
+        props.setError(e instanceof Error ? e.message : String(e));
+      }
+    }
+  }
+
   async function onSend(overrideText?: string): Promise<void> {
     const text = (overrideText ?? input).trim();
-    if (!text || props.busy) return;
+    if ((!text && !pendingAttachments.length) || props.busy) return;
+    if (!text && pendingAttachments.length) {
+      props.setError("Добавьте текст к вложению");
+      return;
+    }
+    const attachments = pendingAttachments;
+    setPendingAttachments([]);
     setInput("");
     setStreaming("");
     setThinking("");
@@ -378,6 +422,7 @@ export function ChatPage(props: {
         id: `tmp-user-${Date.now()}`,
         role: "user",
         content: text,
+        attachments: attachments.length ? attachments : undefined,
         createdAt: new Date().toISOString(),
       };
       props.setActiveSessionId(sessionId);
@@ -389,6 +434,7 @@ export function ChatPage(props: {
         sessionId,
         content: text,
         useAgent: session?.toolsEnabled === true ? true : undefined,
+        attachments: attachments.length ? attachments : undefined,
       });
     } catch (e) {
       if (generationEpochRef.current !== epoch) return;
@@ -469,10 +515,17 @@ export function ChatPage(props: {
   async function importSessionFile(file: File): Promise<void> {
     try {
       const text = await file.text();
-      const bundle = JSON.parse(text);
-      const session = await api.importSession(bundle);
+      const parsed = JSON.parse(text) as unknown;
+      const bundles = Array.isArray((parsed as { sessions?: unknown })?.sessions)
+        ? (parsed as { sessions: unknown[] }).sessions
+        : [parsed];
+      let lastId: string | null = null;
+      for (const b of bundles) {
+        const session = await api.importSession(b as never);
+        lastId = session.id;
+      }
       props.setSessions(await api.listSessions());
-      props.setActiveSessionId(session.id);
+      if (lastId) props.setActiveSessionId(lastId);
     } catch (e) {
       props.setError(e instanceof Error ? e.message : String(e));
     }
@@ -489,6 +542,38 @@ export function ChatPage(props: {
         const saved = await api.saveSettings({ ...props.settings, sessionFolders: foldersNext });
         props.setSettings(saved);
       }
+    } catch (e) {
+      props.setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function togglePin(sessionId: string, pinned: boolean): Promise<void> {
+    const s = props.sessions.find((x) => x.id === sessionId);
+    if (!s) return;
+    try {
+      await api.updateSession({ ...s, pinned: !pinned });
+      props.setSessions(await api.listSessions());
+    } catch (e) {
+      props.setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function exportFolderBundle(): Promise<void> {
+    if (!folderFilter) {
+      props.setError("Выберите папку в фильтре, чтобы экспортировать её");
+      return;
+    }
+    try {
+      const bundles = await api.exportSessionFolder(folderFilter);
+      const blob = new Blob([JSON.stringify({ folder: folderFilter, sessions: bundles }, null, 2)], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `kovi-folder-${folderFilter.replace(/[^\w.-]+/g, "_")}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
     } catch (e) {
       props.setError(e instanceof Error ? e.message : String(e));
     }
@@ -511,7 +596,7 @@ export function ChatPage(props: {
               }
             }}
           >
-            Новый диалог
+            {t("new_dialog")}
           </button>
           <label className="btn ghost" style={{ cursor: "pointer" }}>
             Импорт
@@ -534,20 +619,41 @@ export function ChatPage(props: {
           onChange={(e) => setSessionQuery(e.target.value)}
         />
         {folders.length > 0 && (
-          <select
-            className="input"
-            value={folderFilter}
-            onChange={(e) => setFolderFilter(e.target.value)}
-            aria-label="Фильтр папки"
-          >
-            <option value="">Все папки</option>
-            {folders.map((f) => (
-              <option key={f} value={f}>
-                {f}
-              </option>
-            ))}
-          </select>
+          <div className="session-folder-row" style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <select
+              className="input"
+              value={folderFilter}
+              onChange={(e) => setFolderFilter(e.target.value)}
+              aria-label="Фильтр папки"
+              style={{ flex: 1 }}
+            >
+              <option value="">Все папки</option>
+              {folders.map((f) => (
+                <option key={f} value={f}>
+                  {f}
+                </option>
+              ))}
+            </select>
+            {folderFilter ? (
+              <button
+                type="button"
+                className="btn ghost"
+                title="Экспорт папки"
+                onClick={() => void exportFolderBundle()}
+              >
+                JSON
+              </button>
+            ) : null}
+          </div>
         )}
+        <label className="muted" style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12 }}>
+          <input
+            type="checkbox"
+            checked={pinnedOnly}
+            onChange={(e) => setPinnedOnly(e.target.checked)}
+          />
+          {t("pinned_only")}
+        </label>
         <div className="session-scroll">
           {filteredSessions.map((s) => (
             <div
@@ -567,12 +673,27 @@ export function ChatPage(props: {
                 {sessionInitial(s.title)}
               </div>
               <div className="session-meta">
-                <div className="session-title">{s.title}</div>
+                <div className="session-title">
+                  {s.pinned ? "📌 " : ""}
+                  {s.title}
+                </div>
                 <div className="muted session-sub">
                   {s.folder ? `${s.folder} · ` : ""}
                   {new Date(s.updatedAt).toLocaleString()}
                 </div>
               </div>
+              <button
+                type="button"
+                className="btn ghost session-del"
+                title={s.pinned ? "Открепить" : "Закрепить"}
+                aria-label={s.pinned ? "Открепить" : "Закрепить"}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void togglePin(s.id, Boolean(s.pinned));
+                }}
+              >
+                {s.pinned ? "★" : "☆"}
+              </button>
               <button
                 type="button"
                 className="btn ghost session-del"
@@ -593,6 +714,34 @@ export function ChatPage(props: {
       <div className="panel-main chat-main">
         <div className="chat-scroll">
           <div className="chat-inner">
+            {limitBanner &&
+            activeSession &&
+            limitBanner.sessionId === activeSession.id &&
+            !props.busy ? (
+              <div
+                className="card"
+                style={{
+                  margin: "8px 0",
+                  display: "flex",
+                  gap: 10,
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                }}
+              >
+                <span>{limitBanner.text}</span>
+                <button
+                  type="button"
+                  className="btn primary"
+                  onClick={() => {
+                    setLimitBanner(null);
+                    void onSend(resumePromptFor(activeSession));
+                  }}
+                >
+                  Продолжить
+                </button>
+              </div>
+            ) : null}
+
             {activeSession && (
               <div className="chat-session-bar row">
                 <button
@@ -606,9 +755,10 @@ export function ChatPage(props: {
                   className="input"
                   style={{ maxWidth: 180 }}
                   placeholder="Папка…"
-                  value={activeSession.folder || ""}
+                  value={folderDraft}
                   onChange={(e) => {
                     const value = e.target.value;
+                    setFolderDraft(value);
                     if (folderTimer.current) clearTimeout(folderTimer.current);
                     folderTimer.current = setTimeout(() => {
                       void setSessionFolder(value);
@@ -739,7 +889,11 @@ export function ChatPage(props: {
                 <div key={m.id} className={`msg ${m.role} msg-enter`}>
                   <div className="role">{roleLabel(m)}</div>
                   {m.thinking ? <div className="thinking">{m.thinking}</div> : null}
-                  <div className="msg-body">{m.content}</div>
+                  {m.role === "assistant" || m.role === "tool" ? (
+                    <ChatMarkdown text={m.content} />
+                  ) : (
+                    <div className="msg-body">{m.content}</div>
+                  )}
                 </div>
               ))}
               {showProcess ? (
@@ -847,7 +1001,61 @@ export function ChatPage(props: {
                 }}
               />
             </div>
-            <div className="composer-actions">
+            {pendingAttachments.length > 0 ? (
+              <div className="row" style={{ flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+                {pendingAttachments.map((a) => (
+                  <span key={a.id} className="path-chip" title={a.path}>
+                    {a.name}
+                    <button
+                      type="button"
+                      className="btn ghost"
+                      style={{ marginLeft: 4, padding: "0 4px" }}
+                      onClick={() =>
+                        setPendingAttachments((cur) => cur.filter((x) => x.id !== a.id))
+                      }
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+            ) : null}
+            <div
+              className="composer-actions"
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const files = [...(e.dataTransfer?.files || [])];
+                const fromApi =
+                  typeof api.pathsFromFileList === "function"
+                    ? api.pathsFromFileList(files)
+                    : [];
+                const legacy = files
+                  .map((f) => (f as File & { path?: string }).path)
+                  .filter((p): p is string => Boolean(p));
+                const paths = [...new Set([...fromApi, ...legacy])];
+                if (paths.length) void attachPickedFiles(paths);
+              }}
+            >
+              <button
+                className="btn ghost"
+                type="button"
+                disabled={props.busy}
+                title="Прикрепить файл"
+                onClick={() => {
+                  void api
+                    .pickFile([{ name: "Файлы", extensions: ["*"] }])
+                    .then((p) => {
+                      if (p) void attachPickedFiles([p]);
+                    });
+                }}
+              >
+                📎
+              </button>
               <button
                 className="btn ghost"
                 type="button"

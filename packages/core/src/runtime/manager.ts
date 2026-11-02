@@ -77,6 +77,8 @@ export class RuntimeManager {
    */
   jsonSchemaOk: boolean | null = null;
   grammarOk: boolean | null = null;
+  /** OpenAI-style tools / tool_calls support (null = unknown). */
+  toolsOk: boolean | null = null;
   private onProgress?: ProgressFn;
   private ensurePromise: Promise<{
     updated: boolean;
@@ -605,6 +607,7 @@ export class RuntimeManager {
   async stopServer(): Promise<void> {
     this.jsonSchemaOk = null;
     this.grammarOk = null;
+    this.toolsOk = null;
     if (!this.process) {
       this.port = null;
       this.clearLoadedModel();

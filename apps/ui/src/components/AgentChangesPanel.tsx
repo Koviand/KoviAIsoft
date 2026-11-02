@@ -4,6 +4,7 @@ export type AgentChangeItem = {
   summary: string;
   diff?: string;
   confirmationId?: string;
+  checkpointPath?: string;
   status: "pending" | "accepted" | "rejected" | "applied";
 };
 
@@ -12,6 +13,7 @@ type Props = {
   confirmBusy?: boolean;
   onAccept: (item: AgentChangeItem) => void;
   onReject: (item: AgentChangeItem) => void;
+  onRestore?: (item: AgentChangeItem) => void;
   onDismiss: () => void;
   selectedId: string | null;
   onSelect: (id: string | null) => void;
@@ -48,26 +50,39 @@ export function AgentChangesPanel(props: Props) {
           {selected.summary}
         </p>
       )}
-      {selected.status === "pending" && selected.confirmationId ? (
-        <div className="row" style={{ marginTop: 8, flexWrap: "wrap" }}>
+      <div className="row" style={{ marginTop: 8, flexWrap: "wrap", gap: 8 }}>
+        {selected.status === "pending" && selected.confirmationId ? (
+          <>
+            <button
+              type="button"
+              className="btn primary"
+              disabled={props.confirmBusy}
+              onClick={() => props.onAccept(selected)}
+            >
+              Принять
+            </button>
+            <button
+              type="button"
+              className="btn danger"
+              disabled={props.confirmBusy}
+              onClick={() => props.onReject(selected)}
+            >
+              Отклонить
+            </button>
+          </>
+        ) : null}
+        {selected.status === "applied" && props.onRestore ? (
           <button
             type="button"
-            className="btn primary"
+            className="btn"
             disabled={props.confirmBusy}
-            onClick={() => props.onAccept(selected)}
+            onClick={() => props.onRestore?.(selected)}
+            title="Откатить файл из checkpoint (если есть)"
           >
-            Принять
+            Откатить
           </button>
-          <button
-            type="button"
-            className="btn danger"
-            disabled={props.confirmBusy}
-            onClick={() => props.onReject(selected)}
-          >
-            Отклонить
-          </button>
-        </div>
-      ) : null}
+        ) : null}
+      </div>
     </div>
   );
 }

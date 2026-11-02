@@ -1,33 +1,20 @@
 import path from "node:path";
 import { v4 as uuid } from "uuid";
 import type {
-  AgentConfirmation,
   AgentEvent,
   AgentPlanStep,
   AppSettings,
+  ChatAttachment,
   GenerationParams,
 } from "@kovi/shared";
 import type { ChatEngine } from "../chat/engine.js";
 import type { Store } from "../db/store.js";
 import type { McpManager } from "../mcp/manager.js";
 import { BrowserTooling } from "../tools/browser.js";
-import {
-  applyPatchTool,
-  deletePathTool,
-  listDir,
-  readFileTool,
-  searchFiles,
-  writeFileTool,
-} from "../tools/files.js";
-import { cancelActiveTerminals, runTerminal } from "../tools/terminal.js";
-import { previewPatchDiff, previewWriteDiff } from "../tools/diff.js";
-import {
-  approvalRememberKey,
-  resolveAgentPath,
-  riskForTool,
-  shouldConfirmRisk,
-} from "../tools/sandbox.js";
-import { webSearch } from "../tools/websearch.js";
+import { cancelActiveTerminals } from "../tools/terminal.js";
+import { resolveAgentPath } from "../tools/sandbox.js";
+import { buildToolConfirmation, evaluateToolConfirmNeed } from "./confirmGate.js";
+import { execAgentTool } from "./toolExec.js";
 import { clampCompletionTokens } from "../chat/completionBudget.js";
 import {
   estimateMessagesTokens,
@@ -42,6 +29,8 @@ import { formatRetrievedSnippets } from "../context/retrieve.js";
 import { invalidateIndexPaths } from "../context/semanticIndex.js";
 import { condenseTranscript, summarizeTranscript } from "../context/summarize.js";
 import { detectCodingTask } from "./intent.js";
+import { buildIncompleteEvent } from "./phases/budgetExhaust.js";
+import { runBatchTools } from "./phases/runBatchTools.js";
 import {
   agentTuningForFamily,
   detectModelFamily,
@@ -50,10 +39,12 @@ import {
   currentPlanStep,
   defaultPlanForTask,
   executePhaseHint,
+  isSoftResumeGoal,
   markCurrentPlanDone,
   normalizePlanDraft,
   PLAN_PHASE_MAX_ATTEMPTS,
   planPhaseInstruction,
+  shouldAdvancePlanOnTool,
   skipRemainingPlan,
 } from "./planner.js";
 import {
@@ -66,14 +57,15 @@ import {
   AGENT_AUTO_EXTEND_BATCH,
   AGENT_AUTO_EXTEND_MAX,
   AGENT_IDENTICAL_TOOL_MAX,
+  AGENT_NON_ADVANCING_HARD_STOP,
   AGENT_NON_ADVANCING_MAX,
+  AGENT_REPAIR_HARD_STOP,
   AGENT_REPAIR_MAX,
   AGENT_STEPS_SAFETY_CAP,
   AGENT_TRUNCATION_MAX,
   agentHasPendingWork,
   clampAgentMaxSteps,
   inFinishWindow,
-  synthesizeBudgetExhaustedAnswer,
   toolFingerprint,
 } from "./finishPolicy.js";
 import {
@@ -187,7 +179,7 @@ export class AgentLoop {
   private pendingConfirm = new Map<
     string,
     {
-      resolve: (approved: boolean) => void;
+      resolve: (result: "approved" | "rejected" | "timeout") => void;
       toolName: string;
       sessionId: string;
       rememberKey: string | null;
@@ -197,8 +189,6 @@ export class AgentLoop {
   /** Remembered approvals keyed by session → approvalRememberKey (path-scoped for writes). */
   private allowBySession = new Map<string, Set<string>>();
   private running = false;
-  /** Max wait for UI confirmation before auto-reject (ms). */
-  static CONFIRM_TIMEOUT_MS = 120_000;
 
   constructor(chat: ChatEngine, store: Store, mcp: McpManager) {
     this.chat = chat;
@@ -218,7 +208,7 @@ export class AgentLoop {
     cancelActiveTerminals();
     for (const [id, p] of this.pendingConfirm) {
       if (p.timer) clearTimeout(p.timer);
-      p.resolve(false);
+      p.resolve("rejected");
       this.pendingConfirm.delete(id);
     }
   }
@@ -234,7 +224,7 @@ export class AgentLoop {
     if (approved && remember && pending.sessionId && pending.rememberKey) {
       this.allowFor(pending.sessionId).add(pending.rememberKey);
     }
-    pending.resolve(approved);
+    pending.resolve(approved ? "approved" : "rejected");
     this.pendingConfirm.delete(id);
   }
 
@@ -261,129 +251,85 @@ export class AgentLoop {
     toolName: string,
     args: Record<string, unknown>,
     settings: AppSettings,
-  ): Promise<boolean> {
+    callId?: string,
+  ): Promise<"approved" | "rejected" | "timeout"> {
     const normalized = normalizeToolArgs(toolName, args, settings.projectRoot);
-    const risk = riskForTool(toolName, normalized, settings.projectRoot);
-    if (risk === "low") return true;
-    const rememberKey = approvalRememberKey(
+    const { needsConfirm, risk, rememberKey } = evaluateToolConfirmNeed(
       toolName,
       normalized,
-      settings.projectRoot,
+      settings,
+      this.allowFor(sessionId),
     );
-    if (rememberKey && this.allowFor(sessionId).has(rememberKey)) return true;
-    if (
-      !shouldConfirmRisk(
-        risk,
-        settings.agentRiskMode || "ask",
-        normalized,
-        settings.projectRoot,
-        toolName,
-      )
-    ) {
-      return true;
+    if (!needsConfirm) return "approved";
+
+    if (callId) {
+      this.emit(sessionId, {
+        type: "tool_call",
+        name: toolName,
+        args: normalized,
+        callId,
+        status: "awaiting_confirm",
+      });
     }
 
-    let diff: string | undefined;
-    try {
-      if (toolName === "write_file") {
-        diff = previewWriteDiff(
-          String(normalized.path || ""),
-          String(normalized.content ?? ""),
-          settings,
-        );
-      } else if (toolName === "apply_patch") {
-        diff = previewPatchDiff(
-          String(normalized.path || ""),
-          String(normalized.oldText ?? ""),
-          String(normalized.newText ?? ""),
-          settings,
-        );
-      }
-    } catch {
-      diff = undefined;
-    }
-
-    const argPreview = JSON.stringify(normalized);
-    const confirmation: AgentConfirmation = {
+    const confirmation = buildToolConfirmation({
       id: uuid(),
       toolName,
-      summary: `${toolName} ${argPreview.length > 1200 ? argPreview.slice(0, 1200) + "…" : argPreview}`,
-      args: normalized,
-      risk: risk === "high" ? "high" : "medium",
-      createdAt: new Date().toISOString(),
-      diff,
-    };
+      normalizedArgs: normalized,
+      risk,
+      settings,
+    });
     this.emit(sessionId, { type: "confirmation_required", confirmation });
-    return new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => {
-        const still = this.pendingConfirm.get(confirmation.id);
-        if (!still) return;
-        this.pendingConfirm.delete(confirmation.id);
-        this.emit(sessionId, {
-          type: "confirmation_timeout",
-          confirmationId: confirmation.id,
-          toolName,
-        });
-        still.resolve(false);
-      }, AgentLoop.CONFIRM_TIMEOUT_MS);
+    const timeoutSec =
+      typeof settings.agentConfirmTimeoutSec === "number"
+        ? settings.agentConfirmTimeoutSec
+        : 120;
+    const timeoutMs =
+      timeoutSec <= 0
+        ? 0
+        : Math.max(5_000, Math.min(600_000, Math.floor(timeoutSec) * 1000));
+    return new Promise<"approved" | "rejected" | "timeout">((resolve) => {
+      const timer =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              const still = this.pendingConfirm.get(confirmation.id);
+              if (!still) return;
+              this.pendingConfirm.delete(confirmation.id);
+              this.emit(sessionId, {
+                type: "confirmation_timeout",
+                confirmationId: confirmation.id,
+                toolName,
+                timeoutSec: Math.round(timeoutMs / 1000),
+              });
+              still.resolve("timeout");
+            }, timeoutMs)
+          : null;
       this.pendingConfirm.set(confirmation.id, {
         resolve,
         toolName,
         sessionId,
         rememberKey,
-        timer,
+        timer: timer || undefined,
       });
     });
   }
+
+  private checkpointRunId: string | null = null;
 
   private async execTool(
     name: string,
     args: Record<string, unknown>,
     settings: AppSettings,
   ): Promise<string> {
-    const a = normalizeToolArgs(name, args, settings.projectRoot);
-    switch (name) {
-      case "list_dir":
-        return listDir(String(a.path), settings);
-      case "read_file":
-        return readFileTool(String(a.path), settings);
-      case "write_file":
-        return writeFileTool(String(a.path), String(a.content ?? ""), settings);
-      case "apply_patch":
-        return applyPatchTool(
-          String(a.path),
-          String(a.oldText ?? ""),
-          String(a.newText ?? ""),
-          settings,
-        );
-      case "delete_path":
-        return deletePathTool(String(a.path), settings);
-      case "search":
-        return searchFiles(String(a.query ?? args.query), String(a.path), settings);
-      case "run_terminal":
-        return runTerminal(
-          String(a.command ?? a.cmd ?? ""),
-          String(a.cwd ?? a.dir ?? a.workdir ?? ""),
-          settings,
-        );
-      case "web_search":
-        return webSearch(String(args.query), settings);
-      case "browser_navigate":
-        return this.browser.navigate(String(args.url));
-      case "browser_snapshot":
-        return this.browser.snapshot();
-      case "browser_click":
-        return this.browser.click(String(args.selector));
-      case "browser_type":
-        return this.browser.type(String(args.selector), String(args.text ?? ""));
-      case "finish":
-        return String(args.summary ?? "");
-      default:
-        if (name.startsWith("mcp_")) {
-          return this.mcp.callTool(name, args);
-        }
-        throw new Error(`Неизвестный инструмент: ${name}`);
-    }
+    return execAgentTool({
+      name,
+      args,
+      settings,
+      normalize: normalizeToolArgs,
+      browser: this.browser,
+      mcp: this.mcp,
+      checkpointRunId: this.checkpointRunId || undefined,
+    });
   }
 
   async run(
@@ -392,14 +338,20 @@ export class AgentLoop {
     settings: AppSettings,
     params: GenerationParams,
     systemPrompt: string,
+    attachments?: ChatAttachment[],
   ): Promise<void> {
     if (this.running) throw new Error("Агент уже выполняется");
     this.running = true;
     this.cancelled = false;
+    this.checkpointRunId = `${sessionId.slice(0, 8)}-${Date.now().toString(36)}`;
     projectContextCache.clear();
 
     try {
-      this.store.addMessage(sessionId, { role: "user", content: userContent });
+      this.store.addMessage(sessionId, {
+        role: "user",
+        content: userContent,
+        attachments: attachments?.length ? attachments : undefined,
+      });
       const ctxWindow = params.context || 8192;
       const compactTools = ctxWindow < 8192;
       const mcpTools = this.mcp.listTools().map((t) => ({
@@ -409,10 +361,23 @@ export class AgentLoop {
       const extraToolNames = mcpTools.map((t) => t.name);
       const toolBlock = toolsPromptBlock(mcpTools, { compact: compactTools });
 
+      const session = this.store.listSessions().find((s) => s.id === sessionId);
+      const restored = parseWorkingMemory(session?.agentScratchpad);
+      const freshGoal = userContent.replace(/\s+/g, " ").trim().slice(0, 400);
+      const softResume =
+        Boolean(restored?.goal) && isSoftResumeGoal(freshGoal, restored!.goal);
+      const goalChanged =
+        Boolean(restored?.goal) &&
+        restored!.goal.toLowerCase() !== freshGoal.toLowerCase() &&
+        !softResume;
+      const effectiveGoal =
+        softResume && restored?.goal ? restored.goal : freshGoal;
+      const contextQuery = softResume && restored?.goal ? restored.goal : userContent;
+
       // Cursor-like layered context: tools + rules + retrieval + project map (budgeted).
       const projectCtx = await buildProjectContext({
         settings,
-        userQuery: userContent,
+        userQuery: contextQuery,
         baseSystem: systemPrompt,
         toolBlock,
         contextTokens: ctxWindow,
@@ -433,17 +398,10 @@ export class AgentLoop {
       });
 
       let baseSystem = projectCtx.systemPrompt;
-      const session = this.store.listSessions().find((s) => s.id === sessionId);
-      const restored = parseWorkingMemory(session?.agentScratchpad);
-      const freshGoal = userContent.replace(/\s+/g, " ").trim().slice(0, 400);
-      const goalChanged =
-        Boolean(restored?.goal) &&
-        restored!.goal.toLowerCase() !== freshGoal.toLowerCase() &&
-        !freshGoal.toLowerCase().includes(restored!.goal.toLowerCase().slice(0, 80));
       const workingMemory = restored
         ? {
             ...restored,
-            goal: freshGoal,
+            goal: effectiveGoal,
             ...(goalChanged
               ? {
                   plan: [],
@@ -474,7 +432,6 @@ export class AgentLoop {
       // Limited lookback — full session history (retries/duplicates) blows local ctx.
       const prior = this.store.getMessages(sessionId);
       const recent = prior.slice(-PRIOR_LOOKBACK_MESSAGES);
-      let lastUser = "";
       for (const m of recent) {
         if (m.role === "system") continue;
         if (m.role === "tool") {
@@ -487,8 +444,9 @@ export class AgentLoop {
         if (m.role === "user" || m.role === "assistant") {
           if (m.role === "user") {
             const t = m.content.trim();
-            if (t && t === lastUser) continue; // drop duplicate user retries
-            lastUser = t;
+            const prev = transcript[transcript.length - 1];
+            // Only collapse consecutive identical user turns (not resume after assistant).
+            if (t && prev?.role === "user" && prev.content.trim() === t) continue;
           }
           transcript.push({ role: m.role, content: m.content });
         }
@@ -526,7 +484,7 @@ export class AgentLoop {
         workingMemory.notes.some((n) => /^wrote /.test(n) && !/stub/i.test(n));
       let stubNudgeCount = 0;
       let lastRetrieveAt = 0;
-      const wantsFiles = detectCodingTask(userContent);
+      const wantsFiles = detectCodingTask(effectiveGoal || userContent);
 
       const persistScratchpad = () => {
         const cur = this.store.listSessions().find((s) => s.id === sessionId);
@@ -590,11 +548,35 @@ export class AgentLoop {
       const showStepCap = userStepsPref > 0;
       let stepBudget = clampAgentMaxSteps(settings.agentMaxSteps);
       let autoExtends = 0;
+      const autoExtendEnabled = settings.agentAutoExtendEnabled !== false;
+      const autoExtendMax = Math.max(
+        0,
+        Math.min(
+          AGENT_AUTO_EXTEND_MAX,
+          Number.isFinite(settings.agentAutoExtendMax)
+            ? Math.floor(settings.agentAutoExtendMax)
+            : 10,
+        ),
+      );
+      const maxRunMs =
+        settings.agentMaxRunMinutes > 0
+          ? settings.agentMaxRunMinutes * 60_000
+          : 0;
+      const runStartedAt = Date.now();
+      let stopReason: "budget" | "no_progress" | "time_limit" | null = null;
 
       for (let i = 0; ; i++) {
         if (this.cancelled) {
           this.emit(sessionId, { type: "cancelled" });
           return;
+        }
+        if (maxRunMs > 0 && Date.now() - runStartedAt >= maxRunMs) {
+          this.emit(sessionId, {
+            type: "thinking",
+            text: `Лимит времени агента (${settings.agentMaxRunMinutes} мин) — останавливаюсь.`,
+          });
+          stopReason = "time_limit";
+          break;
         }
         const pendingWork = agentHasPendingWork({
           steps,
@@ -605,8 +587,9 @@ export class AgentLoop {
         // Soft limit: keep going while plan/coding work remains (up to safety cap).
         if (i >= stepBudget) {
           if (
+            autoExtendEnabled &&
             pendingWork &&
-            autoExtends < AGENT_AUTO_EXTEND_MAX &&
+            autoExtends < autoExtendMax &&
             stepBudget < AGENT_STEPS_SAFETY_CAP
           ) {
             const add = Math.min(
@@ -617,9 +600,10 @@ export class AgentLoop {
             autoExtends += 1;
             this.emit(sessionId, {
               type: "thinking",
-              text: `Автопродолжение ${autoExtends}: ещё ${add} шагов…`,
+              text: `Автопродолжение ${autoExtends}/${autoExtendMax}: ещё ${add} шагов…`,
             });
           } else {
+            if (!stopReason) stopReason = "budget";
             break;
           }
         }
@@ -677,7 +661,7 @@ export class AgentLoop {
           });
           const loadedId = this.chat.getRuntime().getStatus().loadedModelId || "";
           const family = detectModelFamily(loadedId);
-          const tuning = agentTuningForFamily(family);
+          const tuning = agentTuningForFamily(family, loadedId);
           const callParams = {
             ...params,
             maxTokens,
@@ -803,11 +787,48 @@ export class AgentLoop {
           return;
         }
 
-        const parsed = parseAgentAction(
-          raw,
-          finishOnly ? "execute" : planFrozen ? "execute" : "plan",
-        );
+        const inPlanPhase = !finishOnly && !planFrozen;
+        const parsed = parseAgentAction(raw, inPlanPhase ? "plan" : "execute");
         if (!parsed) {
+          // Plan phase: tool/final-without-plan counts as a failed plan attempt.
+          if (inPlanPhase) {
+            planAttempts += 1;
+            transcript.push({ role: "assistant", content: raw.slice(0, 4000) });
+            if (planAttempts >= PLAN_PHASE_MAX_ATTEMPTS) {
+              steps = defaultPlanForTask(wantsFiles);
+              workingMemory.planFrozen = true;
+              updatePlanMemory(workingMemory, steps);
+              persistScratchpad();
+              syncSystem();
+              this.emit(sessionId, { type: "plan", steps });
+              this.emit(sessionId, {
+                type: "step_done",
+                stepId,
+                detail: "План по шаблону",
+              });
+              this.emit(sessionId, {
+                type: "thinking",
+                text: "Модель не дала план — использую шаблон и начинаю исполнение.",
+              });
+              transcript.push({
+                role: "user",
+                content: executePhaseHint(currentPlanStep(steps), steps),
+              });
+              continue;
+            }
+            transcript.push({
+              role: "user",
+              content:
+                planPhaseInstruction(wantsFiles) +
+                "\nПлан обязателен: массив plan из 3–7 пунктов. tool и final сейчас запрещены.",
+            });
+            this.emit(sessionId, {
+              type: "step_done",
+              stepId,
+              detail: "Жду план",
+            });
+            continue;
+          }
           repairAttempts += 1;
           const looksTruncated =
             /["']\s*$/.test(raw.trim()) ||
@@ -816,7 +837,20 @@ export class AgentLoop {
             raw.length > 1500;
           transcript.push({ role: "assistant", content: raw.slice(0, 4000) });
           const loadedId = this.chat.getRuntime().getStatus().loadedModelId || "";
-          const familyNudge = agentTuningForFamily(detectModelFamily(loadedId)).jsonNudge;
+          const tuning = agentTuningForFamily(detectModelFamily(loadedId), loadedId);
+          const familyNudge = tuning.jsonNudge;
+          const proseReject = tuning.rejectProseReasoning
+            ? " Обычный текст/рассуждения без JSON отвергнуты — повтори строго JSON."
+            : "";
+          if (repairAttempts >= AGENT_REPAIR_HARD_STOP) {
+            this.emit(sessionId, {
+              type: "step_done",
+              stepId,
+              detail: "repair hard-stop",
+            });
+            if (!stopReason) stopReason = "no_progress";
+            break;
+          }
           if (repairAttempts >= AGENT_REPAIR_MAX || finishOnly) {
             this.emit(sessionId, {
               type: "step_done",
@@ -834,11 +868,11 @@ export class AgentLoop {
           const repair =
             repairAttempts <= 2
               ? looksTruncated
-                ? `Ответ обрезан. Верни ТОЛЬКО JSON: {"thought":"…","tool":{"name":"write_file","args":{…}}|null,"final":null}. Один короткий write_file.\n${familyNudge}`
-                : `Невалидный ответ. ${familyNudge}`
+                ? `Ответ обрезан. Верни ТОЛЬКО JSON: {"thought":"…","tool":{"name":"write_file","args":{…}}|null,"final":null}. Один короткий write_file.\n${familyNudge}${proseReject}`
+                : `Невалидный ответ. ${familyNudge}${proseReject}`
               : looksTruncated
                 ? "Снова обрезка. Ещё короче: thought 1 фраза, один tool, без final."
-                : `Снова не JSON. ${familyNudge}`;
+                : `Снова не JSON. ${familyNudge}${proseReject}`;
           this.emit(sessionId, { type: "step_done", stepId, detail: "repair" });
           transcript.push({ role: "user", content: repair });
           continue;
@@ -918,6 +952,59 @@ export class AgentLoop {
         // Frozen: ignore structural plan rewrites from the model.
         if (parsed.plan?.length) {
           // Keep titles/ids; statuses only advanced by the runtime after tools.
+        }
+
+        // ——— Batch read-only tools (parallel) ———
+        if (Array.isArray(parsed.tools) && parsed.tools.length && !parsed.tool?.name) {
+          const batchResult = await runBatchTools({
+            tools: parsed.tools,
+            settings,
+            normalize: normalizeToolArgs,
+            browser: this.browser,
+            mcp: this.mcp,
+            checkpointRunId: this.checkpointRunId || undefined,
+            emit: (ev) => this.emit(sessionId, ev),
+            isCancelled: () => this.cancelled,
+          });
+          if (!batchResult.ok) {
+            this.emit(sessionId, { type: "step_done", stepId, detail: "repair" });
+            transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+            transcript.push({
+              role: "user",
+              content: batchResult.error,
+            });
+            continue;
+          }
+          toolsUsed += batchResult.count;
+          nonAdvancingStreak += 1;
+          const combined = batchResult.combined.slice(0, TOOL_RESULT_TRANSCRIPT_CHARS * 2);
+          rememberToolSuccess(
+            workingMemory,
+            "tools[]",
+            {},
+            combined.slice(0, 400),
+          );
+          persistScratchpad();
+          this.emit(sessionId, {
+            type: "step_done",
+            stepId,
+            detail: `tools×${batchResult.count} ok`,
+          });
+          transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+          transcript.push({
+            role: "user",
+            content: `Результаты batch tools (${batchResult.count}):\n${combined}`,
+          });
+          if (nonAdvancingStreak > AGENT_NON_ADVANCING_MAX) {
+            transcript.push({
+              role: "user",
+              content: wantsFiles
+                ? "Хватит разведки (tools[]). Сделай write_file/apply_patch или final."
+                : "Хватит разведки. Выполни действие по плану или final.",
+            });
+            nonAdvancingStreak = 0;
+          }
+          continue;
         }
 
         if (parsed.final && !parsed.tool) {
@@ -1066,7 +1153,13 @@ export class AgentLoop {
         }
 
         const callId = uuid();
-        this.emit(sessionId, { type: "tool_call", name: toolName, args, callId });
+        this.emit(sessionId, {
+          type: "tool_call",
+          name: toolName,
+          args,
+          callId,
+          status: "proposed",
+        });
 
         if (toolName === "finish") {
           const blockFinishNoFile = wantsFiles && filesWritten === 0 && !finishOnly;
@@ -1117,7 +1210,7 @@ export class AgentLoop {
 
         if (!PLAN_ADVANCING_TOOLS.has(toolName)) {
           nonAdvancingStreak += 1;
-          if (nonAdvancingStreak > AGENT_NON_ADVANCING_MAX) {
+          if (nonAdvancingStreak > AGENT_NON_ADVANCING_HARD_STOP) {
             this.emit(sessionId, {
               type: "tool_result",
               callId,
@@ -1127,27 +1220,44 @@ export class AgentLoop {
             this.emit(sessionId, {
               type: "step_done",
               stepId,
-              detail: "non-advancing cap",
+              detail: "non-advancing hard-stop",
             });
-            transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
-            transcript.push({
-              role: "user",
-              content: wantsFiles
-                ? "Хватит list_dir/read/search. Сделай write_file/apply_patch или final."
-                : "Хватит разведки. Выполни действие по плану или final.",
-            });
-            continue;
+            if (!stopReason) stopReason = "no_progress";
+            break;
           }
         } else {
           nonAdvancingStreak = 0;
         }
 
-        const approved = await this.confirmIfNeeded(sessionId, toolName, args, settings);
+        const confirm = await this.confirmIfNeeded(
+          sessionId,
+          toolName,
+          args,
+          settings,
+          callId,
+        );
         if (this.cancelled) {
           this.emit(sessionId, { type: "cancelled" });
           return;
         }
-        if (!approved) {
+        if (confirm === "timeout") {
+          const deny = `Подтверждение «${toolName}» истекло`;
+          this.emit(sessionId, { type: "tool_result", callId, result: deny, isError: true });
+          this.emit(sessionId, { type: "step_done", stepId, detail: deny });
+          const msg = this.store.addMessage(sessionId, {
+            role: "assistant",
+            content: `${deny}. Можно нажать «Продолжить».`,
+          });
+          this.emit(sessionId, { type: "stream", text: msg.content });
+          this.emit(sessionId, {
+            type: "incomplete",
+            message: msg.content.slice(0, 400),
+            reason: "confirm_timeout",
+          });
+          this.emit(sessionId, { type: "done", messageId: msg.id });
+          return;
+        }
+        if (confirm === "rejected") {
           const deny = "Пользователь отклонил действие";
           this.emit(sessionId, { type: "tool_result", callId, result: deny, isError: true });
           this.emit(sessionId, { type: "step_done", stepId, detail: deny });
@@ -1158,6 +1268,13 @@ export class AgentLoop {
 
         try {
           const normalizedArgs = normalizeToolArgs(toolName, args, settings.projectRoot);
+          this.emit(sessionId, {
+            type: "tool_call",
+            name: toolName,
+            args: normalizedArgs,
+            callId,
+            status: "running",
+          });
           const result = await this.execTool(toolName, args, settings);
           toolsUsed += 1;
           if (FILE_MUTATION_TOOLS.has(toolName)) {
@@ -1183,7 +1300,10 @@ export class AgentLoop {
               );
             }
           }
-          if (steps.length && PLAN_ADVANCING_TOOLS.has(toolName)) {
+          if (
+            steps.length &&
+            shouldAdvancePlanOnTool(currentPlanStep(steps), toolName, normalizedArgs)
+          ) {
             steps = markCurrentPlanDone(steps, toolName);
             this.emit(sessionId, { type: "plan", steps });
           }
@@ -1214,6 +1334,13 @@ export class AgentLoop {
           });
           let followUp = `Результат инструмента ${toolName}:\n${result.slice(0, TOOL_RESULT_TRANSCRIPT_CHARS)}`;
           if (
+            toolName === "run_terminal" &&
+            /exit:\s*(?!0\b)\d+/i.test(result)
+          ) {
+            followUp +=
+              `\n\nУчти блок «Диагностика» (если есть): исправь код через write_file/apply_patch и повтори запуск.`;
+          }
+          if (
             wantsFiles &&
             toolName === "write_file" &&
             String(normalizedArgs.content ?? "").length <
@@ -1226,6 +1353,18 @@ export class AgentLoop {
             role: "user",
             content: followUp,
           });
+          if (
+            !PLAN_ADVANCING_TOOLS.has(toolName) &&
+            nonAdvancingStreak > AGENT_NON_ADVANCING_MAX &&
+            nonAdvancingStreak % AGENT_NON_ADVANCING_MAX === 1
+          ) {
+            transcript.push({
+              role: "user",
+              content: wantsFiles
+                ? "Хватит разведки. Сделай write_file/apply_patch или final."
+                : "Хватит разведки. Выполни действие по плану или final.",
+            });
+          }
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           rememberToolError(workingMemory, toolName, message);
@@ -1250,23 +1389,20 @@ export class AgentLoop {
         }
       }
 
-      const synthesized = synthesizeBudgetExhaustedAnswer(workingMemory, {
+      const { content: exhaustContent, event: incompleteEv } = buildIncompleteEvent({
+        workingMemory,
         wantsFiles,
         filesWritten,
         toolsUsed,
         substantialWrite,
+        stopReason,
       });
       const msg = this.store.addMessage(sessionId, {
         role: "assistant",
-        content: synthesized.content,
+        content: exhaustContent,
       });
-      this.emit(sessionId, { type: "stream", text: synthesized.content });
-      if (synthesized.incomplete) {
-        this.emit(sessionId, {
-          type: "error",
-          message: `incomplete: ${synthesized.content.slice(0, 240)}`,
-        });
-      }
+      this.emit(sessionId, { type: "stream", text: exhaustContent });
+      this.emit(sessionId, incompleteEv);
       this.emit(sessionId, { type: "done", messageId: msg.id });
     } catch (err) {
       this.emit(sessionId, {

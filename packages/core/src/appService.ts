@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type {
   AppSettings,
+  ChatAttachment,
   ChatMessage,
   ChatSession,
   CodebaseIndexStatus,
@@ -17,6 +18,7 @@ import type {
   McpHealthResult,
   McpServerConfig,
   ModelRecommendationsReport,
+  SessionPatch,
   MonitorSnapshot,
   RuntimeAsset,
   RuntimeBackend,
@@ -45,11 +47,15 @@ import {
 } from "./context/embedder.js";
 import { stopSharedEmbeddingServer } from "./context/embeddingServer.js";
 import {
-  ensureProjectIndex,
-  getCodebaseIndexStatus,
-  reindexCodebase,
-} from "./context/semanticIndex.js";
+  readCodebaseIndexStatus,
+  reindexProjectCodebase,
+  warmProjectCodebaseIndex,
+} from "./services/codebaseFacade.js";
+import { listCheckpoints, restoreCheckpoint } from "./tools/checkpoints.js";
+import { assertAllowedPath, resolveAgentPath } from "./tools/sandbox.js";
 import { Store } from "./db/store.js";
+import { v4 as uuid } from "uuid";
+import { ProjectRootWatcher } from "./context/projectWatcher.js";
 import { McpManager } from "./mcp/manager.js";
 import {
   buildHardwareTierProfiles,
@@ -72,7 +78,7 @@ import { ensureHfCli, getHfCliStatus } from "./models/hfCli.js";
 import { verifyGgufFile, withIntegrity } from "./models/integrity.js";
 import { deleteLocalModelFiles } from "./models/deleteLocal.js";
 import { scanLocalModels } from "./models/scanner.js";
-import { getAppDataDir } from "./paths.js";
+import { getAppDataDir, getAttachmentsDir } from "./paths.js";
 import { OpenAiProxy } from "./proxy/openaiProxy.js";
 import { configureRuntimeAssetFetcher } from "./runtime/assets.js";
 import { RuntimeManager } from "./runtime/manager.js";
@@ -105,9 +111,12 @@ export class AppService {
   private lastTokensPerSecond: number | null = null;
   private agentStepLabel: string | null = null;
   private errorLog: string[] = [];
-  /** Serialize loadModel / startAgent to prevent parallel runs (P1-6). */
+  /** Serialize loadModel / unloadModel (agent runs separately). */
   private loadModelChain: Promise<void> = Promise.resolve();
+  /** Serialize MCP sync so background init cannot race saveSettings. */
+  private mcpSyncChain: Promise<void> = Promise.resolve();
   private agentStartLock = false;
+  private projectWatcher = new ProjectRootWatcher();
 
   onRuntimeProgress?: (p: { progress: number; label: string }) => void;
   onDownloadProgress?: (p: { progress: number; label: string }) => void;
@@ -213,19 +222,55 @@ export class AppService {
     });
   }
 
-  /** Real token when settings.json holds `__secure__` placeholder (Electron safeStorage). */
+  /** Real secrets when settings.json holds `__secure__` (Electron safeStorage). */
   private githubTokenOverride: string | null = null;
+  private hfTokenOverride: string | null = null;
+  private webSearchApiKeyOverride: string | null = null;
 
   setGithubTokenOverride(token: string | null): void {
     this.githubTokenOverride = token && token.trim() ? token.trim() : null;
     this.applyRuntimeFetcherConfig();
   }
 
+  setHfTokenOverride(token: string | null): void {
+    this.hfTokenOverride = token && token.trim() ? token.trim() : null;
+  }
+
+  setWebSearchApiKeyOverride(key: string | null): void {
+    this.webSearchApiKeyOverride = key && key.trim() ? key.trim() : null;
+  }
+
+  private resolveSecret(
+    override: string | null,
+    raw: string | undefined | null,
+  ): string | undefined {
+    if (override) return override;
+    const t = raw?.trim();
+    if (!t || t === "__secure__") return undefined;
+    return t;
+  }
+
   private resolveGithubToken(s = this.settings.get()): string | undefined {
-    if (this.githubTokenOverride) return this.githubTokenOverride;
-    const raw = s.githubToken?.trim();
-    if (!raw || raw === "__secure__") return undefined;
-    return raw;
+    return this.resolveSecret(this.githubTokenOverride, s.githubToken);
+  }
+
+  private resolveHfToken(s = this.settings.get()): string | undefined {
+    return this.resolveSecret(this.hfTokenOverride, s.hfToken);
+  }
+
+  private resolveWebSearchApiKey(s = this.settings.get()): string | undefined {
+    return this.resolveSecret(this.webSearchApiKeyOverride, s.webSearchApiKey);
+  }
+
+  /** Settings with secrets hydrated for tool/runtime use. */
+  getEffectiveSettings(): AppSettings {
+    const s = this.settings.get();
+    return {
+      ...s,
+      githubToken: this.resolveGithubToken(s) || "",
+      hfToken: this.resolveHfToken(s) || "",
+      webSearchApiKey: this.resolveWebSearchApiKey(s) || "",
+    };
   }
 
   private applyRuntimeFetcherConfig(s = this.settings.get()): void {
@@ -243,7 +288,7 @@ export class AppService {
         const st = this.runtime.getStatus();
         return st.installed?.serverPath ?? null;
       },
-      getHfToken: () => this.settings.get().hfToken?.trim() || undefined,
+      getHfToken: () => this.resolveHfToken(),
       getDownloadMethod: () => this.settings.get().hfDownloadMethod || "auto",
       onProgress: (progress, label) => {
         this.onDownloadProgress?.({ progress, label });
@@ -251,11 +296,27 @@ export class AppService {
     });
   }
 
+  private enqueueMcpSync(configs: McpServerConfig[]): Promise<void> {
+    const next = this.mcpSyncChain.then(
+      () => this.mcp.sync(configs),
+      () => this.mcp.sync(configs),
+    );
+    this.mcpSyncChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
   async init(): Promise<void> {
+    await this.store.ready();
     const s = this.settings.get();
     this.applyRuntimeFetcherConfig(s);
     this.applyEmbeddingConfig(s);
-    await this.mcp.sync(s.mcpServers);
+    // Non-blocking — hung MCP must not delay the main window.
+    void this.enqueueMcpSync(s.mcpServers).catch((err) => {
+      this.pushErrorLog("mcp", err instanceof Error ? err.message : String(err));
+    });
     if (s.openaiProxyEnabled) {
       await this.proxy.start(s.openaiProxyPort).catch(() => undefined);
     }
@@ -270,15 +331,50 @@ export class AppService {
       void this.runtime.checkUpdate(s.runtimeBackendPreference).catch(() => undefined);
     }
     this.warmCodebaseIndex();
+    this.projectWatcher.start(s.projectRoot);
   }
 
   async dispose(): Promise<void> {
+    this.projectWatcher.stop();
+    this.agent.cancel();
+    this.chat.stop();
     await this.agent.dispose();
+    await this.enqueueMcpSync([]).catch(() => undefined);
     await this.mcp.closeAll();
     await this.proxy.stop();
     await stopSharedEmbeddingServer();
     await this.runtime.stopServer();
     this.store.close();
+  }
+
+  async addChatAttachment(sourcePath: string): Promise<ChatAttachment> {
+    const src = path.resolve(String(sourcePath || "").trim());
+    if (!src || !fs.existsSync(src) || !fs.statSync(src).isFile()) {
+      throw new Error("Файл вложения не найден");
+    }
+    const stat = fs.statSync(src);
+    if (stat.size > 8 * 1024 * 1024) {
+      throw new Error("Вложение больше 8 МБ");
+    }
+    const dir = getAttachmentsDir(this.appData);
+    const id = uuid();
+    const base = path.basename(src).replace(/[^\w.\-()+ ]+/g, "_").slice(0, 120);
+    const dest = path.join(dir, `${id}-${base}`);
+    await fs.promises.copyFile(src, dest);
+    const ext = path.extname(base).toLowerCase();
+    const mime =
+      ext === ".png"
+        ? "image/png"
+        : ext === ".jpg" || ext === ".jpeg"
+          ? "image/jpeg"
+          : ext === ".gif"
+            ? "image/gif"
+            : ext === ".webp"
+              ? "image/webp"
+              : ext === ".pdf"
+                ? "application/pdf"
+                : "application/octet-stream";
+    return { id, name: base, mime, path: dest, size: stat.size };
   }
 
   async getSystemInfo(): Promise<SystemInfo> {
@@ -310,7 +406,7 @@ export class AppService {
     this.applyRuntimeFetcherConfig(saved);
     this.applyEmbeddingConfig(saved);
     if (JSON.stringify(prev.mcpServers) !== JSON.stringify(saved.mcpServers)) {
-      await this.mcp.sync(saved.mcpServers);
+      await this.enqueueMcpSync(saved.mcpServers);
     }
     if (saved.openaiProxyEnabled && !prev.openaiProxyEnabled) {
       await this.proxy.start(saved.openaiProxyPort);
@@ -323,8 +419,9 @@ export class AppService {
       await this.proxy.start(saved.openaiProxyPort);
     }
     this.systemCache = null;
-    if (saved.projectRoot && saved.projectRoot !== prev.projectRoot) {
-      this.warmCodebaseIndex();
+    if (saved.projectRoot !== prev.projectRoot) {
+      this.projectWatcher.start(saved.projectRoot);
+      if (saved.projectRoot) this.warmCodebaseIndex();
     }
     return saved;
   }
@@ -620,7 +717,7 @@ export class AppService {
   async downloadHf(modelId: string, filePath: string): Promise<string> {
     this.modelDownload = { active: true, progress: 0, label: "Скачивание модели…" };
     try {
-      const s = this.settings.get();
+      const s = this.getEffectiveSettings();
       const method = s.hfDownloadMethod || "auto";
       this.modelDownload = {
         active: true,
@@ -638,7 +735,7 @@ export class AppService {
       });
       const result = await downloadHfFile(modelId, filePath, s.downloadDir, {
         method,
-        token: s.hfToken,
+        token: this.resolveHfToken(s),
         onProgress: (progress, label) => {
           this.modelDownload = { active: true, progress, label };
           this.onDownloadProgress?.({ progress, label });
@@ -649,11 +746,17 @@ export class AppService {
         label: `Готово (${result.via === "cli" ? "HF CLI" : "HTTP"})`,
       });
       // Ensure downloaded files appear in the local scan list.
-      const downloadRoot = path.resolve(s.downloadDir);
-      if (!s.modelRoots.some((r) => path.resolve(r).toLowerCase() === downloadRoot.toLowerCase())) {
+      // Persist via settings.get() — never write decrypted secrets from getEffectiveSettings().
+      const stored = this.settings.get();
+      const downloadRoot = path.resolve(stored.downloadDir);
+      if (
+        !stored.modelRoots.some(
+          (r) => path.resolve(r).toLowerCase() === downloadRoot.toLowerCase(),
+        )
+      ) {
         await this.settings.save({
-          ...s,
-          modelRoots: [...s.modelRoots, s.downloadDir],
+          ...stored,
+          modelRoots: [...stored.modelRoots, stored.downloadDir],
         });
       }
       await this.scanModels();
@@ -665,7 +768,7 @@ export class AppService {
 
   async loadModel(modelId: string, params?: Partial<GenerationParams>): Promise<void> {
     const run = async (): Promise<void> => {
-      if (this.chat.isBusy() || this.agent.isRunning()) {
+      if (this.chat.isBusy() || this.agent.isRunning() || this.agentStartLock) {
         throw new Error("Сначала остановите генерацию или агента, затем загрузите модель");
       }
       const model = this.modelsCache.find((m) => m.id === modelId);
@@ -754,7 +857,7 @@ export class AppService {
 
   async unloadModel(): Promise<void> {
     const run = async () => {
-      if (this.chat.isBusy() || this.agent.isRunning()) {
+      if (this.chat.isBusy() || this.agent.isRunning() || this.agentStartLock) {
         throw new Error("Сначала остановите генерацию или агента");
       }
       await this.runtime.stopServer();
@@ -775,8 +878,27 @@ export class AppService {
     return this.store.createSession(mode, title, this.settings.get().defaultParams);
   }
 
-  updateSession(session: ChatSession): ChatSession {
-    return this.store.updateSession(session);
+  updateSession(patch: SessionPatch | (Partial<ChatSession> & { id: string })): ChatSession {
+    // Whitelist merge — UI snapshot must never wipe agentScratchpad / identity.
+    const existing = this.store.listSessions().find((s) => s.id === patch.id);
+    if (!existing) throw new Error("Сессия не найдена");
+    return this.store.updateSession({
+      ...existing,
+      title: patch.title ?? existing.title,
+      mode: patch.mode ?? existing.mode,
+      toolsEnabled:
+        patch.toolsEnabled !== undefined ? patch.toolsEnabled : existing.toolsEnabled,
+      systemPrompt: patch.systemPrompt ?? existing.systemPrompt,
+      modelId: patch.modelId !== undefined ? patch.modelId : existing.modelId,
+      pinned: patch.pinned !== undefined ? patch.pinned : existing.pinned,
+      folder: patch.folder !== undefined ? patch.folder : existing.folder,
+      params: patch.params
+        ? { ...existing.params, ...patch.params }
+        : existing.params,
+      id: existing.id,
+      createdAt: existing.createdAt,
+      agentScratchpad: existing.agentScratchpad,
+    });
   }
 
   setSessionToolsEnabled(sessionId: string, enabled: boolean): ChatSession {
@@ -829,8 +951,9 @@ export class AppService {
     sessionId: string,
     content: string,
     params?: Partial<GenerationParams>,
+    attachments?: ChatAttachment[],
   ): Promise<ChatMessage> {
-    if (this.agent.isRunning()) {
+    if (this.agent.isRunning() || this.agentStartLock) {
       throw new Error("Агент ещё выполняется. Остановите его перед обычным чатом.");
     }
     const session = this.store.listSessions().find((s) => s.id === sessionId);
@@ -859,7 +982,13 @@ export class AppService {
       }
     }
     try {
-      const result = await this.chat.send(sessionId, content, merged, system);
+      const result = await this.chat.send(
+        sessionId,
+        content,
+        merged,
+        system,
+        attachments,
+      );
       this.maybeRenameSession(session, content);
       this.emitGeneration(sessionId, { type: "done", messageId: result.id });
       return result;
@@ -891,15 +1020,47 @@ export class AppService {
    * Unified send: progress always via onAgentEvent (started → … → done/error/cancelled).
    * Fire-and-forget from IPC — resolves without a ChatMessage when agent path is used.
    */
+  /** Build text block from attachments (text files inlined, others as path meta). */
+  static formatAttachmentsBlock(attachments: ChatAttachment[]): string {
+    if (!attachments.length) return "";
+    const parts: string[] = ["\n\n[Вложения]"];
+    let budget = 32_000;
+    for (const a of attachments) {
+      const isText =
+        /^text\//i.test(a.mime) ||
+        /\.(txt|md|json|ts|tsx|js|jsx|py|rs|go|java|c|cpp|h|css|html|yml|yaml|toml|xml|csv|log)$/i.test(
+          a.name,
+        );
+      if (isText && fs.existsSync(a.path) && budget > 0) {
+        try {
+          const raw = fs.readFileSync(a.path, "utf8");
+          const slice = raw.slice(0, Math.min(budget, 16_000));
+          budget -= slice.length;
+          parts.push(`--- ${a.name} ---\n${slice}`);
+          continue;
+        } catch {
+          /* fall through */
+        }
+      }
+      parts.push(`- ${a.name} (${a.mime}, ${a.size} B) path=${a.path}`);
+    }
+    return parts.join("\n");
+  }
+
   async sendMessage(
     sessionId: string,
     content: string,
-    opts?: { useAgent?: boolean; params?: Partial<GenerationParams> },
+    opts?: {
+      useAgent?: boolean;
+      params?: Partial<GenerationParams>;
+      attachments?: ChatAttachment[];
+    },
   ): Promise<void> {
     const settings = this.settings.get();
     const session = this.store.listSessions().find((s) => s.id === sessionId);
     const preferAgent =
       opts?.useAgent ?? (session ? sessionToolsEnabled(session) : false);
+    // Intent from user text only — attachment bodies must not flip chat→agent / coding.
     const parsed = AppService.parseAgentIntent(content, preferAgent, {
       projectRoot: settings.projectRoot,
     });
@@ -908,10 +1069,10 @@ export class AppService {
     }
     if (!parsed.content) throw new Error("Пустое сообщение");
     if (parsed.useAgent) {
-      await this.startAgent(sessionId, parsed.content);
+      await this.startAgent(sessionId, parsed.content, opts?.attachments);
       return;
     }
-    await this.sendChat(sessionId, parsed.content, opts?.params);
+    await this.sendChat(sessionId, parsed.content, opts?.params, opts?.attachments);
   }
 
   stopGeneration(): void {
@@ -925,68 +1086,69 @@ export class AppService {
     this.genStats.startedAt = Date.now();
   }
 
-  async startAgent(sessionId: string, content: string): Promise<void> {
+  async startAgent(
+    sessionId: string,
+    content: string,
+    attachments?: ChatAttachment[],
+  ): Promise<void> {
     if (this.agent.isRunning() || this.agentStartLock) {
       throw new Error("Агент уже выполняется");
     }
-    const run = async () => {
-      await this.startAgentInner(sessionId, content);
-    };
-    const next = this.loadModelChain.then(run, run);
-    this.loadModelChain = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    await next;
-  }
-
-  private async startAgentInner(sessionId: string, content: string): Promise<void> {
-    if (this.agent.isRunning() || this.agentStartLock) {
-      throw new Error("Агент уже выполняется");
-    }
+    // Sync lock before any await — prevents double-start race.
     this.agentStartLock = true;
     try {
-      if (this.chat.isBusy()) {
-        this.chat.stop();
-      }
-      const session = this.store.listSessions().find((s) => s.id === sessionId);
-      if (!session) throw new Error("Сессия не найдена");
-      const settings = this.settings.get();
-      if (settings.fileAccessMode === "project") {
-        if (!settings.projectRoot) {
-          throw new Error(
-            "Режим project: выберите папку проекта в Настройках перед запуском агента",
-          );
-        }
-        try {
-          const st = fs.statSync(settings.projectRoot);
-          if (!st.isDirectory()) {
-            throw new Error(`Папка проекта не является каталогом: ${settings.projectRoot}`);
-          }
-        } catch (err) {
-          if (err instanceof Error && /Настройках|каталогом/.test(err.message)) throw err;
-          throw new Error(`Папка проекта недоступна: ${settings.projectRoot}`);
-        }
-      } else if (!settings.projectRoot) {
-        this.pushErrorLog(
-          "agent",
-          "Папка проекта не задана — shell/относительные пути могут не работать. Укажите projectRoot в Настройках.",
-        );
-      }
-      await this.runtime.assertLlmReady();
-      this.emitGeneration(sessionId, { type: "started", mode: "agent" });
-      this.noteGenerationStart();
-      this.maybeRenameSession(session, content);
-      await this.agent.run(
-        sessionId,
-        content,
-        settings,
-        session.params,
-        session.systemPrompt,
-      );
+      // Wait for in-flight load/unload without joining the chain as a follower.
+      await this.loadModelChain.catch(() => undefined);
+      await this.startAgentInner(sessionId, content, attachments);
     } finally {
       this.agentStartLock = false;
     }
+  }
+
+  private async startAgentInner(
+    sessionId: string,
+    content: string,
+    attachments?: ChatAttachment[],
+  ): Promise<void> {
+    if (this.chat.isBusy()) {
+      this.chat.stop();
+    }
+    const session = this.store.listSessions().find((s) => s.id === sessionId);
+    if (!session) throw new Error("Сессия не найдена");
+    const settings = this.getEffectiveSettings();
+    if (settings.fileAccessMode === "project") {
+      if (!settings.projectRoot) {
+        throw new Error(
+          "Режим project: выберите папку проекта в Настройках перед запуском агента",
+        );
+      }
+      try {
+        const st = fs.statSync(settings.projectRoot);
+        if (!st.isDirectory()) {
+          throw new Error(`Папка проекта не является каталогом: ${settings.projectRoot}`);
+        }
+      } catch (err) {
+        if (err instanceof Error && /Настройках|каталогом/.test(err.message)) throw err;
+        throw new Error(`Папка проекта недоступна: ${settings.projectRoot}`);
+      }
+    } else if (!settings.projectRoot) {
+      this.pushErrorLog(
+        "agent",
+        "Папка проекта не задана — shell/относительные пути могут не работать. Укажите projectRoot в Настройках.",
+      );
+    }
+    await this.runtime.assertLlmReady();
+    this.emitGeneration(sessionId, { type: "started", mode: "agent" });
+    this.noteGenerationStart();
+    this.maybeRenameSession(session, content);
+    await this.agent.run(
+      sessionId,
+      content,
+      settings,
+      session.params,
+      session.systemPrompt,
+      attachments,
+    );
   }
 
   resolveConfirmation(
@@ -1024,8 +1186,44 @@ export class AppService {
     return this.store.exportSession(sessionId);
   }
 
+  exportSessionFolder(folder: string): SessionExportBundle[] {
+    return this.store.exportSessionFolder(folder);
+  }
+
   importSession(bundle: SessionExportBundle): ChatSession {
     return this.store.importSession(bundle);
+  }
+
+  listCheckpoints(): Array<{
+    runId: string;
+    relPath: string;
+    checkpointPath: string;
+    mtimeMs: number;
+  }> {
+    const root = this.settings.get().projectRoot;
+    if (!root) return [];
+    return listCheckpoints(root);
+  }
+
+  async restoreCheckpoint(checkpointPath: string): Promise<string> {
+    const settings = this.settings.get();
+    if (!settings.projectRoot) throw new Error("Нужна папка проекта");
+    return restoreCheckpoint({
+      projectRoot: settings.projectRoot,
+      checkpointAbsOrRel: checkpointPath,
+      settings,
+    });
+  }
+
+  resolveOpenPath(targetPath: string): string {
+    const settings = this.settings.get();
+    const resolved = resolveAgentPath(targetPath, settings.projectRoot);
+    return assertAllowedPath(
+      resolved,
+      settings.fileAccessMode,
+      settings.projectRoot,
+      settings.modelRoots,
+    );
   }
 
   getErrorLog(): string {
@@ -1059,7 +1257,7 @@ export class AppService {
   }
 
   getCodebaseIndexStatus(): CodebaseIndexStatus {
-    return getCodebaseIndexStatus();
+    return readCodebaseIndexStatus(this.settings.get().projectRoot);
   }
 
   listProjectMentions(): { root: string | null; files: string[] } {
@@ -1115,50 +1313,14 @@ export class AppService {
   }
 
   async reindexCodebase(): Promise<CodebaseIndexStatus> {
-    const root = this.settings.get().projectRoot;
-    if (!root) {
-      return {
-        ready: false,
-        indexing: false,
-        root: null,
-        chunkCount: 0,
-        modelId: "",
-        updatedAt: null,
-        error: "Сначала укажите папку проекта в настройках",
-      };
-    }
-    this.onDownloadProgress?.({ progress: 5, label: "Индексация @codebase…" });
-    try {
-      const status = await reindexCodebase(root, (msg) => {
-        this.onDownloadProgress?.({ progress: 40, label: msg });
-      });
-      this.onDownloadProgress?.({
-        progress: 100,
-        label: status.error
-          ? `Индекс: ${status.error}`
-          : `Индекс готов · ${status.chunkCount} чанков`,
-      });
-      return status;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.onDownloadProgress?.({ progress: 100, label: `Индекс: ${message}` });
-      return {
-        ready: false,
-        indexing: false,
-        root,
-        chunkCount: 0,
-        modelId: "",
-        updatedAt: null,
-        error: message,
-      };
-    }
+    return reindexProjectCodebase(this.settings.get().projectRoot, (p) =>
+      this.onDownloadProgress?.(p),
+    );
   }
 
   /** Warm semantic index in background after project root is set. */
   warmCodebaseIndex(): void {
-    const root = this.settings.get().projectRoot;
-    if (!root) return;
-    void ensureProjectIndex(root).catch(() => undefined);
+    warmProjectCodebaseIndex(this.settings.get().projectRoot);
   }
 
   async getMonitorSnapshot(): Promise<MonitorSnapshot> {

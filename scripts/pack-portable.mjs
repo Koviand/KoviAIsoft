@@ -235,26 +235,43 @@ function stagePackageJson() {
   });
 }
 
+function npmInstallWithFallback(args, label) {
+  const registries = [
+    process.env.npm_config_registry,
+    "https://registry.npmjs.org",
+    "https://registry.npmmirror.com",
+  ].filter(Boolean);
+  const unique = [...new Set(registries)];
+  let lastStatus = 1;
+  for (const registry of unique) {
+    const npmEnv = { ...process.env, npm_config_registry: registry };
+    delete npmEnv.npm_config_shamefully_hoist;
+    console.log(`[pack] ${label} via ${registry}`);
+    const res = spawnSync("npm", args, {
+      cwd: stage,
+      stdio: "inherit",
+      shell: process.platform === "win32",
+      env: npmEnv,
+      timeout: 10 * 60 * 1000,
+    });
+    lastStatus = res.status ?? 1;
+    if (lastStatus === 0) return;
+    console.warn(`[pack] ${label} failed (${lastStatus}) at ${registry}, trying next…`);
+  }
+  throw new Error(`${label} failed (${lastStatus})`);
+}
+
 function installStageDeps() {
   const electronVer = resolveLockedVersion("electron");
   const builderVer = resolveLockedVersion("electron-builder");
-  // Prefer mirror when registry.npmjs.org is flaky (ECONNRESET on some networks).
-  const npmEnv = {
-    ...process.env,
-    npm_config_registry: process.env.npm_config_registry || "https://registry.npmmirror.com",
-  };
-  delete npmEnv.npm_config_shamefully_hoist;
-  // Use npm in stage for a classic flat node_modules electron-builder understands.
-  const res1 = spawnSync(
-    "npm",
-    ["install", "--omit=dev", "--no-audit", "--no-fund", "--fetch-retries=5"],
-    { cwd: stage, stdio: "inherit", shell: process.platform === "win32", env: npmEnv },
-  );
-  if (res1.status !== 0) {
-    throw new Error(`npm install deps failed (${res1.status})`);
+  if (fs.existsSync(path.join(stage, "node_modules"))) {
+    console.log("[pack] refreshing existing pack-stage/node_modules");
   }
-  const res2 = spawnSync(
-    "npm",
+  npmInstallWithFallback(
+    ["install", "--omit=dev", "--no-audit", "--no-fund", "--fetch-retries=5"],
+    "npm install deps",
+  );
+  npmInstallWithFallback(
     [
       "install",
       "--no-save",
@@ -265,11 +282,8 @@ function installStageDeps() {
       `electron@${electronVer}`,
       `electron-builder@${builderVer}`,
     ],
-    { cwd: stage, stdio: "inherit", shell: process.platform === "win32", env: npmEnv },
+    "npm install electron-builder",
   );
-  if (res2.status !== 0) {
-    throw new Error(`npm install electron-builder failed (${res2.status})`);
-  }
   // Ensure Electron binary is actually downloaded (npm may skip scripts).
   run("node", ["node_modules/electron/install.js"], stage);
 }
@@ -388,8 +402,28 @@ async function main() {
   run("pnpm", ["build"]);
 
   console.log("Preparing stage...");
+  // Preserve node_modules across packs — npm install is the slow/flaky step.
+  const preservedNm = path.join(outDir, "_pack-stage-node_modules");
+  const stageNm = path.join(stage, "node_modules");
+  try {
+    if (fs.existsSync(stageNm)) {
+      rmrf(preservedNm);
+      fs.renameSync(stageNm, preservedNm);
+      console.log("[pack] parked node_modules for reuse");
+    }
+  } catch (err) {
+    console.warn("[pack] could not park node_modules:", err);
+  }
   rmrf(stage);
   mkdirp(stage);
+  try {
+    if (fs.existsSync(preservedNm)) {
+      fs.renameSync(preservedNm, stageNm);
+      console.log("[pack] restored node_modules into stage");
+    }
+  } catch (err) {
+    console.warn("[pack] could not restore node_modules:", err);
+  }
   stagePackageJson();
   await bundleMain();
   installStageDeps();

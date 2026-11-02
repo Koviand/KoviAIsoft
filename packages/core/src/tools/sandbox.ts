@@ -509,6 +509,9 @@ export const NEVER_REMEMBER_TOOLS = new Set([
   "browser_click",
   "browser_type",
   "browser_navigate",
+  "git_push",
+  "git_pull",
+  "git_commit",
 ]);
 
 export function approvalRememberKey(
@@ -537,6 +540,13 @@ export function riskForTool(
   if (["run_terminal", "browser_click", "browser_type", "browser_navigate"].includes(name)) {
     return "high";
   }
+  if (name === "git_commit" || name === "git_push") return "high";
+  if (name === "git_pull") return "high";
+  if (name === "git_branch") {
+    const action = String(args.action || "list").toLowerCase();
+    return action === "list" || !args.name ? "low" : "medium";
+  }
+  if (["git_status", "git_diff", "git_log"].includes(name)) return "low";
   if (name === "browser_snapshot") return "medium";
   if (name.startsWith("mcp_")) return "medium";
   if (name === "delete_path") {
@@ -579,10 +589,12 @@ export function shouldConfirmRisk(
   const target = String(args.path || args.file || args.cwd || "");
   if (target && isDangerousSystemDir(target)) return true;
 
-  // Never auto-approve shell / browser mutations, even in "full".
+  // Never auto-approve shell / browser mutations / git push-commit, even in "full".
   if (
     toolName &&
-    ["run_terminal", "browser_click", "browser_type"].includes(toolName)
+    ["run_terminal", "browser_click", "browser_type", "git_commit", "git_push", "git_pull"].includes(
+      toolName,
+    )
   ) {
     return true;
   }

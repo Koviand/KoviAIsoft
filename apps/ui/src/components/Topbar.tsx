@@ -1,14 +1,7 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { AppView, LocalModel, StatusBarInfo } from "@kovi/shared";
 import { api } from "../api";
-
-const NAV: Array<{ id: AppView; label: string }> = [
-  { id: "chat", label: "Чат" },
-  { id: "models", label: "Модели" },
-  { id: "runtime", label: "Движок" },
-  { id: "mcp", label: "MCP" },
-  { id: "settings", label: "Настройки" },
-];
+import { t } from "../i18n";
 
 export function Topbar(props: {
   view: AppView;
@@ -19,8 +12,21 @@ export function Topbar(props: {
   models?: LocalModel[];
   onStop?: () => void;
   onLoadModel?: (modelId: string) => void;
+  /** Bump when settings.language changes to refresh labels. */
+  lang?: string;
 }) {
   const [monitorError, setMonitorError] = useState<string | null>(null);
+  const NAV = useMemo(
+    () =>
+      [
+        { id: "chat" as const, label: t("tab_chat") },
+        { id: "models" as const, label: t("tab_models") },
+        { id: "runtime" as const, label: t("tab_runtime") },
+        { id: "mcp" as const, label: t("tab_mcp") },
+        { id: "settings" as const, label: t("tab_settings") },
+      ] satisfies Array<{ id: AppView; label: string }>,
+    [props.lang],
+  );
   const online = Boolean(props.status?.serverPort);
   const tps = props.status?.tokensPerSecond;
   const agentStep = props.status?.agentStepLabel;

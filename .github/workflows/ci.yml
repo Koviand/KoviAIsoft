@@ -20,4 +20,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - run: pnpm build:shared
+      - run: pnpm build:core
+      - run: pnpm --filter @kovi/ui build
       - run: pnpm test

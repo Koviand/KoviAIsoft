@@ -1,5 +1,10 @@
 import { z } from "zod";
-import type { AppSettings, SessionExportBundle } from "./types.js";
+import type {
+  AppSettings,
+  ChatSession,
+  GenerationParams,
+  SessionExportBundle,
+} from "./types.js";
 import { isThemePreset } from "./types.js";
 
 const resolveConfirmationSchema = z.object({
@@ -62,6 +67,54 @@ export function assertSessionExportBundle(bundle: unknown): SessionExportBundle 
     );
   }
   return parsed.data as unknown as SessionExportBundle;
+}
+
+const sessionPatchSchema = z
+  .object({
+    id: z.string().min(1),
+    title: z.string().max(200).optional(),
+    mode: z.enum(["chat", "agent"]).optional(),
+    toolsEnabled: z.boolean().optional(),
+    systemPrompt: z.string().max(100_000).optional(),
+    modelId: z.string().optional(),
+    pinned: z.boolean().optional(),
+    folder: z.string().max(200).optional(),
+    params: z.record(z.unknown()).optional(),
+  })
+  .strip();
+
+export type SessionPatch = {
+  id: string;
+  title?: string;
+  mode?: ChatSession["mode"];
+  toolsEnabled?: boolean;
+  systemPrompt?: string;
+  modelId?: string;
+  pinned?: boolean;
+  folder?: string;
+  params?: Partial<GenerationParams>;
+};
+
+/** Whitelist session fields from renderer — strips agentScratchpad / createdAt / etc. */
+export function assertSessionPatch(x: unknown): SessionPatch {
+  const parsed = sessionPatchSchema.safeParse(x);
+  if (!parsed.success) {
+    throw new Error(
+      `Некорректная сессия: ${parsed.error.issues[0]?.message || "ошибка"}`,
+    );
+  }
+  const d = parsed.data;
+  return {
+    id: d.id,
+    title: d.title,
+    mode: d.mode,
+    toolsEnabled: d.toolsEnabled,
+    systemPrompt: d.systemPrompt,
+    modelId: d.modelId,
+    pinned: d.pinned,
+    folder: d.folder,
+    params: d.params as Partial<GenerationParams> | undefined,
+  };
 }
 
 /** Deep-ish settings validation for IPC saveSettings. */

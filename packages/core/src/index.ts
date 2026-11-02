@@ -46,6 +46,16 @@ export {
 export type { HardwareLoadSuggestion, LoadTier } from "./models/hardwareProfile.js";
 export * from "./tools/sandbox.js";
 export {
+  gitBranchTool,
+  gitCommitTool,
+  gitDiffTool,
+  gitLogTool,
+  gitPullTool,
+  gitPushTool,
+  gitStatusTool,
+  verifyGithubToken,
+} from "./tools/git.js";
+export {
   adaptCommandForWindows,
   cancelActiveTerminals,
   isBlankCwd,
@@ -73,8 +83,10 @@ export {
 export {
   buildAgentActionGbnf,
   buildAgentActionJsonSchema,
+  buildOpenAiTools,
   nextConstraintModeAfterFailure,
   pickConstraintMode,
+  toolCallsToActionJson,
 } from "./agent/actionSchema.js";
 export {
   parseAgentAction,
