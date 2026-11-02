@@ -21,6 +21,12 @@ describe("parseAgentAction", () => {
     expect(parseAgentAction(raw)?.final).toBe("hi");
   });
 
+  it("keeps inner markdown fences inside final content", () => {
+    const raw =
+      '{"thought":"x","tool":null,"final":"run:\\n```bash\\necho hi\\n```\\ndone"}';
+    expect(parseAgentAction(raw)?.final).toContain("```bash");
+  });
+
   it("parses with trailing comma via sanitize", () => {
     const raw = '{"thought":"ok","tool":null,"final":"done",}';
     expect(parseAgentAction(raw)?.final).toBe("done");

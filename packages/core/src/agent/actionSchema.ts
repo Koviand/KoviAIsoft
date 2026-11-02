@@ -38,17 +38,23 @@ export type BuildToolsOpts = {
   compact?: boolean;
   /** Explicit allow-list of builtin names; defaults from compact. */
   allowBuiltinNames?: string[];
+  /** Hide these builtin names (e.g. network tools when internet is off). */
+  excludeBuiltinNames?: string[];
 };
 
 function selectBuiltinSpecs(opts?: BuildToolsOpts) {
+  const exclude = new Set(opts?.excludeBuiltinNames || []);
+  let specs;
   if (opts?.allowBuiltinNames?.length) {
     const allow = new Set(opts.allowBuiltinNames);
-    return BUILTIN_TOOL_SPECS.filter((t) => allow.has(t.name));
+    specs = BUILTIN_TOOL_SPECS.filter((t) => allow.has(t.name));
+  } else if (opts?.compact) {
+    specs = BUILTIN_TOOL_SPECS.filter((t) => CORE_TOOL_NAMES.has(t.name));
+  } else {
+    specs = [...BUILTIN_TOOL_SPECS];
   }
-  if (opts?.compact) {
-    return BUILTIN_TOOL_SPECS.filter((t) => CORE_TOOL_NAMES.has(t.name));
-  }
-  return [...BUILTIN_TOOL_SPECS];
+  if (!exclude.size) return specs;
+  return specs.filter((t) => !exclude.has(t.name));
 }
 
 /** OpenAI Chat Completions `tools` array from built-in (+ extra) specs. */
@@ -96,6 +102,7 @@ export function toolCallsToActionJson(
     function?: { name?: string; arguments?: string };
   }>,
   thought = "native tool_calls",
+  opts?: { rejectBrokenArgs?: boolean },
 ): string {
   const mapped = toolCalls
     .map((tc) => {
@@ -109,6 +116,8 @@ export function toolCallsToActionJson(
           args = parsed as Record<string, unknown>;
         }
       } catch {
+        // Truncated native args — do not mask as usable {_raw} (blocks boost).
+        if (opts?.rejectBrokenArgs) return null;
         args = { _raw: raw };
       }
       return { name, args };
@@ -120,10 +129,11 @@ export function toolCallsToActionJson(
   if (mapped.length === 1) {
     return JSON.stringify({ thought, tool: mapped[0], final: null });
   }
-  // tools[] only when every call is BATCHABLE read-only; otherwise first call alone.
+  // tools[] only when every call is BATCHABLE read-only; otherwise prefer mutating.
   const allBatchable = mapped.every((m) => BATCHABLE_TOOL_NAMES.has(m.name));
   if (!allBatchable) {
-    return JSON.stringify({ thought, tool: mapped[0], final: null });
+    const mutating = mapped.find((m) => !BATCHABLE_TOOL_NAMES.has(m.name));
+    return JSON.stringify({ thought, tool: mutating || mapped[0], final: null });
   }
   return JSON.stringify({
     thought,

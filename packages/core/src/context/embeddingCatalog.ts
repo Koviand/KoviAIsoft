@@ -57,9 +57,9 @@ export function minilmCacheDir(appData = getAppDataDir()): string {
   return dir;
 }
 
-export function lfm25ModelDir(appData = getAppDataDir()): string {
+export function lfm25ModelDir(appData = getAppDataDir(), create = true): string {
   const dir = path.join(embeddingsRootDir(appData), "lfm25");
-  ensureDir(dir);
+  if (create) ensureDir(dir);
   return dir;
 }
 
@@ -114,14 +114,46 @@ export function isMinilmInstalled(appData = getAppDataDir()): boolean {
   return candidates.some(dirHasOnnx);
 }
 
+/** Recursively collect .gguf under dir (HF download nests LiquidAI__…/). */
+function listGgufFilesRecursive(dir: string): string[] {
+  const out: string[] = [];
+  if (!fs.existsSync(dir)) return out;
+  const stack = [dir];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(cur);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      const full = path.join(cur, name);
+      let st: fs.Stats;
+      try {
+        st = fs.statSync(full);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) {
+        stack.push(full);
+        continue;
+      }
+      if (name.toLowerCase().endsWith(".gguf")) out.push(full);
+    }
+  }
+  return out;
+}
+
 export function findLfmGgufPath(appData = getAppDataDir()): string | null {
-  const dir = lfm25ModelDir(appData);
+  const dir = lfm25ModelDir(appData, false);
   try {
-    const names = fs.readdirSync(dir).filter((n) => n.toLowerCase().endsWith(".gguf"));
-    if (!names.length) return null;
-    const pick = pickLfmGgufFilename(names);
-    const full = path.join(dir, pick);
-    return fs.existsSync(full) ? full : path.join(dir, names[0]!);
+    const files = listGgufFilesRecursive(dir);
+    if (!files.length) return null;
+    const basenames = files.map((f) => path.basename(f));
+    const pickName = pickLfmGgufFilename(basenames);
+    const preferred = files.find((f) => path.basename(f) === pickName);
+    return preferred || files[0]!;
   } catch {
     return null;
   }

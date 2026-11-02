@@ -1,216 +1,115 @@
 # NEED2FIX — аудит KoviAIsoft
 
-Дата: 2026-11-02 (High+Mid+Verify + audit pass-2)  
-Область: safeStorage secrets, git_pull/askpass, attachments, stop reasons, watcher, resume/goal, git timeout/GCM, cmd quoting, constraint overflow, UI races.
+Дата: 2026-11-02 (Pass-2 logic audit после Full polish A–E)  
+Область: security (.git/MCP), Stop/busy races, confirm UI, agent finish/tools[], chat truncation, settings/index/embed/IPC.
 
 Легенда: **pass** ок · **fix** исправлено в этой волне · **smoke** ручная проверка
 
 ---
 
-## Full function matrix (2026-10-30)
+## Full function matrix (актуально)
 
 ### Boot / Settings
 | Функция | Статус | Примечание |
 |---------|--------|-----------|
-| init / dispose | pass | AppService lifecycle |
-| getSystemInfo | fix | VRAM registry + pickMaxVram |
-| getSettings / saveSettings | fix | agentMaxSteps 0; auto-extend/maxRunMinutes; Tavily key; githubToken safeStorage |
-| onboarding wizard | pass | Движок/папки/тема |
+| init / dispose | pass | |
+| getSettings / saveSettings / patch | fix | `settings.patch` без RMW; applyLoadProfile перечитывает latest |
+| getEffectiveSettings | pass | secrets для Tavily |
+| internetAccessMode | pass | off / ask / allow |
+| Settings draft secrets | fix | `__secure__` не попадает в editable fields |
 
-### Runtime
+### Runtime / Embeddings
 | Функция | Статус | Примечание |
 |---------|--------|-----------|
-| detectRuntimeAsset | pass | |
-| installRuntime / ensureLatestRuntime | pass | |
-| checkRuntimeUpdate | pass | |
-| getRuntimeStatus | fix | loadedContext + loadedGpuLayers |
-| loadModel / unloadModel | fix | единый estimateLoadPlan, без silent min(scanner) |
-| runtimeProgress event | pass | |
-| Monitor snapshot / open / alwaysOnTop | fix | UI на push IPC, без второго polling |
+| ensureInstalled / throttle | pass | |
+| loadModel / unloadModel | pass | |
+| semanticIndex single-flight | fix | повторный join после await |
+| EmbeddingServer | fix | exit только текущего child; no respawn после stop |
+| loadVectors align | pass | |
 
-### Models / HF
+### Chat / Agent
 | Функция | Статус | Примечание |
 |---------|--------|-----------|
-| listModels / scanModels | fix | estimateFit = estimateLoadPlan |
-| deleteModel / verifyGguf | pass | тесты |
-| getModelRecommendations | fix | pickMaxVram |
-| suggest/applyHardware / applyLoadProfile | fix | auto-reload loaded model |
-| ModelAdvancedSettings gen sync | fix | activeSessionId, не sessions[0] |
-| searchHf / listHfFiles / downloadHfFile | pass | |
-| getHfCliStatus / ensureHfCli | pass | |
+| sendChat busy gate | fix | `isGenerationBusy()`; abort до assertLlmReady |
+| startAgent Stop during lock | fix | `agentStartAbort`; AGENT_BUSY без terminal error |
+| ChatPage stale done | fix | busy только при `streamSession` match |
+| soft-resume sticky writes | fix | `writtenPaths` / `hadSubstantialWrite` |
+| tools[] + finish_only | fix | batch blocked in finish window |
+| identical tool hard-stop | fix | no_progress после nudge+ |
+| finalize ≠ pendingWork | fix | finish window включается |
+| finish ↔ mustWork | fix | симметрия с final |
+| truncation / native tools | fix | boost при early bal; rejectBrokenArgs |
+| batch coerce + unbill | fix | |
+| finish_only inject | fix | без executePhaseHint |
+| chat auto-continue | fix | system+user+assistant tail |
 
-### Chat
+### Security / Confirm / Tools
 | Функция | Статус | Примечание |
 |---------|--------|-----------|
-| sessions CRUD | pass | |
-| sendChat / sendMessage | fix | long maxTokens + auto-continue ×2 |
-| stopGeneration | pass | chat+agent |
-| session params UI | fix | только gen (temp/topP/maxTokens); ctx/ngl — read-only статус |
-| Continue (resume) | fix | после стопа/бюджета без полного replan |
-| @-picker | fix | listProjectMentions + dropdown файлов/@codebase/@agent |
-| export/import session | pass | + exportSessionFolder |
-| pin / pinned-only filter | fix | Chat sidebar |
-| openPath (клик по пути) | fix | shell.openPath / showItemInFolder |
-| chatToken event | pass | |
-
-### Agent
-| Функция | Статус | Примечание |
-|---------|--------|-----------|
-| startAgent / cancelAgent | pass | stopGeneration alias |
-| resolveConfirmation | pass | |
-| multi-diff review panel | fix | Accept/Reject + Откатить (checkpoint) |
-| plan/parse/tools | fix | plan↔tool; tools[]≤3 RO; git_*; fingerprint |
-| budget exhaust | fix | incomplete + banner «Продолжить»; auto-extend settings |
-| completeJson | fix | tools → json_schema → grammar → Hermes |
-| checkpoints | fix | `.kovi/checkpoints/<runId>/…` + restore IPC |
-| project memory rules | fix | AGENTS.md + `.cursor/rules` + `.kovi/rules` ≤6k |
-| write → @codebase | fix | await invalidateIndexPaths + invalidateRoot |
-| files/shell/browser/web | pass | stderr Диагностика; Tavily+DDG harden |
-
-### Embeddings / @codebase
-| Функция | Статус | Примечание |
-|---------|--------|-----------|
-| list/getEmbeddingStatus | pass | |
-| download/setEmbeddingModel | pass | UI на Движок; reindex on set |
-| reindex / getCodebaseIndexStatus | pass | |
-| listProjectMentions | fix | IPC для @-picker |
-| retrieve @codebase | fix | cache invalidateRoot после мутаций |
-
-### MCP / Proxy
-| Функция | Статус | Примечание |
-|---------|--------|-----------|
-| checkMcpHealth | pass | |
-| MCP UI add/toggle/delete/presets | pass | PageShell |
-| OpenAI proxy start/stop | pass | via saveSettings |
-
-### UI / Desktop IPC
-| Функция | Статус | Примечание |
-|---------|--------|-----------|
-| Все IPC invoke ↔ preload ↔ main | pass | ipc-contract.test (+ listProjectMentions) |
-| pickDirectory / pickFile | pass | |
-| previewFileDiff | pass | |
-| getErrorLog / getStatusBar | pass | |
-| Pages: Chat/Models/Движок/Settings/MCP | fix | структура + preferModelId |
+| `.git` writes | fix | blocked in assertNotInternalProjectPath |
+| git spawn harden | fix | hooksPath= + fsmonitor off; askpass host-aware |
+| MCP remember | fix | rememberKey null; resolve canRemember; high skip remember |
+| confirm timeout UI | fix | agentChanges → rejected; silent resolve ≠ accepted |
+| browser SSRF | fix | ::ffff:v4; xhr/fetch/ws gated |
+| IPC attachments | fix | sendChat / startAgent pass attachments |
 
 ---
 
-## Волна 0 — anti-loop (закрыто)
+## Закрыто в Pass-2
 
-- Finish window (последние 2 шага)
-- Caps: repair 3, truncation 3, identical tool 2, non-advancing 4
-- final/finish на последнем шаге даже без файлов (+ пометка)
-- Budget exhaust → synthesize итог из working memory
-- completeJson: boost до throw + schema hint
-- agentMaxSteps 0=без лимита; auto-extend пока есть работа; finishOnly только без pending work
-- step_done на repair/truncation/blocked ветках
+### Wave 1 P0
+- Block `.git` writes; git `-c core.hooksPath=` / fsmonitor off; askpass hostname-aware
 
----
+### Wave 2
+- agentStartAbort; chat abort before LLM ready; sendChat busy; ChatPage streamSession owns busy; AGENT_BUSY silent
 
-## Cursor-like stability (закрыто)
+### Wave 3
+- MCP/high remember bypass closed; timeout → rejected changes; resolve returns boolean
 
-- A: gen vs load params; Advanced → active session; await index invalidate
-- B: JSON stream harden; Continue; tighter non-advancing
-- C: @picker; multi rules; agent changes panel
-- D: Monitor push-only; retrieve invalidateRoot; githubToken safeStorage
-- E: build:shared/core, typecheck green, vitest 191
+### Wave 4
+- finish_only vs tools[]; identical hard-stop; pendingWork finalize; finish mustWork; truncation boost; sticky writes; batch coerce/unbill; phase inject
 
----
+### Wave 5
+- settings.patch; applyLoadProfile latest; index single-flight; embed child/stop; IPC attachments; secure draft; SSRF; continue context; incomplete copy
 
-## Verify 2026-11-02 (shipped)
-
-| Фича | Статус |
-|------|--------|
-| Anti-loop / finishPolicy | pass |
-| Checkpoints + Откатить | pass |
-| git_* (+ git_pull, askpass env) | pass |
-| tools[] batch ≤3 | pass |
-| native tool_calls cascade | pass |
-| Tavily | pass |
-| SQLite migrate | pass |
-| pin / export folder | pass |
-| openPath | pass |
-| Monitor push-only | pass |
-
-## Открыто / у пользователя
-
-### P0-8. GitHub push auth
-PAT в Settings + «Проверить token»; SSH/`gh auth login` по желанию. Askpass больше не пишет PAT в файл.
+### Wave 6–7
+- `tests/pass2-regressions.test.ts` + sandbox; vitest green; this matrix
 
 ---
 
-## Остаточный долг (P2)
+## Открытый долг (сознательно)
 
 | ID | Тема |
 |----|------|
 | P2-18 | shamefully-hoist |
-| P2-IDE | Monaco / Tab / Cmd+K — вне скоупа (отдельный продукт) |
+| P2-IDE | Monaco / Tab / Cmd+K |
+| P0-8 | GitHub push auth UX (у пользователя) |
 
-Закрыто в High+Mid+Verify: hf/Tavily safeStorage, git_pull, attachments, incomplete reasons, confirm timeout, FS watcher, i18n chrome, rejectProseReasoning, loop phases, CI build.
-
-Закрыто в audit pass-2: confirm resolve types; HF save без plaintext secrets; soft-resume goal; plan/repair hard-stop; non-advancing nudge→×3 stop; git timeout+GCM+validation; cmd verbatim args; context-overflow ≠ constraint reject; chat abort race; importSession id remap; sendMessage intent без attachments; secrets before init; updateSession preserves scratchpad; limitBanner/folderDraft UI.
-
-Закрыто в P2 residual: MCP withTimeout+mcpSyncChain; agent вне loadModelChain; tool persist 20KB; assertSessionPatch; Settings dirty/saveSeq; HF recursive+Link; import folder bundle; confirmation timeoutSec; rg `-e`.
+**P0/P1 логических поломок из Pass-2: нет.**
 
 ---
 
-## Smoke checklist (ручной)
+## Smoke checklist
 
-1. Загрузка GGUF → чат короткий ответ
-2. Длинный ответ (не режется на 4k)
-3. Параметры чата: нет ctx/ngl; статус «Загружено: ctx=… ngl=…»
-4. Advanced → gen sync в **активную** сессию
-5. @agent маленькая задача → final
-6. @agent большая → итог / banner лимита → «Продолжить»
-7. Stop mid-flight → кнопка «Продолжить»
-8. @-picker файлов + @codebase
-9. @codebase после write агента — свежий текст
-10. AGENTS.md + `.cursor/rules/*.md` подхватываются
-11. Confirm → панель «Изменения агента» Accept/Reject/Откатить
-12. Клик по пути в чате → openPath
-13. Pin сессии + «только закреплённые» + экспорт папки
-14. Settings: auto-extend / max run minutes / Tavily
-15. HF search + download
-16. Движок: embedding MiniLM/LFM
-17. MCP health
-18. Под этот ПК → reload модели
-19. GitHub token сохраняется (desktop safeStorage)
+1. Stop во время старта агента (load) → cancelled, агент не стартует  
+2. Режим Чат / Агент + stale done не сбрасывает busy нового запроса  
+3. write в `.git/config` → ошибка sandbox  
+4. MCP confirm: нет «до конца диалога»; IPC remember не сохраняет  
+5. Confirm timeout → rejected в панели изменений  
+6. Finish window: tools[] → nudge final  
+7. Soft-resume после многих shell notes → filesWritten из sticky paths  
+8. Settings: после hardware apply токены не показывают `__secure__`
 
-Авто: `tests/e2e-agent-smoke.test.ts`, `git-tools`, `sqlite-store`.
-
----
-
-## Cursor-like chat (2026-11-02)
-
-| Пункт | Статус | Примечание |
-|-------|--------|-----------|
-| waitForServer exit-check | fix | мёртвый llama-server → сразу ошибка, не 120с |
-| port retry после stop | fix | пауза TIME_WAIT + EADDRINUSE retry |
-| MCP callTool timeout | fix | 75с withTimeout |
-| confirm ≤0 | fix | трактуется как 180с; баннер «Ждёт подтверждения» |
-| chat busy race | fix | abort не сбрасывается mid-recovery |
-| projectRoot → agent session | fix | createSession() по умолчанию agent |
-| detectShortProjectTask | fix | «добавь счёт» при projectRoot |
-| composer mode toggle | fix | Агент/Чат |
-| run/verify soft-skip | fix | nudge ×2 → soft-skip ×3 |
-| identical-tool | fix | nudge, затем final/finish |
-| settings save chain | fix | serialize + saveSeq на hardware apply |
-| preserve agentMaxSteps | fix | не затирать user >0 при «Под этот ПК» |
-| repair unbill | fix | repair/truncation не жгут step budget |
-| tiny-model refusal loop | fix | isModelRefusalText ×2 → incomplete + hint ≥7B |
-| model identity (name/path) | fix | RuntimeStatus.loadedModelName/Path; family не по hash |
-| preferredConstraintMode | fix | tiny/deepseek/lfm → json_schema first |
-| tools soft-fail | fix | prose в tools mode → retry json_schema |
-| compact tools sync | fix | CORE+MCP одинаково в prompt и OpenAI tools |
-| MCP inputSchema | fix | parameters из schema; validate required |
-
-Авто: `tests/cursor-like-chat.test.ts`, `tests/agent-loop-integration.test.ts`, `tests/model-family.test.ts`, `tests/agent-parse-action.test.ts`, `tests/tools-catalog.test.ts`.
+Авто: `pnpm exec vitest run` (279+ tests).
 
 ---
 
 ## Регрессия
 
-- `pnpm build:shared` + `pnpm build:core`
-- `pnpm typecheck` — green
-- `pnpm test` — e2e/git/sqlite + прежние
+```text
+pnpm build:shared && pnpm build:core
+pnpm typecheck
+pnpm exec vitest run
+```
 
-*Обновлено при models↔tools wiring sprint.*
+*Обновлено: Pass-2 logic audit 2026-11-02.*

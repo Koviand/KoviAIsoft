@@ -11,6 +11,12 @@ import type { ChatEngine } from "../chat/engine.js";
 import type { Store } from "../db/store.js";
 import type { McpManager } from "../mcp/manager.js";
 import { BrowserTooling } from "../tools/browser.js";
+import {
+  internetDisabledMessage,
+  isInternetEnabled,
+  isNetworkTool,
+  NETWORK_TOOL_NAMES,
+} from "../tools/internetAccess.js";
 import { cancelActiveTerminals } from "../tools/terminal.js";
 import { resolveAgentPath } from "../tools/sandbox.js";
 import { buildToolConfirmation, evaluateToolConfirmNeed } from "./confirmGate.js";
@@ -71,6 +77,8 @@ import {
   AGENT_REPAIR_MAX,
   AGENT_STEPS_SAFETY_CAP,
   AGENT_TRUNCATION_MAX,
+  AGENT_TRUNCATION_HARD_STOP,
+  AGENT_FINAL_BLOCKED_HARD_STOP,
   agentHasPendingWork,
   clampAgentMaxSteps,
   inFinishWindow,
@@ -193,6 +201,7 @@ export class AgentLoop {
       toolName: string;
       sessionId: string;
       rememberKey: string | null;
+      canRemember: boolean;
       timer?: ReturnType<typeof setTimeout>;
     }
   >();
@@ -227,15 +236,23 @@ export class AgentLoop {
     return this.running;
   }
 
-  resolveConfirmation(id: string, approved: boolean, remember = false): void {
+  /** @returns false when id is unknown/already timed out (UI must not mark accepted). */
+  resolveConfirmation(id: string, approved: boolean, remember = false): boolean {
     const pending = this.pendingConfirm.get(id);
-    if (!pending) return;
+    if (!pending) return false;
     if (pending.timer) clearTimeout(pending.timer);
-    if (approved && remember && pending.sessionId && pending.rememberKey) {
+    if (
+      approved &&
+      remember &&
+      pending.canRemember &&
+      pending.sessionId &&
+      pending.rememberKey
+    ) {
       this.allowFor(pending.sessionId).add(pending.rememberKey);
     }
     pending.resolve(approved ? "approved" : "rejected");
     this.pendingConfirm.delete(id);
+    return true;
   }
 
   private allowFor(sessionId: string): Set<string> {
@@ -294,31 +311,40 @@ export class AgentLoop {
       typeof settings.agentConfirmTimeoutSec === "number"
         ? settings.agentConfirmTimeoutSec
         : 120;
-    // ≤0 used to mean "wait forever" and hung the UI — treat as 180s (Cursor-like).
-    const timeoutSec = rawTimeout <= 0 ? 180 : rawTimeout;
-    const timeoutMs = Math.max(5_000, Math.min(600_000, Math.floor(timeoutSec) * 1000));
+    // 0 = wait forever (UI promise). Negative → 180s safety default.
+    const waitForever = rawTimeout === 0;
+    const timeoutSec = rawTimeout < 0 ? 180 : rawTimeout;
+    const timeoutMs = waitForever
+      ? 0
+      : Math.max(5_000, Math.min(600_000, Math.floor(timeoutSec) * 1000));
     this.emit(sessionId, {
       type: "thinking",
-      text: `Ждёт подтверждения «${toolName}» (до ${Math.round(timeoutMs / 1000)} с)…`,
+      text: waitForever
+        ? `Ждёт подтверждения «${toolName}»…`
+        : `Ждёт подтверждения «${toolName}» (до ${Math.round(timeoutMs / 1000)} с)…`,
     });
     return new Promise<"approved" | "rejected" | "timeout">((resolve) => {
-      const timer = setTimeout(() => {
-        const still = this.pendingConfirm.get(confirmation.id);
-        if (!still) return;
-        this.pendingConfirm.delete(confirmation.id);
-        this.emit(sessionId, {
-          type: "confirmation_timeout",
-          confirmationId: confirmation.id,
-          toolName,
-          timeoutSec: Math.round(timeoutMs / 1000),
-        });
-        still.resolve("timeout");
-      }, timeoutMs);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      if (!waitForever) {
+        timer = setTimeout(() => {
+          const still = this.pendingConfirm.get(confirmation.id);
+          if (!still) return;
+          this.pendingConfirm.delete(confirmation.id);
+          this.emit(sessionId, {
+            type: "confirmation_timeout",
+            confirmationId: confirmation.id,
+            toolName,
+            timeoutSec: Math.round(timeoutMs / 1000),
+          });
+          still.resolve("timeout");
+        }, timeoutMs);
+      }
       this.pendingConfirm.set(confirmation.id, {
         resolve,
         toolName,
         sessionId,
-        rememberKey,
+        rememberKey: confirmation.canRemember === false ? null : rememberKey,
+        canRemember: confirmation.canRemember !== false,
         timer,
       });
     });
@@ -364,6 +390,9 @@ export class AgentLoop {
       });
       const ctxWindow = params.context || 8192;
       const compactTools = ctxWindow < 8192;
+      const excludeNetworkTools = isInternetEnabled(settings)
+        ? []
+        : [...NETWORK_TOOL_NAMES];
       const mcpTools = this.mcp.listTools().map((t) => ({
         name: t.name,
         description: t.description,
@@ -374,7 +403,10 @@ export class AgentLoop {
       for (const t of mcpTools) {
         if (t.inputSchema != null) mcpSchemas[t.name] = t.inputSchema;
       }
-      const toolBlock = toolsPromptBlock(mcpTools, { compact: compactTools });
+      const toolBlock = toolsPromptBlock(mcpTools, {
+        compact: compactTools,
+        excludeBuiltinNames: excludeNetworkTools,
+      });
 
       const session = this.store.listSessions().find((s) => s.id === sessionId);
       const restored = parseWorkingMemory(session?.agentScratchpad);
@@ -431,6 +463,7 @@ export class AgentLoop {
                   plan: [],
                   planFrozen: false,
                   notes: [],
+                  filesTouched: [],
                   lastError: null,
                   lastTool: null,
                   lastResult: null,
@@ -488,24 +521,28 @@ export class AgentLoop {
             id: p.id,
             title: p.title,
             status: (p.status as AgentPlanStep["status"]) || "pending",
+            ...((p as { kind?: AgentPlanStep["kind"] }).kind
+              ? { kind: (p as { kind?: AgentPlanStep["kind"] }).kind }
+              : {}),
           }));
       if (steps.length && workingMemory.planFrozen) {
         this.emit(sessionId, { type: "plan", steps });
       }
       let planAttempts = 0;
       let toolsUsed = 0;
-      let filesWritten = workingMemory.filesTouched?.length
-        ? workingMemory.filesTouched.filter((f) =>
-            workingMemory.notes.some((n) => n.includes(`wrote ${f}`) || /wrote /.test(n)),
-          ).length
-        : 0;
-      // Count prior writes from notes so resume doesn't re-force from zero incorrectly.
-      if (!filesWritten && workingMemory.notes.some((n) => /^wrote /.test(n))) {
-        filesWritten = workingMemory.notes.filter((n) => /^wrote /.test(n)).length;
-      }
+      // Sticky writtenPaths survive notes ring eviction; notes are a fallback.
+      const stickyWrites = workingMemory.writtenPaths?.filter(Boolean) || [];
+      const writeNotes = workingMemory.notes.filter((n) => /^wrote\s+\S/.test(n));
+      const writePaths = new Set([
+        ...stickyWrites,
+        ...writeNotes
+          .map((n) => n.replace(/^wrote\s+/, "").trim())
+          .filter(Boolean),
+      ]);
+      let filesWritten = writePaths.size;
       let substantialWrite =
-        filesWritten > 0 &&
-        workingMemory.notes.some((n) => /^wrote /.test(n) && !/stub/i.test(n));
+        Boolean(workingMemory.hadSubstantialWrite) ||
+        (filesWritten > 0 && writeNotes.some((n) => !/stub/i.test(n)));
       let stubNudgeCount = 0;
       let lastRetrieveAt = 0;
       const wantsFiles = detectCodingTask(effectiveGoal || userContent);
@@ -564,6 +601,7 @@ export class AgentLoop {
       let lastPhaseKind: "plan" | "execute" | "finish_only" | null = null;
       let repairAttempts = 0;
       let truncationStreak = 0;
+      let finalBlockedStreak = 0;
       let identicalToolStreak = 0;
       let lastToolFp: string | null = null;
       let identicalNudgeSent = false;
@@ -660,23 +698,27 @@ export class AgentLoop {
                 ? `${stepLabel}: исполнение плана…`
                 : `${stepLabel}: составление плана…`,
         });
-        if (phase === "finish_only" && planFrozen) {
-          transcript.push({
-            role: "user",
-            content:
-              "Работа по плану завершена. ЗАПРЕЩЕНЫ новые tool. Верни JSON с final (краткий итог) или tool finish.",
-          });
-        }
-
         // Inject phase instruction once per phase (not every tool turn).
         syncSystem();
         if (lastPhaseKind !== phase) {
-          const phaseHint =
-            phase === "plan"
-              ? planPhaseInstruction(wantsFiles)
-              : executePhaseHint(curPlan, steps);
-          transcript.push({ role: "user", content: phaseHint });
+          if (phase === "finish_only") {
+            transcript.push({
+              role: "user",
+              content:
+                "Финальное окно. ЗАПРЕЩЕНЫ новые tool (в т.ч. tools[]). Верни JSON с final (краткий итог) или tool finish.",
+            });
+          } else {
+            const phaseHint =
+              phase === "plan"
+                ? planPhaseInstruction(wantsFiles)
+                : executePhaseHint(curPlan, steps);
+            transcript.push({ role: "user", content: phaseHint });
+          }
           lastPhaseKind = phase;
+        }
+        // After plan freeze, next turn is execute — avoid re-injecting plan hint.
+        if (phase === "plan" && workingMemory.planFrozen) {
+          lastPhaseKind = "execute";
         }
 
         let raw: string;
@@ -736,6 +778,7 @@ export class AgentLoop {
               extraToolNames: phase === "plan" ? [] : extraToolNames,
               extraTools: phase === "plan" ? [] : mcpTools,
               compact: compactTools,
+              excludeBuiltinNames: excludeNetworkTools,
               planOnly: phase === "plan",
               preferredConstraint:
                 phase === "plan" ? "json_schema" : constraintPrefer,
@@ -749,6 +792,15 @@ export class AgentLoop {
                 type: "thinking",
                 text: `Ответ обрезан по max_tokens (${truncationStreak}/${AGENT_TRUNCATION_MAX})`,
               });
+              if (truncationStreak >= AGENT_TRUNCATION_HARD_STOP) {
+                this.emit(sessionId, {
+                  type: "step_done",
+                  stepId,
+                  detail: "truncation hard-stop",
+                });
+                if (!stopReason) stopReason = "no_progress";
+                break;
+              }
               if (truncationStreak >= AGENT_TRUNCATION_MAX || finishOnly) {
                 this.emit(sessionId, {
                   type: "step_done",
@@ -798,6 +850,7 @@ export class AgentLoop {
               extraToolNames: phase === "plan" ? [] : extraToolNames,
               extraTools: phase === "plan" ? [] : mcpTools,
               compact: compactTools,
+              excludeBuiltinNames: excludeNetworkTools,
               planOnly: phase === "plan",
               preferredConstraint:
                 phase === "plan" ? "json_schema" : constraintPrefer,
@@ -815,6 +868,15 @@ export class AgentLoop {
               type: "thinking",
               text: `Обрезка ответа (${truncationStreak}/${AGENT_TRUNCATION_MAX})`,
             });
+            if (truncationStreak >= AGENT_TRUNCATION_HARD_STOP) {
+              this.emit(sessionId, {
+                type: "step_done",
+                stepId,
+                detail: "truncation hard-stop",
+              });
+              if (!stopReason) stopReason = "no_progress";
+              break;
+            }
             this.emit(sessionId, {
               type: "step_done",
               stepId,
@@ -839,13 +901,15 @@ export class AgentLoop {
 
         const inPlanPhase = !finishOnly && !planFrozen;
         const parsed = parseAgentAction(raw, inPlanPhase ? "plan" : "execute");
-        // Tiny instruct models often refuse in prose / JSON thought+final without tools.
-        const refusalBlob = [
-          raw,
-          parsed?.thought || "",
-          parsed?.final || "",
-        ].join("\n");
-        if (isModelRefusalText(refusalBlob)) {
+        // Refusal only when there is NO actionable tool/plan — don't kill valid write_file.
+        const hasAction =
+          Boolean(parsed?.tool?.name) ||
+          (Array.isArray(parsed?.tools) && parsed!.tools!.length > 0) ||
+          (inPlanPhase && Array.isArray(parsed?.plan) && parsed!.plan!.length > 0);
+        const refusalBlob = hasAction
+          ? ""
+          : [raw, parsed?.thought || "", parsed?.final || ""].join("\n");
+        if (!hasAction && isModelRefusalText(refusalBlob)) {
           refusalStreak += 1;
           this.emit(sessionId, {
             type: "thinking",
@@ -881,12 +945,14 @@ export class AgentLoop {
           transcript.push({ role: "assistant", content: raw.slice(0, 2000) });
           transcript.push({
             role: "user",
-            content:
-              "Это задача локального coding-агента, не запрещённый контент. " +
-              "Верни строго JSON с tool (write_file/run_terminal/…) по текущему пункту плана. " +
-              "Без отказа текстом. Пример: {\"thought\":\"пишу файл\",\"tool\":{\"name\":\"write_file\",\"args\":{\"path\":\"main.py\",\"content\":\"...\"}},\"final\":null}",
+            content: inPlanPhase
+              ? "Это локальный coding-агент. Верни JSON с plan (3–7 шагов, kind). Без отказа текстом."
+              : "Это задача локального coding-агента, не запрещённый контент. " +
+                "Верни строго JSON с tool (write_file/run_terminal/…) по текущему пункту плана. " +
+                "Без отказа текстом. Пример: {\"thought\":\"пишу файл\",\"tool\":{\"name\":\"write_file\",\"args\":{\"path\":\"main.py\",\"content\":\"...\"}},\"final\":null}",
           });
           this.emit(sessionId, { type: "step_done", stepId, detail: "refusal nudge" });
+          unbillStep();
           continue;
         }
         refusalStreak = 0;
@@ -1067,6 +1133,20 @@ export class AgentLoop {
 
         // ——— Batch read-only tools (parallel) ———
         if (Array.isArray(parsed.tools) && parsed.tools.length && !parsed.tool?.name) {
+          if (finishOnly) {
+            this.emit(sessionId, {
+              type: "step_done",
+              stepId,
+              detail: "finish window — tools[] blocked",
+            });
+            transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+            transcript.push({
+              role: "user",
+              content:
+                "Финальное окно: tools[] запрещён. Верни final или tool finish без новых инструментов.",
+            });
+            continue;
+          }
           const batchResult = await runBatchTools({
             tools: parsed.tools,
             settings,
@@ -1079,6 +1159,7 @@ export class AgentLoop {
           });
           if (!batchResult.ok) {
             this.emit(sessionId, { type: "step_done", stepId, detail: "repair" });
+            unbillStep();
             transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
             transcript.push({
               role: "user",
@@ -1087,7 +1168,6 @@ export class AgentLoop {
             continue;
           }
           toolsUsed += batchResult.count;
-          nonAdvancingStreak += 1;
           const combined = batchResult.combined.slice(0, TOOL_RESULT_TRANSCRIPT_CHARS * 2);
           rememberToolSuccess(
             workingMemory,
@@ -1095,6 +1175,20 @@ export class AgentLoop {
             {},
             combined.slice(0, 400),
           );
+          const curExplore = currentPlanStep(steps);
+          const batchNames = (parsed.tools || []).map((t) => t.name).filter(Boolean);
+          const allExplore =
+            curExplore?.kind === "explore" &&
+            batchNames.length > 0 &&
+            batchNames.every((n) => isExploreTool(n));
+          if (allExplore && shouldAdvancePlanOnTool(curExplore, batchNames[0]!)) {
+            steps = markCurrentPlanDone(steps);
+            updatePlanMemory(workingMemory, steps);
+            nonAdvancingStreak = 0;
+            this.emit(sessionId, { type: "plan", steps });
+          } else {
+            nonAdvancingStreak += 1;
+          }
           persistScratchpad();
           this.emit(sessionId, {
             type: "step_done",
@@ -1106,6 +1200,10 @@ export class AgentLoop {
             role: "user",
             content: `Результаты batch tools (${batchResult.count}):\n${combined}`,
           });
+          if (nonAdvancingStreak > AGENT_NON_ADVANCING_HARD_STOP) {
+            if (!stopReason) stopReason = "no_progress";
+            break;
+          }
           if (nonAdvancingStreak > AGENT_NON_ADVANCING_MAX) {
             transcript.push({
               role: "user",
@@ -1113,7 +1211,7 @@ export class AgentLoop {
                 ? "Хватит разведки (tools[]). Сделай write_file/apply_patch или final."
                 : "Хватит разведки. Выполни действие по плану или final.",
             });
-            nonAdvancingStreak = 0;
+            // Keep streak — do not reset (hard-stop must still fire).
           }
           continue;
         }
@@ -1142,11 +1240,16 @@ export class AgentLoop {
                 (pendingLeft && !currentIsFinalish && toolsUsed === 0)));
           if (mustWork) {
             if (stubOnly) stubNudgeCount += 1;
+            finalBlockedStreak += 1;
             this.emit(sessionId, {
               type: "step_done",
               stepId,
               detail: "final_blocked",
             });
+            if (finalBlockedStreak >= AGENT_FINAL_BLOCKED_HARD_STOP) {
+              if (!stopReason) stopReason = "no_progress";
+              break;
+            }
             const curTitle = current
               ? ` Пункт [${current.id}]: ${current.title}.`
               : "";
@@ -1162,6 +1265,7 @@ export class AgentLoop {
             // Count toward budget — otherwise thought-only loops never stop.
             continue;
           }
+          finalBlockedStreak = 0;
           let finalText = parsed.final;
           if (wantsFiles && filesWritten === 0) {
             finalText +=
@@ -1187,7 +1291,12 @@ export class AgentLoop {
         }
 
         if (!parsed.tool?.name) {
+          finalBlockedStreak += 1;
           this.emit(sessionId, { type: "step_done", stepId, detail: "no tool" });
+          if (finalBlockedStreak >= AGENT_FINAL_BLOCKED_HARD_STOP) {
+            if (!stopReason) stopReason = "no_progress";
+            break;
+          }
           const cur = currentPlanStep(steps);
           const curHint = cur
             ? `Текущий пункт плана [${cur.id}]: ${cur.title}.`
@@ -1204,6 +1313,7 @@ export class AgentLoop {
           // Count toward budget — empty turns must not loop forever.
           continue;
         }
+        finalBlockedStreak = 0;
 
         if (finishOnly && parsed.tool.name !== "finish") {
           this.emit(sessionId, {
@@ -1229,6 +1339,12 @@ export class AgentLoop {
           mcpSchemas,
         );
         if (!argCheck.ok) {
+          const badFp = toolFingerprint(toolName, coerced);
+          if (badFp === lastToolFp) identicalToolStreak += 1;
+          else {
+            identicalToolStreak = 1;
+            lastToolFp = badFp;
+          }
           transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
           transcript.push({
             role: "user",
@@ -1239,10 +1355,39 @@ export class AgentLoop {
             stepId,
             detail: argCheck.error,
           });
+          if (identicalToolStreak >= AGENT_IDENTICAL_TOOL_MAX) {
+            if (!stopReason) stopReason = "no_progress";
+            break;
+          }
           continue;
         }
         const args = argCheck.args;
         parsed.tool = { name: toolName, args };
+
+        if (isNetworkTool(toolName) && !isInternetEnabled(settings)) {
+          const deny = internetDisabledMessage(toolName);
+          const netCallId = `net-off-${Date.now()}`;
+          this.emit(sessionId, {
+            type: "tool_call",
+            callId: netCallId,
+            name: toolName,
+            args,
+            status: "running",
+          });
+          this.emit(sessionId, {
+            type: "tool_result",
+            callId: netCallId,
+            result: deny,
+            isError: true,
+          });
+          this.emit(sessionId, { type: "step_done", stepId, detail: deny });
+          transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
+          transcript.push({
+            role: "user",
+            content: `Результат инструмента ${toolName}: ${deny}`,
+          });
+          continue;
+        }
 
         // Fingerprint before emitting tool_call so identical retries don't spam the UI.
         const fp = toolFingerprint(toolName, args);
@@ -1286,12 +1431,13 @@ export class AgentLoop {
               content:
                 "Повтор инструмента исчерпан. Верни JSON с final (краткий честный итог) или tool finish.",
             });
-            identicalToolStreak = 0;
-            lastToolFp = null;
+            if (identicalToolStreak > AGENT_IDENTICAL_TOOL_MAX + 4) {
+              if (!stopReason) stopReason = "no_progress";
+              break;
+            }
+            // One last chance for final — do not reset fingerprint forever.
             continue;
           }
-          identicalToolStreak = 0;
-          lastToolFp = null;
           transcript.push({
             role: "user",
             content:
@@ -1310,19 +1456,34 @@ export class AgentLoop {
         });
 
         if (toolName === "finish") {
-          const blockFinishNoFile = wantsFiles && filesWritten === 0 && !finishOnly;
-          const blockFinishStub =
+          // Same mustWork gate as free-text final (symmetry).
+          const noFileYetFinish = wantsFiles && filesWritten === 0 && !finishOnly;
+          const stubOnlyFinish =
             wantsFiles &&
             filesWritten > 0 &&
             !substantialWrite &&
             stubNudgeCount < 2 &&
-            !finishOnly &&
-            i < stepBudget - 1;
-          if (blockFinishNoFile || blockFinishStub) {
-            if (blockFinishStub) stubNudgeCount += 1;
-            const deny = blockFinishNoFile
+            !finishOnly;
+          const pendingLeftFinish = steps.some((s) => s.status === "pending");
+          const currentFinish = currentPlanStep(steps);
+          const currentIsFinalishFinish =
+            currentFinish &&
+            (currentFinish.kind === "finalize" ||
+              /итог|final|finish|отчет|отчёт|резюме/i.test(currentFinish.title));
+          const mustWorkFinish =
+            noFileYetFinish ||
+            (!finishOnly &&
+              i < stepBudget - 1 &&
+              (stubOnlyFinish ||
+                (!wantsFiles && toolsUsed === 0 && steps.length > 0) ||
+                (pendingLeftFinish && !currentIsFinalishFinish && toolsUsed === 0)));
+          if (mustWorkFinish) {
+            if (stubOnlyFinish) stubNudgeCount += 1;
+            const deny = noFileYetFinish
               ? "finish отклонён: файлы ещё не записаны. Вызови write_file с полным кодом."
-              : "finish отклонён: код ещё stub. Допиши файлы (write_file/apply_patch), затем finish.";
+              : stubOnlyFinish
+                ? "finish отклонён: код ещё stub. Допиши файлы (write_file/apply_patch), затем finish."
+                : "finish отклонён: сначала выполни текущий пункт плана инструментом.";
             this.emit(sessionId, { type: "tool_result", callId, result: deny, isError: true });
             this.emit(sessionId, { type: "step_done", stepId, detail: deny });
             transcript.push({ role: "assistant", content: JSON.stringify(parsed) });
@@ -1443,13 +1604,25 @@ export class AgentLoop {
               const contentLen = String(normalizedArgs.content ?? "").length;
               if (contentLen >= minWriteCharsForPath(targetPath)) {
                 substantialWrite = true;
+                workingMemory.hadSubstantialWrite = true;
               }
             } else {
-              // apply_patch: small diffs are valid if they replace real code.
+              // apply_patch: small diffs / replacements[] are valid mutations.
+              const reps = normalizedArgs.replacements;
+              const hasReps =
+                Array.isArray(reps) &&
+                reps.some(
+                  (r) =>
+                    r &&
+                    typeof r === "object" &&
+                    String((r as { oldText?: string }).oldText ?? "").length >= 1 &&
+                    String((r as { newText?: string }).newText ?? "").length >= 1,
+                );
               const newLen = String(normalizedArgs.newText ?? "").length;
               const oldLen = String(normalizedArgs.oldText ?? "").length;
-              if (newLen >= 1 && oldLen >= 1) {
+              if (hasReps || (newLen >= 1 && oldLen >= 1)) {
                 substantialWrite = true;
+                workingMemory.hadSubstantialWrite = true;
               }
             }
             if (settings.projectRoot && targetPath) {

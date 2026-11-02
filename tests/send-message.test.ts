@@ -12,7 +12,7 @@ describe("unified send / session tools", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("parses @agent / /agent prefixes and project actions", () => {
+  it("parses @agent / /agent prefixes; chat mode never auto-agents", () => {
     expect(AppService.parseAgentIntent("hello", false)).toEqual({
       content: "hello",
       useAgent: false,
@@ -30,17 +30,19 @@ describe("unified send / session tools", () => {
       useAgent: true,
     });
     expect(AppService.parseAgentIntent("@agent", false).emptyAgentPrefix).toBe(true);
+
+    // preferAgent=false (chat mode): coding intent stays in chat.
     expect(
       AppService.parseAgentIntent(
         "Я хочу чтобы ты написал игру Tetris на Python",
         false,
       ).useAgent,
-    ).toBe(true);
+    ).toBe(false);
     expect(
       AppService.parseAgentIntent("перепиши auth модуль", false, {
         projectRoot: "C:\\proj",
       }).useAgent,
-    ).toBe(true);
+    ).toBe(false);
     expect(
       AppService.parseAgentIntent("привет", false, {
         projectRoot: "C:\\proj",
@@ -50,17 +52,20 @@ describe("unified send / session tools", () => {
       AppService.parseAgentIntent("исправь файл main.py", false, {
         projectRoot: "C:\\proj",
       }).useAgent,
-    ).toBe(true);
+    ).toBe(false);
     expect(
       AppService.parseAgentIntent("implement tetris game in python", false).useAgent,
-    ).toBe(true);
+    ).toBe(false);
     expect(
       AppService.parseAgentIntent("запусти npm test", false, {
         projectRoot: "C:\\proj",
       }).useAgent,
-    ).toBe(true);
+    ).toBe(false);
+    expect(AppService.parseAgentIntent("запусти npm test", false).useAgent).toBe(false);
+
+    // preferAgent=true (agent mode): coding routes to agent.
     expect(
-      AppService.parseAgentIntent("запусти npm test", false).useAgent,
+      AppService.parseAgentIntent("implement tetris game in python", true).useAgent,
     ).toBe(true);
   });
 
@@ -75,11 +80,25 @@ describe("unified send / session tools", () => {
         const chat = svc.createSession("chat", "tools-on");
         await expect(svc.sendMessage(chat.id, "@agent")).rejects.toThrow(/@agent/);
 
-        svc.setSessionToolsEnabled(chat.id, true);
+        // Chat mode: plain question must NOT start agent.
         let agentStarted = false;
         svc.startAgent = async () => {
           agentStarted = true;
         };
+        // Stub chat path so we don't need a loaded model.
+        svc.sendChat = async () =>
+          ({
+            id: "m1",
+            sessionId: chat.id,
+            role: "assistant",
+            content: "ok",
+            createdAt: new Date().toISOString(),
+          }) as never;
+        await svc.sendMessage(chat.id, "просто вопрос без coding");
+        expect(agentStarted).toBe(false);
+
+        svc.setSessionToolsEnabled(chat.id, true);
+        agentStarted = false;
         await svc.sendMessage(chat.id, "просто вопрос без coding");
         expect(agentStarted).toBe(true);
       } finally {
@@ -107,7 +126,6 @@ describe("unified send / session tools", () => {
       expect(toggled.toolsEnabled).toBe(true);
       expect(toggled.mode).toBe("agent");
 
-      // Unified list includes both modes
       const all = svc.listSessions();
       expect(all.some((s) => s.id === agent.id)).toBe(true);
       expect(all.some((s) => s.id === chat.id)).toBe(true);

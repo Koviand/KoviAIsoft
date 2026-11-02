@@ -13,6 +13,35 @@ import { getSettingsPath, ensureDir, getModelsDir } from "./paths.js";
 
 const LEGACY_PROFILE_IDS = new Set(["max-quality", "low-vram"]);
 
+/**
+ * Portable EXE moved to another folder: rewrite absolute paths that still point
+ * at a sibling `data/` tree under an old install root.
+ */
+function migratePortablePath(
+  raw: string,
+  appData: string,
+  fallback: string,
+): string {
+  const value = String(raw || "").trim();
+  if (!value) return fallback;
+  try {
+    const resolved = path.resolve(value);
+    if (fs.existsSync(resolved)) return resolved;
+    // Old path …\OldInstall\data\models → …\NewInstall\data\models
+    const base = path.basename(appData).toLowerCase();
+    if (base !== "data") return value;
+    const parts = resolved.split(/[/\\]/).filter(Boolean);
+    const dataIdx = parts.map((p) => p.toLowerCase()).lastIndexOf("data");
+    if (dataIdx >= 0 && dataIdx < parts.length - 1) {
+      const tail = parts.slice(dataIdx + 1).join(path.sep);
+      return path.join(appData, tail);
+    }
+  } catch {
+    /* keep */
+  }
+  return value;
+}
+
 function migrateLoadProfiles(profiles: LoadProfile[]): LoadProfile[] {
   const mapped = profiles.map((p) => {
     const id = migrateLoadProfileId(p.id) || p.id;
@@ -90,6 +119,37 @@ export class SettingsStore {
     return queued;
   }
 
+  /** Patch a single field from latest in-memory state (avoids RMW with concurrent saves). */
+  async patch(partial: Partial<AppSettings>): Promise<AppSettings> {
+    const run = async (): Promise<AppSettings> => {
+      const next = { ...this.settings, ...partial };
+      return this.save(next);
+    };
+    // Nested save also joins saveChain — call merge inline to avoid double-queue deadlock.
+    const runInline = async (): Promise<AppSettings> => {
+      const merged = this.mergePartial(createDefaultSettings(this.appData), {
+        ...this.settings,
+        ...partial,
+      });
+      merged.agentMaxSteps = normalizeAgentMaxStepsSetting(
+        partial.agentMaxSteps ?? merged.agentMaxSteps,
+      );
+      this.settings = structuredClone(merged);
+      await writeFileAtomic(
+        getSettingsPath(this.appData),
+        JSON.stringify(this.settings, null, 2),
+      );
+      return this.get();
+    };
+    void run;
+    const queued = this.saveChain.then(runInline, runInline);
+    this.saveChain = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
+  }
+
   private mergePartial(defaults: AppSettings, parsed: Partial<AppSettings>): AppSettings {
     const loadProfiles: LoadProfile[] = migrateLoadProfiles(
       parsed.loadProfiles?.length
@@ -107,11 +167,16 @@ export class SettingsStore {
       themePreset: isThemePreset(parsed.themePreset) ? parsed.themePreset : defaults.themePreset,
       themeCustom: { ...defaults.themeCustom, ...(parsed.themeCustom || {}) },
       defaultParams: { ...defaults.defaultParams, ...(parsed.defaultParams || {}) },
-      modelRoots: parsed.modelRoots?.length ? parsed.modelRoots : defaults.modelRoots,
-      downloadDir:
+      modelRoots: (parsed.modelRoots?.length ? parsed.modelRoots : defaults.modelRoots).map(
+        (r) => migratePortablePath(r, this.appData, defaults.downloadDir),
+      ),
+      downloadDir: migratePortablePath(
         typeof parsed.downloadDir === "string" && parsed.downloadDir.trim()
           ? parsed.downloadDir.trim()
           : defaults.downloadDir,
+        this.appData,
+        defaults.downloadDir,
+      ),
       mcpServers: parsed.mcpServers || [],
       autoUpdateRuntime:
         typeof parsed.autoUpdateRuntime === "boolean"
@@ -196,6 +261,12 @@ export class SettingsStore {
         typeof parsed.webSearchApiKey === "string"
           ? parsed.webSearchApiKey
           : defaults.webSearchApiKey,
+      internetAccessMode:
+        parsed.internetAccessMode === "off" ||
+        parsed.internetAccessMode === "ask" ||
+        parsed.internetAccessMode === "allow"
+          ? parsed.internetAccessMode
+          : defaults.internetAccessMode,
     };
   }
 

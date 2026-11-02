@@ -133,7 +133,7 @@ export class RuntimeManager {
       downloading: this.downloading,
       downloadProgress: this.downloadProgress,
       downloadLabel: this.downloadLabel,
-      serverRunning: Boolean(this.process && !this.process.killed),
+      serverRunning: this.isProcessAlive(),
       serverPort: this.port,
       loadedModelId: this.loadedModelId,
       loadedModelName: this.loadedModelId ? this.loadedModelName : null,
@@ -460,7 +460,20 @@ export class RuntimeManager {
   ): Promise<InstalledRuntime> {
     if (!this.installed) this.refreshInstalled();
     if (this.installed && fs.existsSync(this.installed.serverPath)) {
-      return this.installed;
+      // Prefer matching backend when preference is explicit (or auto→recommended).
+      try {
+        const want =
+          backendPref === "auto"
+            ? (await detectSystemInfo("auto")).recommendedBackend
+            : backendPref;
+        if (this.installed.backend === want) {
+          return this.installed;
+        }
+        // Wrong backend installed — download the preferred one.
+        return this.install(backendPref);
+      } catch {
+        return this.installed;
+      }
     }
     return this.install(backendPref);
   }
@@ -720,7 +733,8 @@ export class RuntimeManager {
         "--no-webui",
       ];
       if (params.flashAttn) {
-        args.push("-fa");
+        // Modern llama.cpp requires an explicit value (on|off|auto).
+        args.push("-fa", "on");
       }
       if (model.mmprojPath) {
         args.push("--mmproj", model.mmprojPath);

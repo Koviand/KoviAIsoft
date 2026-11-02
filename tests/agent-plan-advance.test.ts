@@ -84,11 +84,12 @@ describe("isSoftResumeGoal", () => {
     ).toBe(true);
   });
 
-  it("does not soft-resume on token overlap or continue without unfinished plan", () => {
+  it("does not soft-resume on token overlap; continue cue always keeps notes", () => {
     expect(isSoftResumeGoal("добавь счёт в tetris", "сделай tetris игру")).toBe(false);
+    // Explicit «продолжи» soft-resumes even without unfinished plan (avoid wipe notes).
     expect(
       isSoftResumeGoal("продолжи", "сделай тетрис", { hasUnfinishedFrozenPlan: false }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("resets on unrelated goal", () => {

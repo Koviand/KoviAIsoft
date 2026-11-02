@@ -34,7 +34,13 @@ import {
   type ApplyLoadSettingsResult,
   type HardwareLoadSuggestion,
 } from "@kovi/shared";
-import { detectAgentTask } from "./agent/intent.js";
+import {
+  detectAgentTask,
+  detectLiveWebNeed,
+} from "./agent/intent.js";
+import { fetchWeatherBrief } from "./tools/weather.js";
+import { isInternetEnabled } from "./tools/internetAccess.js";
+import { webSearch } from "./tools/websearch.js";
 import { AgentLoop } from "./agent/loop.js";
 import { ChatEngine } from "./chat/engine.js";
 import { buildProjectContext } from "./context/packer.js";
@@ -122,6 +128,10 @@ export class AppService {
   /** Serialize MCP sync so background init cannot race saveSettings. */
   private mcpSyncChain: Promise<void> = Promise.resolve();
   private agentStartLock = false;
+  /** Abort in-flight startAgent waits (loadModelChain) before agent.run. */
+  private agentStartAbort: AbortController | null = null;
+  /** Abort weather/web/context prep before chat.send starts its own controller. */
+  private chatPrepAbort: AbortController | null = null;
   private projectWatcher = new ProjectRootWatcher();
 
   onRuntimeProgress?: (p: { progress: number; label: string }) => void;
@@ -212,7 +222,16 @@ export class AppService {
 
   private shouldSkipRuntimeCheck(force?: boolean): boolean {
     if (force) return false;
-    if (!this.runtime.getStatus().installed) return false;
+    const st = this.runtime.getStatus();
+    if (!st.installed) return false;
+    // Local backend mismatch must not wait 24h for ensureLatest.
+    if (st.update?.updateAvailable && /backend|отложен/i.test(st.update.message || "")) {
+      return false;
+    }
+    const pref = this.settings.get().runtimeBackendPreference;
+    if (pref !== "auto" && st.installed.backend !== pref) {
+      return false;
+    }
     const last = this.settings.get().runtimeLastCheckAt;
     if (!last) return false;
     const ts = Date.parse(last);
@@ -221,9 +240,7 @@ export class AppService {
   }
 
   private async markRuntimeChecked(): Promise<void> {
-    const s = this.settings.get();
-    await this.settings.save({
-      ...s,
+    await this.settings.patch({
       runtimeLastCheckAt: new Date().toISOString(),
     });
   }
@@ -452,6 +469,14 @@ export class AppService {
     }
     if (saved.runtimeBackendPreference !== prev.runtimeBackendPreference) {
       this.clearSystemCache();
+      void this.ensureLatestRuntime(saved.runtimeBackendPreference, {
+        force: true,
+      }).catch((err) => {
+        this.pushErrorLog(
+          "runtime",
+          err instanceof Error ? err.message : String(err),
+        );
+      });
     }
     if (saved.projectRoot !== prev.projectRoot) {
       this.projectWatcher.start(saved.projectRoot);
@@ -501,8 +526,13 @@ export class AppService {
       return { updated: false, installed, update };
     }
     const result = await this.runtime.ensureLatest(pref, { force: opts.force });
-    // Only throttle after GitHub actually resolved an asset (not on rate-limit/network fail).
-    if (result.update.latestAsset) {
+    // Do not mark checked when update was deferred (model still loaded) — otherwise
+    // 24h throttle hides backendMismatch / pending upgrade after unload.
+    const deferred =
+      !result.updated &&
+      Boolean(result.update.updateAvailable) &&
+      /отложен/i.test(result.update.message || "");
+    if (result.update.latestAsset && !deferred) {
       await this.markRuntimeChecked();
     }
     return result;
@@ -725,12 +755,17 @@ export class AppService {
       throw new Error(`Профиль загрузки не найден: ${opts.profileId}`);
     }
 
+    // Re-read after awaits so concurrent user saves are not overwritten.
+    const latest = this.settings.get();
     const saved = await this.settings.save({
-      ...cur,
+      ...latest,
       loadProfiles: profiles,
       activeLoadProfileId: opts.profileId,
       defaultParams,
-      agentMaxSteps,
+      agentMaxSteps:
+        latest.agentMaxSteps > 0 && tierIds.has(opts.profileId)
+          ? latest.agentMaxSteps
+          : agentMaxSteps,
     });
     const reload = await this.reloadLoadedModelAfterProfileChange();
     return { settings: saved, reload };
@@ -826,7 +861,7 @@ export class AppService {
 
   async loadModel(modelId: string, params?: Partial<GenerationParams>): Promise<void> {
     const run = async (): Promise<void> => {
-      if (this.chat.isBusy() || this.agent.isRunning() || this.agentStartLock) {
+      if (this.isGenerationBusy()) {
         throw new Error("Сначала остановите генерацию или агента, затем загрузите модель");
       }
       const model = this.modelsCache.find((m) => m.id === modelId);
@@ -896,7 +931,35 @@ export class AppService {
           `Модель ${model.name} может не влезть в VRAM (ngl=${merged.gpuLayers}, ctx=${merged.context}).`,
         );
       }
-      await this.runtime.ensureInstalled(settings.runtimeBackendPreference);
+      const installed = await this.runtime.ensureInstalled(
+        settings.runtimeBackendPreference,
+      );
+      // Plan ngl/flashAttn against the *installed* backend, not only recommended.
+      if (installed.backend && installed.backend !== sys.recommendedBackend) {
+        const planForInstalled = estimateLoadPlan(
+          { ...sys, recommendedBackend: installed.backend },
+          {
+            modelSizeGb,
+            tier: profile?.hardwareAware
+              ? tierFromProfileId(profile.id)
+              : "balanced",
+            layerCount,
+          },
+        );
+        if (profile?.hardwareAware || !profile) {
+          merged.gpuLayers = planForInstalled.gpuLayers;
+          merged.context = planForInstalled.context;
+          merged.flashAttn = planForInstalled.flashAttn;
+          merged.maxTokens = planForInstalled.maxTokens;
+        } else if (installed.backend === "cpu") {
+          merged.gpuLayers = 0;
+          merged.flashAttn = false;
+        }
+        this.pushErrorLog(
+          "runtime",
+          `Установлен backend ${installed.backend} (рекомендован ${sys.recommendedBackend}) — параметры нагрузки подогнаны.`,
+        );
+      }
       this.resetGenStats();
       try {
         await this.runtime.loadModel(model, merged);
@@ -921,7 +984,7 @@ export class AppService {
 
   async unloadModel(): Promise<void> {
     const run = async () => {
-      if (this.chat.isBusy() || this.agent.isRunning() || this.agentStartLock) {
+      if (this.isGenerationBusy()) {
         throw new Error("Сначала остановите генерацию или агента");
       }
       await this.runtime.stopServer();
@@ -951,16 +1014,30 @@ export class AppService {
     // Whitelist merge — UI snapshot must never wipe agentScratchpad / identity.
     const existing = this.store.listSessions().find((s) => s.id === patch.id);
     if (!existing) throw new Error("Сессия не найдена");
+    const toolsEnabled =
+      patch.toolsEnabled !== undefined ? patch.toolsEnabled : existing.toolsEnabled;
+    // Keep stock system prompt in sync when toggling Агент/Чат from UI.
+    let systemPrompt = patch.systemPrompt ?? existing.systemPrompt;
+    if (
+      patch.toolsEnabled !== undefined &&
+      patch.toolsEnabled !== existing.toolsEnabled &&
+      patch.systemPrompt === undefined
+    ) {
+      const synced = this.store.setToolsEnabled(existing.id, patch.toolsEnabled);
+      if (synced) return synced;
+    }
     return this.store.updateSession({
       ...existing,
       title: patch.title ?? existing.title,
       mode: patch.mode ?? existing.mode,
-      toolsEnabled:
-        patch.toolsEnabled !== undefined ? patch.toolsEnabled : existing.toolsEnabled,
-      systemPrompt: patch.systemPrompt ?? existing.systemPrompt,
+      toolsEnabled,
+      systemPrompt,
       modelId: patch.modelId !== undefined ? patch.modelId : existing.modelId,
       pinned: patch.pinned !== undefined ? patch.pinned : existing.pinned,
-      folder: patch.folder !== undefined ? patch.folder : existing.folder,
+      folder:
+        patch.folder !== undefined
+          ? patch.folder.trim() || undefined
+          : existing.folder,
       params: patch.params
         ? { ...existing.params, ...patch.params }
         : existing.params,
@@ -1010,6 +1087,17 @@ export class AppService {
       }
       return { content: rest, useAgent: true };
     }
+    // Explicit chat mode (preferAgent=false): never auto-route to agent.
+    if (!preferAgent) {
+      return { content: trimmed, useAgent: false };
+    }
+    // Live weather/news → plain chat, but not coding tasks that merely mention «погода».
+    if (
+      detectLiveWebNeed(trimmed) &&
+      !detectAgentTask(trimmed, opts)
+    ) {
+      return { content: trimmed, useAgent: false };
+    }
     return {
       content: trimmed,
       useAgent: preferAgent || detectAgentTask(trimmed, opts),
@@ -1022,11 +1110,14 @@ export class AppService {
     params?: Partial<GenerationParams>,
     attachments?: ChatAttachment[],
   ): Promise<ChatMessage> {
-    if (this.agent.isRunning() || this.agentStartLock) {
-      throw new Error("Агент ещё выполняется. Остановите его перед обычным чатом.");
+    if (this.isGenerationBusy()) {
+      throw new Error("Генерация уже выполняется. Дождитесь ответа или нажмите Стоп.");
     }
     const session = this.store.listSessions().find((s) => s.id === sessionId);
     if (!session) throw new Error("Сессия не найдена");
+    this.chatPrepAbort?.abort();
+    this.chatPrepAbort = new AbortController();
+    const prepSignal = this.chatPrepAbort.signal;
     this.noteGenerationStart();
     this.emitGeneration(sessionId, { type: "started", mode: "chat" });
     const loadedCtx = this.runtime.getStatus().loadedContext;
@@ -1037,27 +1128,106 @@ export class AppService {
         : {}),
       ...params,
     };
-    const settings = this.settings.get();
+    // Hydrate safeStorage secrets (Tavily etc.) — raw get() may hold "__secure__".
+    const settings = this.getEffectiveSettings();
     let system = session.systemPrompt;
-    // Lightweight Cursor-style project context for plain chat (no tool catalog).
-    if (settings.projectRoot) {
-      try {
-        const packed = await buildProjectContext({
-          settings,
-          userQuery: content,
-          baseSystem: session.systemPrompt,
-          toolBlock:
-            "Инструменты недоступны в этом ответе. Для правок файлов начните с @agent или опишите задачу по коду.",
-          contextTokens: merged.context || 8192,
-          // Leave generous room for a long reply (aligned with completionBudget).
-          reserveTokens: Math.min(Math.floor((merged.context || 8192) * 0.55), 10000),
-        });
-        system = packed.systemPrompt;
-      } catch {
-        // fall back to bare system prompt
-      }
-    }
+    const cancelledResult = (): ChatMessage => ({
+      id: `cancelled-${Date.now()}`,
+      role: "assistant",
+      content: "(отменено)",
+      createdAt: new Date().toISOString(),
+    });
     try {
+      // Lightweight Cursor-style project context for plain chat (no tool catalog).
+      if (settings.projectRoot) {
+        if (prepSignal.aborted) {
+          this.emitGeneration(sessionId, { type: "cancelled" });
+          return cancelledResult();
+        }
+        try {
+          const packed = await buildProjectContext({
+            settings,
+            userQuery: content,
+            baseSystem: session.systemPrompt,
+            toolBlock:
+              "Инструменты недоступны в этом ответе. Для правок файлов начните с @agent или опишите задачу по коду.",
+            contextTokens: merged.context || 8192,
+            // Leave generous room for a long reply (aligned with completionBudget).
+            reserveTokens: Math.min(Math.floor((merged.context || 8192) * 0.55), 10000),
+          });
+          if (!prepSignal.aborted) system = packed.systemPrompt;
+        } catch {
+          // fall back to bare system prompt
+        }
+      }
+      if (prepSignal.aborted) {
+        this.emitGeneration(sessionId, { type: "cancelled" });
+        return cancelledResult();
+      }
+      // Live facts (weather/news/rates): inject web search — plain chat has no tools.
+      // Gated by internetAccessMode (off = no network; ask/allow = user allowed internet).
+      if (detectLiveWebNeed(content)) {
+        if (!isInternetEnabled(settings)) {
+          system =
+            `${system}\n\n## Интернет\n` +
+            `Доступ в сеть выключен в Настройках → Веб-поиск. ` +
+            `Честно скажи, что актуальную погоду/новости/курсы узнать нельзя, пока пользователь не включит «Спрашивать» или «Разрешить». Не выдумывай цифры.`;
+        } else {
+          const now = new Date();
+          const dateLabel = now.toLocaleString("ru-RU", {
+            timeZone: "Europe/Moscow",
+            dateStyle: "full",
+            timeStyle: "short",
+          });
+          this.emitGeneration(sessionId, {
+            type: "thinking",
+            text: "Ищу актуальные данные в интернете…",
+          });
+          const wantsWeather =
+            /(погод\p{L}*|weather|forecast|прогноз\p{L}*|температур\p{L}*)/iu.test(content);
+          try {
+            let injected = "";
+            if (wantsWeather && !prepSignal.aborted) {
+              try {
+                const brief = await fetchWeatherBrief(content);
+                if (brief && !prepSignal.aborted) {
+                  injected =
+                    `## Погода (${dateLabel})\n` +
+                    `Официальные данные ниже. Ответь коротко и по делу на языке пользователя.\n\n${brief.summary}`;
+                }
+              } catch {
+                /* fall through to web search */
+              }
+            }
+            if (!injected && !prepSignal.aborted) {
+              const hits = await webSearch(content, settings);
+              if (!hits || hits === "Ничего не найдено" || hits === "Пустой запрос") {
+                injected =
+                  `## Веб-поиск (${dateLabel})\n` +
+                  `По запросу ничего не найдено (провайдер: ${settings.webSearchProvider || "duckduckgo"}). ` +
+                  `Честно скажи, что актуальных данных нет. Не выдумывай погоду/курсы/новости.`;
+              } else {
+                injected =
+                  `## Веб-поиск (${dateLabel})\n` +
+                  `Свежие сниппеты. Опирайся на них; не выдумывай цифры.\n\n${hits.slice(0, 6000)}`;
+              }
+            }
+            if (injected && !prepSignal.aborted) system = `${system}\n\n${injected}`;
+          } catch (err) {
+            if (!prepSignal.aborted) {
+              const msg = err instanceof Error ? err.message : String(err);
+              system =
+                `${system}\n\n## Веб-поиск\n` +
+                `Поиск не удался: ${msg}. Скажи, что без интернета актуальную погоду/новости узнать нельзя. Не выдумывай.`;
+            }
+          }
+        }
+      }
+      if (prepSignal.aborted) {
+        this.emitGeneration(sessionId, { type: "cancelled" });
+        return cancelledResult();
+      }
+      // Keep prep abort until send() installs its own controller (no busy gap).
       const result = await this.chat.send(
         sessionId,
         content,
@@ -1065,20 +1235,18 @@ export class AppService {
         system,
         attachments,
       );
+      if (this.chatPrepAbort?.signal === prepSignal) {
+        this.chatPrepAbort = null;
+      }
       this.maybeRenameSession(session, content);
       this.emitGeneration(sessionId, { type: "done", messageId: result.id });
       return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (/отмен|abort/i.test(message)) {
+      if (prepSignal.aborted || /отмен|abort/i.test(message)) {
         this.emitGeneration(sessionId, { type: "cancelled" });
         // Do not rethrow — avoids duplicate IPC error after cancel (P0-6).
-        return {
-          id: `cancelled-${Date.now()}`,
-          role: "assistant",
-          content: "(отменено)",
-          createdAt: new Date().toISOString(),
-        };
+        return cancelledResult();
       }
       this.pushErrorLog(`chat:${sessionId}`, message);
       this.emitGeneration(sessionId, { type: "error", message });
@@ -1089,7 +1257,22 @@ export class AppService {
         content: `(ошибка) ${message}`,
         createdAt: new Date().toISOString(),
       };
+    } finally {
+      if (this.chatPrepAbort?.signal === prepSignal) {
+        this.chatPrepAbort = null;
+      }
     }
+  }
+
+  /** True while chat prep (weather/web/context), chat stream, or agent is active. */
+  isGenerationBusy(): boolean {
+    return (
+      Boolean(this.chatPrepAbort) ||
+      this.chat.isBusy() ||
+      this.agent.isRunning() ||
+      this.agentStartLock ||
+      Boolean(this.agentStartAbort)
+    );
   }
 
   /**
@@ -1118,7 +1301,14 @@ export class AppService {
           /* fall through */
         }
       }
-      parts.push(`- ${a.name} (${a.mime}, ${a.size} B) path=${a.path}`);
+      if (/^image\//i.test(a.mime)) {
+        parts.push(
+          `- ${a.name} (${a.mime}, ${a.size} B) — изображение приложено как файл; ` +
+            `текстовая модель его не видит (нужен vision/mmproj). path=${a.path}`,
+        );
+      } else {
+        parts.push(`- ${a.name} (${a.mime}, ${a.size} B) path=${a.path}`);
+      }
     }
     return parts.join("\n");
   }
@@ -1144,14 +1334,26 @@ export class AppService {
       throw new Error("После @agent укажите задачу (например: @agent list files)");
     }
     if (!parsed.content) throw new Error("Пустое сообщение");
+    const attBlock = opts?.attachments?.length
+      ? AppService.formatAttachmentsBlock(opts.attachments)
+      : "";
+    const contentForModel = parsed.content + attBlock;
     if (parsed.useAgent) {
-      await this.startAgent(sessionId, parsed.content, opts?.attachments);
+      await this.startAgent(sessionId, contentForModel, opts?.attachments);
       return;
     }
-    await this.sendChat(sessionId, parsed.content, opts?.params, opts?.attachments);
+    await this.sendChat(
+      sessionId,
+      contentForModel,
+      opts?.params,
+      opts?.attachments,
+    );
   }
 
   stopGeneration(): void {
+    this.chatPrepAbort?.abort();
+    this.chatPrepAbort = null;
+    this.agentStartAbort?.abort();
     this.chat.stop();
     this.agent.cancel();
   }
@@ -1168,15 +1370,31 @@ export class AppService {
     attachments?: ChatAttachment[],
   ): Promise<void> {
     if (this.agent.isRunning() || this.agentStartLock) {
-      throw new Error("Агент уже выполняется");
+      // Non-terminal for the live run — callers must not treat as agentEvent error.
+      const err = new Error("Агент уже выполняется");
+      (err as Error & { code?: string }).code = "AGENT_BUSY";
+      throw err;
+    }
+    // Abort chat weather/web prep so agent and chat don't share ChatEngine.abort.
+    this.chatPrepAbort?.abort();
+    this.chatPrepAbort = null;
+    if (this.chat.isBusy()) {
+      this.chat.stop();
     }
     // Sync lock before any await — prevents double-start race.
     this.agentStartLock = true;
+    const startAbort = new AbortController();
+    this.agentStartAbort = startAbort;
     try {
       // Wait for in-flight load/unload without joining the chain as a follower.
       await this.loadModelChain.catch(() => undefined);
+      if (startAbort.signal.aborted) {
+        this.emitGeneration(sessionId, { type: "cancelled" });
+        return;
+      }
       await this.startAgentInner(sessionId, content, attachments);
     } finally {
+      if (this.agentStartAbort === startAbort) this.agentStartAbort = null;
       this.agentStartLock = false;
     }
   }
@@ -1238,8 +1456,12 @@ export class AppService {
     confirmationId: string,
     approved: boolean,
     rememberForSession?: boolean,
-  ): void {
-    this.agent.resolveConfirmation(confirmationId, approved, rememberForSession);
+  ): boolean {
+    return this.agent.resolveConfirmation(
+      confirmationId,
+      approved,
+      rememberForSession,
+    );
   }
 
   cancelAgent(): void {
@@ -1377,17 +1599,60 @@ export class AppService {
     if (id !== "minilm" && id !== "lfm25") {
       throw new Error(`Unknown embedding model: ${id}`);
     }
+    this.applyEmbeddingConfig();
+    let models = listEmbeddingModelsInfo();
+    let info = models.find((m) => m.id === id);
+    if (!info?.installed) {
+      await downloadEmbeddingModel(id);
+      models = listEmbeddingModelsInfo();
+      info = models.find((m) => m.id === id);
+    }
+    if (!info?.installed) {
+      throw new Error(
+        `Модель эмбеддингов «${id}» не установилась. Скачайте ещё раз или проверьте сеть.`,
+      );
+    }
+    if (id === "lfm25" && !info.ready) {
+      throw new Error(
+        info.error ||
+          "LFM2.5 нужен установленный llama-server (Runtime). Установите runtime и повторите.",
+      );
+    }
     const prev = this.settings.get();
+    const prevEmbedId = prev.embeddingModelId || "minilm";
     const next = await this.settings.save({ ...prev, embeddingModelId: id });
     this.applyEmbeddingConfig(next);
     await resetEmbedder();
     this.applyEmbeddingConfig(next);
-    const models = listEmbeddingModelsInfo();
-    const info = models.find((m) => m.id === id);
-    if (!info?.installed) {
-      await downloadEmbeddingModel(id);
+    const projectRoot = this.settings.get().projectRoot;
+    if (!projectRoot || !String(projectRoot).trim()) {
+      // Model applied; index will build when project folder is set.
+      return {
+        settings: this.settings.get(),
+        status: getEmbeddingStatus(),
+        index: {
+          ready: false,
+          indexing: false,
+          root: null,
+          chunkCount: 0,
+          modelId: id,
+          updatedAt: null,
+          error: null,
+        },
+      };
     }
     const index = await this.reindexCodebase();
+    if (index.error) {
+      // Roll back so @codebase doesn't query with a new dim against an old index.
+      await this.settings.save({
+        ...this.settings.get(),
+        embeddingModelId: prevEmbedId,
+      });
+      this.applyEmbeddingConfig();
+      await resetEmbedder();
+      this.applyEmbeddingConfig();
+      throw new Error(`Индекс не пересобран: ${index.error}. Модель эмбеддингов не применена.`);
+    }
     return {
       settings: this.settings.get(),
       status: getEmbeddingStatus(),
@@ -1412,7 +1677,7 @@ export class AppService {
     const vram = await sampleVram();
     const total = os.totalmem() / 1024 ** 3;
     const free = os.freemem() / 1024 ** 3;
-    const busy = this.chat.isBusy() || this.agent.isRunning();
+    const busy = this.isGenerationBusy();
 
     let tokensPerSecond: number | null = null;
     let promptTokensPerSecond: number | null = null;
@@ -1444,7 +1709,7 @@ export class AppService {
 
     const settings = this.settings.get();
     return {
-      modelName: model?.name || null,
+      modelName: model?.name || st.loadedModelName || null,
       loadedModelId: st.loadedModelId,
       backend: st.installed?.backend || null,
       runtimeTag: st.installed?.tag || null,

@@ -4,8 +4,10 @@ import { describe, expect, it } from "vitest";
 import { IPC } from "../packages/shared/src/ipc";
 import {
   assertAppSettingsDeep,
+  assertChatAttachments,
   assertResolveConfirmation,
   assertSessionExportBundle,
+  assertSessionPatch,
 } from "../packages/shared/src/ipcValidate";
 import { createDefaultSettings } from "../packages/shared/src/types";
 
@@ -98,5 +100,56 @@ describe("IPC contract", () => {
         messages: [],
       }).session.id,
     ).toBe("s1");
+  });
+
+  it("keeps attachments and parentId on session import", () => {
+    const bundle = assertSessionExportBundle({
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      session: {
+        id: "s1",
+        title: "t",
+        mode: "chat",
+        systemPrompt: "",
+        pinned: false,
+        createdAt: "a",
+        updatedAt: "b",
+        params: {},
+      },
+      messages: [
+        {
+          id: "m1",
+          role: "user",
+          content: "hi",
+          createdAt: "a",
+          attachments: [
+            {
+              id: "a1",
+              name: "note.txt",
+              mime: "text/plain",
+              path: "C:/tmp/a1-note.txt",
+              size: 3,
+            },
+          ],
+        },
+        {
+          id: "m2",
+          role: "assistant",
+          content: "ok",
+          createdAt: "b",
+          parentId: "m1",
+        },
+      ],
+    });
+    expect(bundle.messages[0]?.attachments?.[0]?.name).toBe("note.txt");
+    expect(bundle.messages[1]?.parentId).toBe("m1");
+  });
+
+  it("assertSessionPatch preserves empty folder clear", () => {
+    expect(assertSessionPatch({ id: "s1", folder: "" }).folder).toBe("");
+    expect(assertChatAttachments([{ id: "1", name: "a", mime: "text/plain", path: "/x", size: 1 }])).toHaveLength(
+      1,
+    );
+    expect(() => assertChatAttachments([{ id: "1" }])).toThrow(/вложен/i);
   });
 });

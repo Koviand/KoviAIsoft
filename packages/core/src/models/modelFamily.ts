@@ -41,9 +41,11 @@ export type AgentFamilyTuning = {
   rejectProseReasoning: boolean;
 };
 
-/** Heuristic: tiny / unknown GGUF names get stricter JSON enforcement. */
+/** Heuristic: tiny GGUF names get stricter JSON enforcement (not every unknown). */
 export function looksLikeSmallOrUnknownModel(nameOrPath: string): boolean {
-  const s = nameOrPath.toLowerCase();
+  const s = nameOrPath.toLowerCase().replace(/\\/g, "/");
+  // Opaque hash ids (16 hex) — do not treat as tiny.
+  if (/^[a-f0-9]{12,40}$/i.test(nameOrPath.trim())) return false;
   if (
     /\b(0\.5b|0\.6b|0\.8b|1b|1\.2b|1\.5b|1\.7b|2b|2\.6b|3b|3\.5b|4b|5b|6b|350m|500m)\b/.test(
       s,
@@ -52,7 +54,9 @@ export function looksLikeSmallOrUnknownModel(nameOrPath: string): boolean {
     return true;
   }
   if (/tiny|mini(?!lm)|nano|smol/.test(s)) return true;
-  return detectModelFamily(nameOrPath) === "other";
+  // Unknown family alone is not "small" — only tighten when name is empty/garbage.
+  if (!s.trim() || s.length < 3) return true;
+  return false;
 }
 
 /**

@@ -53,6 +53,14 @@ export function isThemePreset(value: unknown): value is ThemePreset {
 /** Agent confirmation policy. */
 export type AgentRiskMode = "ask" | "auto-safe" | "full";
 
+/**
+ * Internet access for models (web_search / browser / live weather in chat).
+ * - off: block network tools and chat live lookups
+ * - ask: allow after user confirmation (web_search); browser mutations still confirm
+ * - allow: web_search without confirm; browser navigate/click still follow risk mode
+ */
+export type InternetAccessMode = "off" | "ask" | "allow";
+
 export interface ThemeCustom {
   accent: string;
   background: string;
@@ -365,6 +373,8 @@ export interface AgentConfirmation {
   createdAt: string;
   /** Unified diff preview for write/patch tools. */
   diff?: string;
+  /** False for shell/browser/git mutate — «запомнить на сессию» no-op. */
+  canRemember?: boolean;
 }
 
 /** Unified generation progress for chat streaming and agent/tool loops. */
@@ -484,6 +494,8 @@ export interface AppSettings {
   webSearchProvider: "duckduckgo" | "searxng" | "tavily";
   searxngUrl?: string;
   webSearchApiKey?: string;
+  /** Model access to the public internet (search / browser / live facts in chat). */
+  internetAccessMode: InternetAccessMode;
   mcpServers: McpServerConfig[];
   agentMaxSteps: number;
   /** Soft auto-extend while plan/coding work remains. */
@@ -630,6 +642,7 @@ export function createDefaultSettings(appData: string): AppSettings {
     openaiProxyEnabled: false,
     openaiProxyPort: 3928,
     webSearchProvider: "duckduckgo",
+    internetAccessMode: "ask",
     mcpServers: [],
     agentMaxSteps: 0,
     agentAutoExtendEnabled: true,

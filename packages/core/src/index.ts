@@ -45,6 +45,7 @@ export {
 } from "./models/hardwareProfile.js";
 export type { HardwareLoadSuggestion, LoadTier } from "./models/hardwareProfile.js";
 export * from "./tools/sandbox.js";
+export * from "./tools/internetAccess.js";
 export {
   gitBranchTool,
   gitCommitTool,

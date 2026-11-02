@@ -129,8 +129,12 @@ export async function webSearch(query: string, settings: AppSettings): Promise<s
     const key = (settings.webSearchApiKey || "").trim();
     if (!key) throw new Error("Tavily: укажите webSearchApiKey в настройках");
     hits = await searchTavily(q, key);
-  } else if (provider === "searxng" && settings.searxngUrl) {
-    hits = await searchSearxng(q, settings.searxngUrl);
+  } else if (provider === "searxng") {
+    const url = (settings.searxngUrl || "").trim();
+    if (!url) {
+      throw new Error("SearXNG: укажите URL инстанса в Настройках → Веб-поиск");
+    }
+    hits = await searchSearxng(q, url);
   } else {
     hits = await searchDuckDuckGo(q);
   }

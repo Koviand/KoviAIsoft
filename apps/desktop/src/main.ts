@@ -5,11 +5,12 @@ import type { AppSettings, McpServerConfig } from "@kovi/shared";
 import {
   IPC,
   assertAppSettingsDeep,
+  assertChatAttachments,
   assertResolveConfirmation,
   assertSessionExportBundle,
   assertSessionPatch,
 } from "@kovi/shared";
-import { AppService, getAppDataDir, setAppDataDir } from "@kovi/core";
+import { AppService, getAppDataDir, getAttachmentsDir, setAppDataDir } from "@kovi/core";
 import {
   isSecureTokenAvailable,
   loadSecret,
@@ -41,6 +42,9 @@ function isPortableLayout(): boolean {
 
 function appInstallRoot(): string {
   if (app.isPackaged) {
+    // electron-builder single-file portable unpacks to TEMP; persist beside the real EXE.
+    const portableDir = process.env.PORTABLE_EXECUTABLE_DIR?.trim();
+    if (portableDir) return portableDir;
     return path.dirname(process.execPath);
   }
   return path.join(__dirname, "..");
@@ -55,7 +59,11 @@ function configureAppPaths(): void {
     const root = appInstallRoot();
     const dataDir = path.join(root, "data");
     setAppDataDir(dataDir);
-    app.setPath("userData", dataDir);
+    try {
+      app.setPath("userData", dataDir);
+    } catch {
+      /* may fail if called after ready — still setAppDataDir for our store */
+    }
     process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(root, "playwright-browsers");
     return;
   }
@@ -123,9 +131,20 @@ function assertSendRequest(req: unknown): {
   if (typeof r.content !== "string") {
     throw new Error("content должен быть строкой");
   }
-  const attachments = Array.isArray(r.attachments)
-    ? (r.attachments as import("@kovi/shared").ChatAttachment[])
-    : undefined;
+  const attachments = r.attachments == null ? undefined : assertChatAttachments(r.attachments);
+  if (attachments?.length) {
+    const root = path.resolve(getAttachmentsDir(getAppDataDir()));
+    for (const a of attachments) {
+      const resolved = path.resolve(a.path);
+      const rel = path.relative(root, resolved);
+      if (rel.startsWith("..") || path.isAbsolute(rel)) {
+        throw new Error(`Вложение вне каталога attachments: ${a.name}`);
+      }
+      if (!fs.existsSync(resolved)) {
+        throw new Error(`Файл вложения не найден: ${a.name}`);
+      }
+    }
+  }
   return {
     sessionId: r.sessionId,
     content: r.content,
@@ -465,7 +484,7 @@ function registerIpc(svc: AppService): void {
   // Deprecated thin wrappers — UI uses sendMessage / stopGeneration.
   ipcMain.handle(IPC.sendChat, (_e, req) => {
     const r = assertSendRequest(req);
-    return svc.sendChat(r.sessionId, r.content, r.params as never);
+    return svc.sendChat(r.sessionId, r.content, r.params as never, r.attachments);
   });
   // Always fire-and-forget: completion is signaled via agentEvent (started/done/error).
   ipcMain.handle(IPC.sendMessage, async (_e, req) => {
@@ -478,7 +497,8 @@ function registerIpc(svc: AppService): void {
       })
       .catch((err) => {
         const message = err instanceof Error ? err.message : String(err);
-        if (isCancelErrorMessage(message)) return;
+        const code = (err as Error & { code?: string })?.code;
+        if (isCancelErrorMessage(message) || code === "AGENT_BUSY") return;
         broadcastMain(IPC.agentEvent, {
           sessionId: r.sessionId,
           event: { type: "error", message },
@@ -488,9 +508,11 @@ function registerIpc(svc: AppService): void {
   ipcMain.handle(IPC.stopGeneration, () => svc.stopGeneration());
   ipcMain.handle(IPC.startAgent, async (_e, req) => {
     const r = assertSendRequest(req);
-    void svc.startAgent(r.sessionId, r.content).catch((err) => {
+    void svc.startAgent(r.sessionId, r.content, r.attachments).catch((err) => {
       const message = err instanceof Error ? err.message : String(err);
-      if (isCancelErrorMessage(message)) return;
+      const code = (err as Error & { code?: string })?.code;
+      // Busy reject must not kill the live run's UI via terminal error.
+      if (isCancelErrorMessage(message) || code === "AGENT_BUSY") return;
       broadcastMain(IPC.agentEvent, {
         sessionId: r.sessionId,
         event: { type: "error", message },
@@ -569,7 +591,11 @@ function registerIpc(svc: AppService): void {
     return svc.addChatAttachment(sourcePath.trim());
   });
   ipcMain.handle(IPC.getErrorLog, () => svc.getErrorLog());
-  ipcMain.handle(IPC.checkMcpHealth, (_e, server) => svc.checkMcpHealth(assertMcpServer(server)));
+  ipcMain.handle(IPC.checkMcpHealth, (_e, server) =>
+    server == null
+      ? svc.checkMcpHealth()
+      : svc.checkMcpHealth(assertMcpServer(server)),
+  );
   ipcMain.handle(IPC.verifyGguf, (_e, modelId: string) => svc.verifyGguf(modelId));
   ipcMain.handle(IPC.getCodebaseIndexStatus, () => svc.getCodebaseIndexStatus());
   ipcMain.handle(IPC.listProjectMentions, () => svc.listProjectMentions());

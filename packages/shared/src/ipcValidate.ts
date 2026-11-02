@@ -25,6 +25,14 @@ export function assertResolveConfirmation(req: unknown): {
   return parsed.data;
 }
 
+const chatAttachmentSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  mime: z.string().min(1),
+  path: z.string().min(1),
+  size: z.number().nonnegative(),
+});
+
 const chatMessageSchema = z.object({
   id: z.string().min(1),
   role: z.enum(["system", "user", "assistant", "tool"]),
@@ -33,6 +41,8 @@ const chatMessageSchema = z.object({
   toolName: z.string().optional(),
   toolCallId: z.string().optional(),
   thinking: z.string().optional(),
+  parentId: z.string().optional(),
+  attachments: z.array(chatAttachmentSchema).optional(),
 });
 
 const chatSessionSchema = z
@@ -91,6 +101,7 @@ export type SessionPatch = {
   systemPrompt?: string;
   modelId?: string;
   pinned?: boolean;
+  /** Empty string clears the folder. */
   folder?: string;
   params?: Partial<GenerationParams>;
 };
@@ -104,7 +115,7 @@ export function assertSessionPatch(x: unknown): SessionPatch {
     );
   }
   const d = parsed.data;
-  return {
+  const out: SessionPatch = {
     id: d.id,
     title: d.title,
     mode: d.mode,
@@ -112,9 +123,23 @@ export function assertSessionPatch(x: unknown): SessionPatch {
     systemPrompt: d.systemPrompt,
     modelId: d.modelId,
     pinned: d.pinned,
-    folder: d.folder,
     params: d.params as Partial<GenerationParams> | undefined,
   };
+  // Preserve empty string so UI can clear folder (undefined would mean «no change»).
+  const rawFolder = (x as { folder?: unknown }).folder;
+  if (typeof rawFolder === "string") out.folder = rawFolder;
+  return out;
+}
+
+export function assertChatAttachments(x: unknown): import("./types.js").ChatAttachment[] {
+  if (x == null) return [];
+  const parsed = z.array(chatAttachmentSchema).safeParse(x);
+  if (!parsed.success) {
+    throw new Error(
+      `Некорректные вложения: ${parsed.error.issues[0]?.message || "ошибка"}`,
+    );
+  }
+  return parsed.data;
 }
 
 /** Deep-ish settings validation for IPC saveSettings. */
@@ -149,6 +174,14 @@ export function assertAppSettingsDeep(settings: unknown): AppSettings {
   }
   if (typeof s.openaiProxyPort === "number" && (s.openaiProxyPort < 1 || s.openaiProxyPort > 65535)) {
     throw new Error("openaiProxyPort вне диапазона 1–65535");
+  }
+  if (
+    s.internetAccessMode != null &&
+    s.internetAccessMode !== "off" &&
+    s.internetAccessMode !== "ask" &&
+    s.internetAccessMode !== "allow"
+  ) {
+    throw new Error("internetAccessMode: off | ask | allow");
   }
   return settings as AppSettings;
 }

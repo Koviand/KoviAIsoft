@@ -178,14 +178,16 @@ export function App() {
               >
                 Разрешить
               </button>
-              <button
-                className="btn"
-                type="button"
-                disabled={state.confirmBusy}
-                onClick={() => void state.resolvePendingConfirm(true, true)}
-              >
-                Разрешить до конца диалога
-              </button>
+              {state.pendingConfirm.canRemember !== false ? (
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={state.confirmBusy}
+                  onClick={() => void state.resolvePendingConfirm(true, true)}
+                >
+                  Разрешить до конца диалога
+                </button>
+              ) : null}
               <button
                 ref={rejectBtnRef}
                 className="btn danger"

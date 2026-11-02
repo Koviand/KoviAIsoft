@@ -89,14 +89,30 @@ export class ChatEngine {
     systemPrompt: string,
     attachments?: ChatAttachment[],
   ): Promise<ChatMessage> {
+    // Own AbortController before any await so isBusy() covers assertLlmReady gap.
+    this.stop();
+    this.abort = new AbortController();
+    this.activeSessionId = sessionId;
+    const signal = this.abort.signal;
+
     let base: string;
     try {
       base = await this.runtime.assertLlmReady();
     } catch (err) {
+      if (this.abort?.signal === signal) {
+        this.abort = null;
+        this.activeSessionId = null;
+      }
       throw formatLlmFetchError(err, this.runtime.getOpenAiBaseUrl());
     }
+    if (signal.aborted) {
+      if (this.abort?.signal === signal) {
+        this.abort = null;
+        this.activeSessionId = null;
+      }
+      throw new Error("Генерация отменена");
+    }
 
-    this.stop();
     this.store.addMessage(sessionId, {
       role: "user",
       content: userContent,
@@ -135,10 +151,6 @@ export class ChatEngine {
     });
     const baseMessages: OpenAiMessage[] = fitMessagesToContext(condensed, ctx, maxTokens);
 
-    this.abort = new AbortController();
-    this.activeSessionId = sessionId;
-    const signal = this.abort.signal;
-
     let content = "";
     let thinking = "";
     let truncated = false;
@@ -149,10 +161,17 @@ export class ChatEngine {
       let messages = baseMessages;
       if (leg > 0) {
         if (!content.trim() || signal.aborted) break;
+        // Keep system + last user + tail of assistant (avoid huge reply wiping history).
+        const sys = baseMessages.find((m) => m.role === "system");
+        const lastUser = [...baseMessages].reverse().find((m) => m.role === "user");
+        const tailBudget = Math.min(content.length, Math.floor(ctx * 3)); // ~chars≈tok*3
+        const assistantTail =
+          content.length > tailBudget ? content.slice(-tailBudget) : content;
         messages = fitMessagesToContext(
           [
-            ...baseMessages,
-            { role: "assistant", content },
+            ...(sys ? [sys] : []),
+            ...(lastUser ? [lastUser] : []),
+            { role: "assistant", content: assistantTail },
             {
               role: "user",
               content:
@@ -363,6 +382,8 @@ export class ChatEngine {
       planOnly?: boolean;
       /** Preferred first constraint mode (family policy). */
       preferredConstraint?: ConstraintMode;
+      /** Hide builtins (e.g. network tools when internetAccessMode=off). */
+      excludeBuiltinNames?: string[];
     },
   ): Promise<string> {
     let base: string;
@@ -388,6 +409,7 @@ export class ChatEngine {
 
     const toolsOpts = (): BuildToolsOpts => ({
       compact: Boolean(opts?.compact),
+      excludeBuiltinNames: opts?.excludeBuiltinNames,
       extraTools:
         opts?.extraTools ||
         (opts?.extraToolNames || []).map((name) => ({ name })),
@@ -548,7 +570,9 @@ export class ChatEngine {
           .map(([, v]) => ({
             function: { name: v.name, arguments: v.arguments || "{}" },
           }));
-        content = toolCallsToActionJson(ordered);
+        content = toolCallsToActionJson(ordered, "native tool_calls", {
+          rejectBrokenArgs: truncated,
+        });
         if (sessionId) {
           this.onToken?.({ sessionId, text: content, draft: true });
         }
@@ -600,10 +624,15 @@ export class ChatEngine {
           }
         }
       }
+      const stripped = stripThinkTags(content);
+      // When truncated, keep raw content for boost detection — do not prefer early
+      // balanced prefix (obj1\n{obj2…) which hides unfinished tails.
       const cleaned =
-        mode === "tools" && content.trim().startsWith("{")
-          ? content.trim()
-          : preferBalancedJson(stripThinkTags(content));
+        mode === "tools" && stripped.trim().startsWith("{")
+          ? stripped.trim()
+          : truncated
+            ? stripped
+            : preferBalancedJson(stripped);
       // Do not throw here — caller boosts max_tokens first, then may throw.
       return { content: cleaned, truncated, mode };
     };
@@ -661,7 +690,13 @@ export class ChatEngine {
         while (
           result.truncated &&
           boosts < 2 &&
-          (looksBrokenJson(result.content) || !result.content.trim())
+          (looksBrokenJson(result.content) ||
+            !result.content.trim() ||
+            // Early balanced prefix shorter than raw → more content was cut off.
+            (() => {
+              const bal = balancedJsonPrefix(result.content);
+              return Boolean(bal) && bal.length + 8 < result.content.trim().length;
+            })())
         ) {
           const boosted = Math.min(
             hardCap,
@@ -682,8 +717,19 @@ export class ChatEngine {
         if (result.truncated && !result.content.trim()) {
           throw new LlmTruncatedError();
         }
+        // finish_reason=length with a balanced JSON object is usable — do not spiral.
         if (result.truncated && looksBrokenJson(result.content)) {
-          throw new LlmTruncatedError();
+          const bal = balancedJsonPrefix(result.content);
+          if (!bal || looksBrokenJson(bal)) {
+            throw new LlmTruncatedError();
+          }
+          result = { ...result, content: bal.trim() };
+        } else if (result.truncated && !looksBrokenJson(result.content)) {
+          const bal = balancedJsonPrefix(result.content);
+          if (bal && bal.length + 8 < result.content.trim().length) {
+            // Still truncated after last object — prefer full usable prefix only.
+            result = { ...result, content: bal.trim() };
+          }
         }
         return result;
       };
@@ -692,13 +738,13 @@ export class ChatEngine {
       for (;;) {
         try {
           const result = await runWithMode(mode);
-          // Soft-fail: HTTP 200 tools mode with prose / empty envelope → retry next mode.
+          // Soft-fail: HTTP 200 tools mode with prose → retry json_schema this turn only.
+          // Do NOT mark toolsOk=false forever (one bad sample must not kill native tools).
           if (
             mode === "tools" &&
             !opts?.planOnly &&
             !looksLikeUsableAgentJson(result.content)
           ) {
-            markConstraintFailure(mode);
             const next = nextConstraintModeAfterFailure(mode);
             if (!next) {
               markConstraintSuccess(mode);

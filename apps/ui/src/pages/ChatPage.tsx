@@ -6,6 +6,7 @@ import type {
   ChatSession,
   RuntimeStatus,
 } from "@kovi/shared";
+import { sessionToolsEnabled } from "@kovi/shared";
 import { api } from "../api";
 import { t } from "../i18n";
 import {
@@ -215,15 +216,12 @@ export function ChatPage(props: {
       const isTerminal =
         ev.type === "done" || ev.type === "cancelled" || ev.type === "error";
 
-      // Always release busy for our in-flight generation even if user switched sessions.
+      // Only the in-flight streamSession may clear busy — never a stale terminal
+      // after Stop/new send (streamSessionRef already null or pointing elsewhere).
       if (isTerminal) {
-        const owns =
-          p.sessionId === streamSessionRef.current ||
-          (streamSessionRef.current == null && p.sessionId === activeIdRef.current);
-        if (owns || epochAtEvent === generationEpochRef.current) {
-          if (p.sessionId === streamSessionRef.current) {
-            streamSessionRef.current = null;
-          }
+        const owns = p.sessionId === streamSessionRef.current;
+        if (owns) {
+          streamSessionRef.current = null;
           props.setBusy(false);
           if (ev.type === "error" && acceptsUiUpdate(p.sessionId, epochAtEvent)) {
             props.setError(ev.message);
@@ -374,7 +372,7 @@ export function ChatPage(props: {
   async function toggleAgentMode(): Promise<void> {
     const session = props.sessions.find((s) => s.id === props.activeSessionId);
     if (!session || props.busy) return;
-    const nextEnabled = !Boolean(session.toolsEnabled);
+    const nextEnabled = !sessionToolsEnabled(session);
     try {
       const updated = await api.updateSession({
         id: session.id,
@@ -411,7 +409,10 @@ export function ChatPage(props: {
     }
   }
 
-  async function onSend(overrideText?: string): Promise<void> {
+  async function onSend(
+    overrideText?: string,
+    opts?: { forceAgent?: boolean },
+  ): Promise<void> {
     const text = (overrideText ?? input).trim();
     if ((!text && !pendingAttachments.length) || props.busy) return;
     if (!text && pendingAttachments.length) {
@@ -449,11 +450,16 @@ export function ChatPage(props: {
       props.setMessages([...baseMsgs, optimistic]);
 
       const session = props.sessions.find((s) => s.id === sessionId);
+      // Resume must force agent even if session is plain chat (toolsEnabled=false).
+      const useAgent =
+        opts?.forceAgent === true || (session ? sessionToolsEnabled(session) : false)
+          ? true
+          : undefined;
       // Fire-and-forget: lifecycle via generation events (started/done/error).
       await api.sendMessage({
         sessionId,
         content: text,
-        useAgent: session?.toolsEnabled === true ? true : undefined,
+        useAgent,
         attachments: attachments.length ? attachments : undefined,
       });
     } catch (e) {
@@ -554,7 +560,8 @@ export function ChatPage(props: {
   async function setSessionFolder(folder: string): Promise<void> {
     if (!activeSession) return;
     try {
-      const next = { ...activeSession, folder: folder.trim() || undefined };
+      // Empty string clears folder — undefined would leave the previous value.
+      const next = { ...activeSession, folder: folder.trim() };
       await api.updateSession(next);
       props.setSessions(await api.listSessions());
       if (folder.trim() && props.settings) {
@@ -754,7 +761,7 @@ export function ChatPage(props: {
                   className="btn primary"
                   onClick={() => {
                     setLimitBanner(null);
-                    void onSend(resumePromptFor(activeSession));
+                    void onSend(resumePromptFor(activeSession), { forceAgent: true });
                   }}
                 >
                   Продолжить
@@ -797,7 +804,9 @@ export function ChatPage(props: {
                     type="button"
                     className="btn ghost"
                     title="Продолжить агента без полного перепланирования"
-                    onClick={() => void onSend(resumePromptFor(activeSession))}
+                    onClick={() =>
+                      void onSend(resumePromptFor(activeSession), { forceAgent: true })
+                    }
                   >
                     Продолжить
                   </button>
@@ -940,7 +949,10 @@ export function ChatPage(props: {
               <button
                 type="button"
                 className={`btn ghost composer-mode ${
-                  props.sessions.find((s) => s.id === props.activeSessionId)?.toolsEnabled
+                  (() => {
+                    const s = props.sessions.find((x) => x.id === props.activeSessionId);
+                    return s ? sessionToolsEnabled(s) : false;
+                  })()
                     ? "on"
                     : ""
                 }`}
@@ -948,9 +960,10 @@ export function ChatPage(props: {
                 title="Агент может править файлы и запускать команды. Чат — только ответы."
                 onClick={() => void toggleAgentMode()}
               >
-                {props.sessions.find((s) => s.id === props.activeSessionId)?.toolsEnabled
-                  ? "Режим: Агент"
-                  : "Режим: Чат"}
+                {(() => {
+                  const s = props.sessions.find((x) => x.id === props.activeSessionId);
+                  return s && sessionToolsEnabled(s) ? "Режим: Агент" : "Режим: Чат";
+                })()}
               </button>
               <span className="muted composer-hint">
                 @ — файлы / @codebase / @agent. Enter — отправить, Shift+Enter — строка.
@@ -1126,7 +1139,9 @@ export function ChatPage(props: {
                   className="btn ghost"
                   type="button"
                   title="Продолжить агента"
-                  onClick={() => void onSend(resumePromptFor(activeSession))}
+                  onClick={() =>
+                    void onSend(resumePromptFor(activeSession), { forceAgent: true })
+                  }
                 >
                   Продолжить
                 </button>

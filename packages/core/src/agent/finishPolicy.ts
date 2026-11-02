@@ -7,7 +7,11 @@ export const AGENT_REPAIR_MAX = 3;
 /** After this many consecutive repair failures → soft-stop (no_progress). */
 export const AGENT_REPAIR_HARD_STOP = AGENT_REPAIR_MAX * 2;
 export const AGENT_TRUNCATION_MAX = 3;
+/** After this many consecutive truncations → soft-stop (no_progress). */
+export const AGENT_TRUNCATION_HARD_STOP = AGENT_TRUNCATION_MAX * 2;
 export const AGENT_IDENTICAL_TOOL_MAX = 2;
+/** Blocked early final / empty turns before hard-stop. */
+export const AGENT_FINAL_BLOCKED_HARD_STOP = 4;
 /** Nudge after this many scout tools; hard-stop at HARD_STOP. */
 export const AGENT_NON_ADVANCING_MAX = 4;
 export const AGENT_NON_ADVANCING_HARD_STOP = AGENT_NON_ADVANCING_MAX * 3;
@@ -90,10 +94,20 @@ export function agentHasPendingWork(opts: {
   filesWritten: number;
   substantialWrite: boolean;
 }): boolean {
-  const pending = opts.steps.some(
-    (s) => s.status === "pending" || s.status === "running",
-  );
-  if (pending) return true;
+  // Pending-only finalize is not blocking work — allow finish window / auto-extend stop.
+  const pendingBlocking = opts.steps.some((s) => {
+    if (s.status !== "pending" && s.status !== "running") return false;
+    const kind = s.kind;
+    if (kind === "finalize") return false;
+    if (
+      !kind &&
+      /(итог|final|finish|отчет|отчёт|резюме)/i.test(s.title || "")
+    ) {
+      return false;
+    }
+    return true;
+  });
+  if (pendingBlocking) return true;
   if (opts.wantsFiles && opts.filesWritten === 0) return true;
   if (opts.wantsFiles && opts.filesWritten > 0 && !opts.substantialWrite) return true;
   return false;

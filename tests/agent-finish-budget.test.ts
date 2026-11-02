@@ -6,6 +6,8 @@ import {
   AGENT_REPAIR_MAX,
   AGENT_STEPS_SAFETY_CAP,
   AGENT_TRUNCATION_MAX,
+  AGENT_TRUNCATION_HARD_STOP,
+  AGENT_FINAL_BLOCKED_HARD_STOP,
   agentHasPendingWork,
   buildAgentResumePrompt,
   clampAgentMaxSteps,
@@ -117,6 +119,8 @@ describe("hard caps constants", () => {
   it("repair and truncation caps are finite and small", () => {
     expect(AGENT_REPAIR_MAX).toBeLessThanOrEqual(4);
     expect(AGENT_TRUNCATION_MAX).toBeLessThanOrEqual(4);
+    expect(AGENT_TRUNCATION_HARD_STOP).toBe(AGENT_TRUNCATION_MAX * 2);
+    expect(AGENT_FINAL_BLOCKED_HARD_STOP).toBe(4);
     expect(AGENT_NON_ADVANCING_MAX).toBe(4);
     expect(AGENT_REFUSAL_HARD_STOP).toBe(2);
   });

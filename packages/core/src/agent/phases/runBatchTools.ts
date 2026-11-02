@@ -7,6 +7,24 @@ import { execAgentTool, type NormalizeToolArgsFn } from "../toolExec.js";
 import type { BrowserTooling } from "../../tools/browser.js";
 import type { McpManager } from "../../mcp/manager.js";
 
+/** Mirror loop.coerceToolArgs aliases before validate (file/filename → path). */
+function coerceBatchArgs(
+  toolName: string,
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = { ...args };
+  if ((next.path == null || String(next.path).trim() === "") && next.file != null) {
+    next.path = next.file;
+  }
+  if ((next.path == null || String(next.path).trim() === "") && next.filename != null) {
+    next.path = next.filename;
+  }
+  if ((next.path == null || String(next.path).trim() === "") && next.filepath != null) {
+    next.path = next.filepath;
+  }
+  return next;
+}
+
 type Emit = (event: AgentEvent) => void;
 
 /**
@@ -30,7 +48,9 @@ export async function runBatchTools(opts: {
     };
   }
   for (const t of batch.tools) {
-    const v = validateToolArgs(t.name, t.args || {});
+    const coerced = coerceBatchArgs(t.name, t.args || {});
+    t.args = coerced;
+    const v = validateToolArgs(t.name, coerced);
     if (!v.ok) {
       return { ok: false, error: `tools[]: ${t.name}: ${v.error}` };
     }

@@ -168,7 +168,7 @@ export const BUILTIN_TOOL_SPECS = [
   },
   {
     name: "web_search",
-    description: "Поиск в интернете",
+    description: "Поиск в интернете (нужно разрешение пользователя в Настройках)",
     parameters: {
       type: "object",
       properties: { query: { type: "string" } },
@@ -237,6 +237,7 @@ export const CORE_TOOL_NAMES = new Set([
   "git_status",
   "git_diff",
   "run_terminal",
+  "web_search",
   "finish",
 ]);
 
@@ -265,11 +266,13 @@ export const MAX_BATCH_TOOLS = 3;
 
 export function toolsPromptBlock(
   extraTools: Array<{ name: string; description?: string }>,
-  opts?: { compact?: boolean },
+  opts?: { compact?: boolean; excludeBuiltinNames?: string[] },
 ): string {
-  const specs = opts?.compact
+  const exclude = new Set(opts?.excludeBuiltinNames || []);
+  const specs = (opts?.compact
     ? BUILTIN_TOOL_SPECS.filter((t) => CORE_TOOL_NAMES.has(t.name))
-    : BUILTIN_TOOL_SPECS;
+    : BUILTIN_TOOL_SPECS
+  ).filter((t) => !exclude.has(t.name));
   // Compact keeps MCP names so OpenAI tools stay aligned; drops only non-CORE builtins.
   const extras = extraTools;
   const all = [

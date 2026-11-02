@@ -25,13 +25,11 @@ export function inferPlanStepKind(title: string): AgentPlanStepKind {
   ) {
     return "finalize";
   }
-  if (
-    /(запустить|запуск(?!аем)|terminal|shell|cmd|проверь|проверить|тест|run_)/i.test(t)
-  ) {
-    return "run";
-  }
   if (/(провер|verify|валид|lint|typecheck)/i.test(t)) {
     return "verify";
+  }
+  if (/(запустить|запуск(?!аем)|terminal|shell|cmd|тест|run_)/i.test(t)) {
+    return "run";
   }
   if (
     /(файл|созда|напис|допис|модул|логик|код|write|patch|исправ|реализ|skeleton|скелет|удал|delete)/i.test(
@@ -55,10 +53,15 @@ const EXPLORE_TOOLS = new Set([
   "git_status",
   "git_diff",
   "git_log",
+  "web_search",
 ]);
 
 export function isExploreTool(toolName: string): boolean {
-  return EXPLORE_TOOLS.has(toolName) || toolName.startsWith("browser_");
+  return (
+    EXPLORE_TOOLS.has(toolName) ||
+    toolName.startsWith("browser_") ||
+    toolName.startsWith("mcp_")
+  );
 }
 
 /** Default coding checklist when the model fails to produce a plan. */
@@ -277,13 +280,15 @@ export function isSoftResumeGoal(
   if (!fresh || !prev) return false;
   if (fresh === prev) return true;
 
+  // Only explicit continue — not «добавь/исправь» (those are new tasks).
   const continueCue =
-    /^(продолж|докажи|добь|ещё|еще|добавь|допиши|исправ|почин|resume|continue|keep going)/i.test(
+    /^(продолж\p{L}*|докачай|добей|ещё раз|еще раз|resume|continue|keep going)($|[\s:,.!?])/iu.test(
       fresh,
     );
   if (!continueCue) return false;
-  // Continue cues require an unfinished frozen plan.
-  return opts?.hasUnfinishedFrozenPlan === true;
+  // Explicit continue always soft-resumes (keep goal/notes). Unfinished frozen plan
+  // is preferred but not required — otherwise «Продолжить» wipes progress.
+  return true;
 }
 
 /** Mark the first pending step failed (after a tool error). */

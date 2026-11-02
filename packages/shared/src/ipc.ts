@@ -225,7 +225,7 @@ export interface KoviApi {
   stopGeneration(): Promise<void>;
   /** @deprecated Prefer sendMessage({ useAgent: true }). */
   startAgent(req: StartAgentRequest): Promise<void>;
-  resolveConfirmation(req: ResolveConfirmationRequest): Promise<void>;
+  resolveConfirmation(req: ResolveConfirmationRequest): Promise<boolean>;
   /** @deprecated Alias of stopGeneration. */
   cancelAgent(): Promise<void>;
   pickDirectory(): Promise<string | null>;

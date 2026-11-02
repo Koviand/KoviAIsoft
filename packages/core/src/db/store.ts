@@ -187,10 +187,12 @@ export class Store {
   }
 
   listSessions(): ChatSession[] {
-    return [...this.data.sessions].sort((a, b) => {
-      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-      return b.updatedAt.localeCompare(a.updatedAt);
-    });
+    return [...this.data.sessions]
+      .map((s) => normalizeSession(s))
+      .sort((a, b) => {
+        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+        return b.updatedAt.localeCompare(a.updatedAt);
+      });
   }
 
   createSession(

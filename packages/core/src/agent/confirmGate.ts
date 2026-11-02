@@ -1,7 +1,13 @@
 import type { AgentConfirmation, AppSettings } from "@kovi/shared";
 import { previewPatchDiff, previewWriteDiff } from "../tools/diff.js";
 import {
+  internetAccessMode,
+  isNetworkTool,
+  networkSearchNeedsConfirm,
+} from "../tools/internetAccess.js";
+import {
   approvalRememberKey,
+  NEVER_REMEMBER_TOOLS,
   riskForTool,
   shouldConfirmRisk,
 } from "../tools/sandbox.js";
@@ -24,11 +30,26 @@ export function evaluateToolConfirmNeed(
     normalizedArgs,
     settings.projectRoot,
   );
+  // Internet off is enforced in toolExec — still treat as needing a block signal.
+  if (isNetworkTool(toolName) && internetAccessMode(settings) === "off") {
+    return { needsConfirm: false, risk, rememberKey };
+  }
   if (risk === "low") {
     return { needsConfirm: false, risk, rememberKey };
   }
-  if (rememberKey && rememberedKeys.has(rememberKey)) {
+  // Never skip confirm via remember for high-risk / MCP (always ask).
+  const allowRemember =
+    Boolean(rememberKey) && risk !== "high" && !toolName.startsWith("mcp_");
+  if (allowRemember && rememberKey && rememberedKeys.has(rememberKey)) {
     return { needsConfirm: false, risk, rememberKey };
+  }
+  // Mode «allow»: skip confirm for read-only web_search; browser_* keep risk rules.
+  if (toolName === "web_search" && !networkSearchNeedsConfirm(settings)) {
+    return { needsConfirm: false, risk, rememberKey };
+  }
+  // Mode «ask»: always confirm web_search even if agentRiskMode is full.
+  if (toolName === "web_search" && networkSearchNeedsConfirm(settings)) {
+    return { needsConfirm: true, risk, rememberKey };
   }
   const needsConfirm = shouldConfirmRisk(
     risk,
@@ -79,14 +100,29 @@ export function buildToolConfirmation(opts: {
     diff = undefined;
   }
 
-  const argPreview = JSON.stringify(normalizedArgs);
+  let summary: string;
+  if (toolName === "web_search") {
+    const q = String(normalizedArgs.query || "").trim();
+    summary = q
+      ? `Поиск в интернете: «${q.length > 200 ? q.slice(0, 200) + "…" : q}»`
+      : "Поиск в интернете";
+  } else if (toolName === "browser_navigate") {
+    const url = String(normalizedArgs.url || "").trim();
+    summary = url
+      ? `Открыть в браузере: ${url.length > 220 ? url.slice(0, 220) + "…" : url}`
+      : "Открыть URL в браузере";
+  } else {
+    const argPreview = JSON.stringify(normalizedArgs);
+    summary = `${toolName} ${argPreview.length > 1200 ? argPreview.slice(0, 1200) + "…" : argPreview}`;
+  }
   return {
     id,
     toolName,
-    summary: `${toolName} ${argPreview.length > 1200 ? argPreview.slice(0, 1200) + "…" : argPreview}`,
+    summary,
     args: normalizedArgs,
     risk: risk === "high" ? "high" : "medium",
     createdAt: new Date().toISOString(),
     diff,
+    canRemember: !NEVER_REMEMBER_TOOLS.has(toolName) && !toolName.startsWith("mcp_"),
   };
 }

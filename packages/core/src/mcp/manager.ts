@@ -160,16 +160,31 @@ export class McpManager {
     const client = this.clients.get(tool.serverId);
     if (!client) throw new Error(`MCP server not connected: ${tool.serverId}`);
     const rawName = fullName.replace(`mcp_${tool.serverId}_`, "");
-    const result = await withTimeout(
-      client.callTool({ name: rawName, arguments: args }),
-      MCP_CALL_TIMEOUT_MS,
-      `MCP ${tool.serverId}/${rawName}`,
-    );
-    const content = (result as { content?: Array<{ type: string; text?: string }> }).content;
-    if (Array.isArray(content)) {
-      return content.map((c) => c.text || JSON.stringify(c)).join("\n");
+    try {
+      const result = await withTimeout(
+        client.callTool({ name: rawName, arguments: args }),
+        MCP_CALL_TIMEOUT_MS,
+        `MCP ${tool.serverId}/${rawName}`,
+      );
+      const content = (result as { content?: Array<{ type: string; text?: string }> }).content;
+      if (Array.isArray(content)) {
+        return content.map((c) => c.text || JSON.stringify(c)).join("\n");
+      }
+      return JSON.stringify(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/timeout|таймаут/i.test(msg)) {
+        // Drop hung client so the next call reconnects via sync.
+        this.clients.delete(tool.serverId);
+        this.tools = this.tools.filter((t) => t.serverId !== tool.serverId);
+        try {
+          await withTimeout(client.close(), MCP_CLOSE_TIMEOUT_MS, `MCP ${tool.serverId} close`);
+        } catch {
+          /* ignore */
+        }
+      }
+      throw err;
     }
-    return JSON.stringify(result);
   }
 
   async closeAll(): Promise<void> {

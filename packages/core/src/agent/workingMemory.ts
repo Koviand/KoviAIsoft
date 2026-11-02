@@ -3,7 +3,12 @@ import type { AgentPlanStep } from "@kovi/shared";
 /** Sticky agent state that survives transcript condense / emergency shrink. */
 export interface AgentWorkingMemory {
   goal: string;
-  plan: Array<{ id: string; title: string; status: string }>;
+  plan: Array<{
+    id: string;
+    title: string;
+    status: string;
+    kind?: AgentPlanStep["kind"];
+  }>;
   /** After plan phase, titles/ids are frozen; only statuses update. */
   planFrozen?: boolean;
   filesTouched: string[];
@@ -11,6 +16,10 @@ export interface AgentWorkingMemory {
   lastResult: string | null;
   lastError: string | null;
   notes: string[];
+  /** Sticky write paths — survive notes ring eviction (cap 12). */
+  writtenPaths?: string[];
+  /** Sticky flag: at least one non-stub write/patch this run. */
+  hadSubstantialWrite?: boolean;
 }
 
 export const WM_MARKER = "# Working memory (не забывай)";
@@ -25,6 +34,8 @@ export function createWorkingMemory(goal: string): AgentWorkingMemory {
     lastResult: null,
     lastError: null,
     notes: [],
+    writtenPaths: [],
+    hadSubstantialWrite: false,
   };
 }
 
@@ -128,6 +139,8 @@ export function parseWorkingMemory(raw: unknown): AgentWorkingMemory | null {
       lastResult: j.lastResult ?? null,
       lastError: j.lastError ?? null,
       notes: Array.isArray(j.notes) ? j.notes : [],
+      writtenPaths: Array.isArray(j.writtenPaths) ? j.writtenPaths : [],
+      hadSubstantialWrite: Boolean(j.hadSubstantialWrite),
     };
   } catch {
     return null;
@@ -173,13 +186,24 @@ export function rememberToolSuccess(
   }
   const compact = result.replace(/\s+/g, " ").trim().slice(0, 180);
   wm.lastResult = compact;
+  if (!wm.writtenPaths) wm.writtenPaths = [];
   if (toolName === "write_file" && path) {
     wm.notes.push(`wrote ${path}`);
+    if (!wm.writtenPaths.includes(path)) wm.writtenPaths.push(path);
+    const contentLen =
+      typeof args.content === "string" ? args.content.length : 0;
+    if (contentLen >= 400) wm.hadSubstantialWrite = true;
+  } else if (toolName === "apply_patch" && path) {
+    // Same prefix as write_file so soft-resume counts filesWritten/substantialWrite.
+    wm.notes.push(`wrote ${path}`);
+    if (!wm.writtenPaths.includes(path)) wm.writtenPaths.push(path);
+    wm.hadSubstantialWrite = true;
   } else if (toolName === "run_terminal") {
     const cmd = String(args.command ?? "").slice(0, 80);
     wm.notes.push(`shell: ${cmd}`);
   }
   if (wm.notes.length > 12) wm.notes = wm.notes.slice(-12);
+  if (wm.writtenPaths.length > 32) wm.writtenPaths = wm.writtenPaths.slice(-32);
 }
 
 export function rememberToolError(

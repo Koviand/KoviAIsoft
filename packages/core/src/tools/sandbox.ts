@@ -229,6 +229,12 @@ export function assertNotInternalProjectPath(target: string): void {
   const resolved = normalizePath(target);
   const norm = resolved.replace(/\\/g, "/").toLowerCase();
   const baseSegs = norm.split("/").filter(Boolean);
+  // .git — writing config/hooks enables RCE via fsmonitor / hooks on next git_*.
+  if (baseSegs.includes(".git")) {
+    throw new Error(
+      "Нельзя писать в .git/ (конфиг, hooks, objects). Используйте git_* инструменты или правьте обычные файлы проекта.",
+    );
+  }
   const hasCodebaseIndex = baseSegs.includes("codebase-index");
   // .kovi, .__.__kovi, __.__kovi — models often mangle the index folder name.
   // Do NOT match bare "kovi" (username / project folder segments).
@@ -520,6 +526,8 @@ export function approvalRememberKey(
   projectRoot: string | null = null,
 ): string | null {
   if (NEVER_REMEMBER_TOOLS.has(toolName)) return null;
+  // MCP / browser mutate must always re-confirm (matches AgentConfirmation.canRemember).
+  if (toolName.startsWith("mcp_")) return null;
   if (["write_file", "apply_patch", "delete_path"].includes(toolName)) {
     const p = String(args.path || args.file || "").trim();
     if (!p) return null;
@@ -548,7 +556,10 @@ export function riskForTool(
   }
   if (["git_status", "git_diff", "git_log"].includes(name)) return "low";
   if (name === "browser_snapshot") return "medium";
-  if (name.startsWith("mcp_")) return "medium";
+  // Read-only web lookup — confirm controlled by internetAccessMode (ask/allow).
+  if (name === "web_search") return "medium";
+  // External MCP may mutate disk / call APIs — always treat as high.
+  if (name.startsWith("mcp_")) return "high";
   if (name === "delete_path") {
     const p = String(args.path || args.file || "");
     if (p && isDangerousSystemDir(p)) return "high";
@@ -569,7 +580,6 @@ export function riskForTool(
     if (p && isDangerousSystemDir(p)) return "high";
     return "medium";
   }
-  if (name.startsWith("mcp_") && /write|delete|create|update|exec/i.test(name)) return "medium";
   return "low";
 }
 
@@ -589,12 +599,19 @@ export function shouldConfirmRisk(
   const target = String(args.path || args.file || args.cwd || "");
   if (target && isDangerousSystemDir(target)) return true;
 
-  // Never auto-approve shell / browser mutations / git push-commit, even in "full".
+  // Never auto-approve shell / browser mutations / git push-commit / MCP, even in "full".
   if (
     toolName &&
-    ["run_terminal", "browser_click", "browser_type", "git_commit", "git_push", "git_pull"].includes(
-      toolName,
-    )
+    (toolName.startsWith("mcp_") ||
+      [
+        "run_terminal",
+        "browser_click",
+        "browser_type",
+        "browser_navigate",
+        "git_commit",
+        "git_push",
+        "git_pull",
+      ].includes(toolName))
   ) {
     return true;
   }

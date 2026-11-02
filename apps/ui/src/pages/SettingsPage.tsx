@@ -8,6 +8,17 @@ import { ModelAdvancedSettings } from "../components/ModelAdvancedSettings";
 
 const TIER_IDS = ["fast", "balanced", "quality"] as const;
 
+/** Never put safeStorage placeholder into editable draft fields. */
+function sanitizeSettingsDraft(s: AppSettings): AppSettings {
+  const scrub = (v: string | undefined) => (v === "__secure__" ? "" : v || "");
+  return {
+    ...s,
+    githubToken: scrub(s.githubToken),
+    hfToken: scrub(s.hfToken),
+    webSearchApiKey: scrub(s.webSearchApiKey),
+  };
+}
+
 const SETTINGS_NAV = [
   { id: "appearance", label: "Внешний вид", group: "Интерфейс" },
   { id: "agent-safety", label: "Безопасность", group: "Агент" },
@@ -66,7 +77,9 @@ export function SettingsPage(props: {
   }
 
   useEffect(() => {
-    if (!dirty.current) setDraft(props.settings);
+    if (!dirty.current && props.settings) {
+      setDraft(sanitizeSettingsDraft(props.settings));
+    }
   }, [props.settings]);
 
   useEffect(() => {
@@ -284,16 +297,19 @@ export function SettingsPage(props: {
           </span>
         </label>
         <label className="field">
-          <span className="field-label">Таймаут подтверждения (сек, 0 = без авто-отклонения)</span>
+          <span className="field-label">
+            Таймаут подтверждения (сек; 0 = без авто-отклонения, иначе мин. 5)
+          </span>
           <input
             className="input"
             type="number"
             value={s.agentConfirmTimeoutSec ?? 120}
             onChange={(e) => {
               const n = Number(e.target.value);
-              const clamped = !Number.isFinite(n)
-                ? 120
-                : Math.max(0, Math.min(600, Math.floor(n)));
+              if (!Number.isFinite(n)) return;
+              const floor = Math.floor(n);
+              const clamped =
+                floor <= 0 ? 0 : Math.max(5, Math.min(600, floor));
               queueSave({ ...s, agentConfirmTimeoutSec: clamped });
             }}
             min={0}
@@ -387,10 +403,36 @@ export function SettingsPage(props: {
         </div>
       </SettingsSection>
 
-      <SettingsSection id="web-search" title="Веб-поиск для агента">
+      <SettingsSection
+        id="web-search"
+        title="Интернет для модели"
+        description="Поиск, браузер агента и актуальные факты в чате (погода, новости, курсы)."
+      >
+        <label className="field">
+          <span className="field-label">Доступ в интернет</span>
+          <select
+            className="select"
+            value={s.internetAccessMode || "ask"}
+            onChange={(e) =>
+              void saveNow({
+                ...s,
+                internetAccessMode: e.target.value as AppSettings["internetAccessMode"],
+              })
+            }
+          >
+            <option value="off">Выкл — модель не ходит в сеть</option>
+            <option value="ask">Спрашивать — подтверждать каждый web_search</option>
+            <option value="allow">Разрешить — поиск без лишних вопросов</option>
+          </select>
+          <p className="muted" style={{ marginTop: 6, fontSize: 13 }}>
+            В режиме «Спрашивать» агент запросит подтверждение перед поиском (можно «запомнить на
+            сессию»). Открытие страниц в браузере (navigate/click) всегда требует подтверждения.
+            В чате запрос вроде «какая погода» сам по себе даёт согласие на этот ответ.
+          </p>
+        </label>
         <div className="grid-2">
           <label className="field">
-            <span className="field-label">Провайдер</span>
+            <span className="field-label">Провайдер поиска</span>
             <select
               className="select"
               value={s.webSearchProvider}
@@ -456,7 +498,7 @@ export function SettingsPage(props: {
                     })
                     .then((res) => {
                       props.setSettings(res.settings);
-                      setDraft(res.settings);
+                      setDraft(sanitizeSettingsDraft(res.settings));
                       dirty.current = false;
                       setProfileHint(
                         reloadHint(res.reload, `Активен уровень «${label}»`),
@@ -492,7 +534,7 @@ export function SettingsPage(props: {
                 })
                 .then((res) => {
                   props.setSettings(res.settings);
-                  setDraft(res.settings);
+                  setDraft(sanitizeSettingsDraft(res.settings));
                   dirty.current = false;
                   setHwPreview(null);
                   setProfileHint(
@@ -542,7 +584,7 @@ export function SettingsPage(props: {
                       })
                       .then((res) => {
                         props.setSettings(res.settings);
-                        setDraft(res.settings);
+                        setDraft(sanitizeSettingsDraft(res.settings));
                         dirty.current = false;
                         setProfileHint(
                           reloadHint(res.reload, `Активен профиль «${p.name}»`),
@@ -660,7 +702,7 @@ export function SettingsPage(props: {
                     })
                     .then((res) => {
                       props.setSettings(res.settings);
-                      setDraft(res.settings);
+                      setDraft(sanitizeSettingsDraft(res.settings));
                       dirty.current = false;
                       setHwPreview(null);
                       setProfileHint(reloadHint(res.reload, "Применено всё под ПК"));
@@ -687,7 +729,7 @@ export function SettingsPage(props: {
                     })
                     .then((res) => {
                       props.setSettings(res.settings);
-                      setDraft(res.settings);
+                      setDraft(sanitizeSettingsDraft(res.settings));
                       dirty.current = false;
                       setHwPreview(null);
                       setProfileHint(
@@ -832,8 +874,19 @@ export function SettingsPage(props: {
                 style={{ width: 110 }}
                 type="number"
                 title="Порт прокси"
+                min={1}
+                max={65535}
                 value={s.openaiProxyPort}
-                onChange={(e) => queueSave({ ...s, openaiProxyPort: Number(e.target.value) })}
+                onChange={(e) => {
+                  const raw = e.target.value.trim();
+                  if (!raw) return;
+                  const n = Number(raw);
+                  if (!Number.isFinite(n)) return;
+                  queueSave({
+                    ...s,
+                    openaiProxyPort: Math.max(1, Math.min(65535, Math.floor(n))),
+                  });
+                }}
               />
             </div>
           </label>

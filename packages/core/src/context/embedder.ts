@@ -6,6 +6,7 @@ import {
   embeddingsRootDir,
   findLfmGgufPath,
   getEmbeddingSpec,
+  isLfm25Installed,
   isMinilmInstalled,
   listEmbeddingModels,
   lfm25ModelDir,
@@ -232,7 +233,9 @@ export async function embedTexts(
 }
 
 export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
-  const n = Math.min(a.length, b.length);
+  // Different dims → not comparable (do not silently truncate to min).
+  if (a.length !== b.length) return 0;
+  const n = a.length;
   let dot = 0;
   let na = 0;
   let nb = 0;
@@ -307,17 +310,42 @@ export async function downloadEmbeddingModel(
     ensureDir(dest);
     const files = await listHfGgufFiles(LFM25_HF_ID);
     const filePath = pickLfmGgufFilename(files.map((f) => f.path));
-    await downloadHfFile(LFM25_HF_ID, filePath, dest, {
+    const downloaded = await downloadHfFile(LFM25_HF_ID, filePath, dest, {
       method: runtimeConfig.getDownloadMethod?.() ?? "auto",
       token: runtimeConfig.getHfToken?.(),
       onProgress: (p, label) => onProgress?.(p, label || "LFM2.5…"),
     });
+    // Flatten into lfm25/<basename>.gguf (HF nests LiquidAI__…/).
+    const ggufPath = downloaded.path || findLfmGgufPath(runtimeConfig.appData);
+    if (ggufPath && fs.existsSync(ggufPath)) {
+      const flat = path.join(dest, path.basename(ggufPath));
+      if (path.resolve(ggufPath) !== path.resolve(flat)) {
+        try {
+          fs.copyFileSync(ggufPath, flat);
+        } catch {
+          /* recursive finder still sees nested file */
+        }
+      }
+    }
+    if (!isLfm25Installed(runtimeConfig.appData)) {
+      throw new Error(
+        "LFM2.5 GGUF скачан, но файл не найден в models/embeddings/lfm25. Повторите загрузку.",
+      );
+    }
     onProgress?.(100, "LFM2.5 Embedding готов");
   }
-  return listEmbeddingModels({
+  const info = listEmbeddingModels({
     appData: runtimeConfig.appData,
     llamaServerPath: runtimeConfig.getServerPath(),
   }).find((m) => m.id === id)!;
+  if (!info.installed) {
+    throw new Error(
+      id === "minilm"
+        ? "MiniLM не установилась (нет ONNX). Проверьте сеть и повторите."
+        : "LFM2.5 Embedding не установилась. Проверьте сеть / HF token.",
+    );
+  }
+  return info;
 }
 
 export { isMinilmInstalled, findLfmGgufPath, applyEmbeddingPrefix, pickLfmGgufFilename };

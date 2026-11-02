@@ -22,14 +22,29 @@ export function buildIncompleteEvent(opts: {
   const reason: IncompleteReason =
     opts.stopReason === "time_limit"
       ? "time_limit"
-      : synthesized.incomplete
+      : opts.stopReason === "no_progress" || synthesized.incomplete
         ? "no_progress"
         : opts.stopReason || "budget";
+  let content = synthesized.content;
+  if (reason === "time_limit") {
+    content =
+      synthesized.content.replace(
+        /Достигнут внутренний лимит безопасности[\s\S]*$/m,
+        "Достигнут лимит времени выполнения. Нажмите «Продолжить», если нужно добить задачу.",
+      ) || synthesized.content;
+    if (!/лимит времени/i.test(content)) {
+      content +=
+        "\n\nДостигнут лимит времени выполнения. Нажмите «Продолжить», если нужно добить задачу.";
+    }
+  } else if (reason === "no_progress" && !synthesized.incomplete) {
+    content +=
+      "\n\nОстановка: почти не было прогресса. Уточните задачу или нажмите «Продолжить».";
+  }
   return {
-    content: synthesized.content,
+    content,
     event: {
       type: "incomplete",
-      message: synthesized.content.slice(0, 400),
+      message: content.slice(0, 400),
       reason,
     },
   };

@@ -165,8 +165,11 @@ export function parseAgentAction(
   phase: ParsePhase = "execute",
 ): ParsedAction | null {
   if (!text || !text.trim()) return null;
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const raw = fence?.[1] || text;
+  // Only strip a leading markdown fence — inner ``` in final/content must not truncate JSON.
+  const leadingFence = text.trimStart().match(/^```(?:json)?\s*([\s\S]*?)```/i);
+  const fencedBody = leadingFence?.[1]?.trim() || "";
+  const raw =
+    fencedBody && fencedBody.includes("{") ? fencedBody : text;
 
   const candidates = [
     extractBalancedObject(raw),

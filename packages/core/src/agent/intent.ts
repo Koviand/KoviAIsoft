@@ -68,3 +68,23 @@ export function detectAgentTask(
   if (hasProject && detectShortProjectTask(text)) return true;
   return false;
 }
+
+/**
+ * Live / factual questions that need web search in plain chat
+ * (weather, news, rates, “today”, scores) — local GGUF has no internet.
+ */
+export function detectLiveWebNeed(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length > 500) return false;
+  return (
+    /(погод\p{L}*|weather|forecast|прогноз\p{L}*)/iu.test(trimmed) ||
+    /(курс\p{L}*\s+(доллар|евро|юан|рубл)|exchange rate|bitcoin|btc\b|eth\b)/iu.test(
+      trimmed,
+    ) ||
+    /(новост\p{L}*|news\b|заголовк\p{L}*|headline)/iu.test(trimmed) ||
+    /(сколько\s+сейчас|какая\s+сегодня|что\s+сегодня|актуальн\p{L}*|на\s+сегодня|right now|current (weather|price|news))/iu.test(
+      trimmed,
+    ) ||
+    /(температур\p{L}*\s+в\s+|в\s+москве|в\s+питер|в\s+санкт)/iu.test(trimmed)
+  );
+}

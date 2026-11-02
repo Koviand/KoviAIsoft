@@ -57,7 +57,12 @@ export function RuntimePage(props: {
   const githubSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    return api.onRuntimeProgress(setProgress);
+    const offRuntime = api.onRuntimeProgress(setProgress);
+    const offDownload = api.onDownloadProgress(setProgress);
+    return () => {
+      offRuntime();
+      offDownload();
+    };
   }, []);
 
   useEffect(() => {
@@ -425,9 +430,21 @@ export function RuntimePage(props: {
                       setEmbedBusyId(opt.id);
                       void api
                         .downloadEmbeddingModel(opt.id)
-                        .then(() => {
-                          void api.getEmbeddingStatus().then((st) => setEmbedModels(st.models));
-                          setHint(`Скачано: ${opt.title}`);
+                        .then(async (info) => {
+                          const st = await api.getEmbeddingStatus();
+                          setEmbedModels(st.models);
+                          const latest = st.models.find((m) => m.id === opt.id) || info;
+                          if (!latest.installed) {
+                            props.setError(
+                              `${opt.title}: файл не найден после скачивания. Повторите или проверьте сеть.`,
+                            );
+                            return;
+                          }
+                          setHint(
+                            latest.ready
+                              ? `Скачано: ${opt.title}`
+                              : `Скачано: ${opt.title}${latest.error ? ` · ${latest.error}` : ""}`,
+                          );
                         })
                         .catch((e) =>
                           props.setError(e instanceof Error ? e.message : String(e)),

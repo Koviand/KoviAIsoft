@@ -20,10 +20,24 @@ async function findFreePort(start = 8190): Promise<number> {
   throw new Error("Не удалось найти свободный порт для embedding-server");
 }
 
-async function waitForEmbeddings(port: number, timeoutMs = 90_000): Promise<void> {
+function embeddingChildAlive(child?: ChildProcess | null): boolean {
+  if (!child || child.killed) return false;
+  return child.exitCode == null;
+}
+
+async function waitForEmbeddings(
+  port: number,
+  timeoutMs = 90_000,
+  child?: ChildProcess | null,
+): Promise<void> {
   const start = Date.now();
   let lastErr = "";
   while (Date.now() - start < timeoutMs) {
+    if (child && !embeddingChildAlive(child)) {
+      throw new Error(
+        `Embedding server завершился (code=${child.exitCode ?? "?"}) до готовности`,
+      );
+    }
     try {
       const health = await fetch(`http://127.0.0.1:${port}/health`);
       if (health.ok) return;
@@ -59,6 +73,8 @@ export type EmbeddingServerDeps = {
 export class EmbeddingServer {
   private child: ChildProcess | null = null;
   private port: number | null = null;
+  /** When true, ensureBaseUrl must not respawn after stop(). */
+  private stoppedIntentionally = false;
   private baseUrl: string | null = null;
   private loadedGguf: string | null = null;
   private flag: "--embeddings" | "--embedding" = "--embeddings";
@@ -83,7 +99,12 @@ export class EmbeddingServer {
   }
 
   isRunning(): boolean {
-    return Boolean(this.child && this.baseUrl && !this.child.killed);
+    return Boolean(
+      this.child &&
+        this.baseUrl &&
+        !this.child.killed &&
+        this.child.exitCode == null,
+    );
   }
 
   private appendLog(chunk: string): void {
@@ -110,9 +131,10 @@ export class EmbeddingServer {
       throw new Error("llama-server не установлен (нужен runtime)");
     }
 
+    this.stoppedIntentionally = false;
     if (this.isRunning() && this.loadedGguf === gguf && this.baseUrl) {
       try {
-        await waitForEmbeddings(this.port!, 5_000);
+        await waitForEmbeddings(this.port!, 5_000, this.child);
         return this.baseUrl;
       } catch {
         await this.stop();
@@ -120,18 +142,26 @@ export class EmbeddingServer {
     }
 
     await this.stop();
-    const port = await findFreePort(8190);
+    this.stoppedIntentionally = false;
+    let port = await findFreePort(8190);
     await this.spawnWithFlag(serverPath, gguf, port, this.flag);
     try {
-      await waitForEmbeddings(port);
+      await waitForEmbeddings(port, 90_000, this.child);
     } catch (firstErr) {
+      if (this.stoppedIntentionally) {
+        throw new Error("Embedding server остановлен");
+      }
       const alt: "--embeddings" | "--embedding" =
         this.flag === "--embeddings" ? "--embedding" : "--embeddings";
       this.flag = alt;
       await this.stop();
+      this.stoppedIntentionally = false;
+      // Windows TIME_WAIT — avoid EADDRINUSE on the same port after kill.
+      await new Promise((r) => setTimeout(r, 400));
+      port = await findFreePort(port);
       await this.spawnWithFlag(serverPath, gguf, port, alt);
       try {
-        await waitForEmbeddings(port);
+        await waitForEmbeddings(port, 90_000, this.child);
       } catch {
         await this.stop();
         const detail = this.serverLog.trim().slice(-400);
@@ -179,9 +209,11 @@ export class EmbeddingServer {
     this.child.on("error", (err) => {
       this.appendLog(`\n[spawn error] ${err.message}\n`);
     });
+    const spawned = this.child;
     this.child.on("exit", (code, signal) => {
       this.appendLog(`\n[exit code=${code} signal=${signal}]\n`);
-      if (this.child) {
+      // Only clear state if this exit belongs to the current child.
+      if (this.child === spawned) {
         this.child = null;
         this.baseUrl = null;
         this.port = null;
@@ -239,6 +271,7 @@ export class EmbeddingServer {
   }
 
   async stop(): Promise<void> {
+    this.stoppedIntentionally = true;
     const child = this.child;
     this.child = null;
     this.baseUrl = null;

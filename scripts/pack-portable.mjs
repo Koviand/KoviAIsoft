@@ -175,6 +175,11 @@ function stagePackageJson() {
           ? resolveLockedVersion("onnxruntime-node")
           : "1.21.0",
       playwright: playwrightVer,
+      // Required by @huggingface/transformers; must be real deps + asarUnpack.
+      sharp:
+        resolveLockedVersion("sharp") !== "0.0.0"
+          ? resolveLockedVersion("sharp")
+          : "0.33.5",
       uuid: "11.0.5",
       zod: "3.24.1",
     },
@@ -205,6 +210,8 @@ function stagePackageJson() {
         "**/node_modules/playwright-core/**",
         "**/node_modules/onnxruntime-node/**",
         "**/node_modules/@huggingface/transformers/**",
+        "**/node_modules/sharp/**",
+        "**/node_modules/@img/**",
       ],
       extraResources: [
         {

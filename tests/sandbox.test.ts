@@ -7,6 +7,7 @@ import {
   assertTerminalCwd,
   isPathInside,
   riskForTool,
+  shouldConfirmRisk,
 } from "../packages/core/src/tools/sandbox";
 
 describe("sandbox", () => {
@@ -79,9 +80,30 @@ describe("sandbox", () => {
     expect(() => assertTerminalCwd("C:\\Temp", "disk", null, [])).toThrow(/задайте папки/);
   });
 
-  it("marks browser navigate as high risk", () => {
+  it("marks browser navigate as high risk and web_search as medium", () => {
     expect(riskForTool("browser_navigate", { url: "http://x" })).toBe("high");
     expect(riskForTool("browser_snapshot", {})).toBe("medium");
+    expect(riskForTool("web_search", { query: "news" })).toBe("medium");
+  });
+
+  it("always confirms MCP and browser_navigate even in full risk mode", () => {
+    expect(riskForTool("mcp_demo", { x: 1 })).toBe("high");
+    expect(
+      shouldConfirmRisk("high", "full", { x: 1 }, root, "mcp_demo"),
+    ).toBe(true);
+    expect(
+      shouldConfirmRisk("high", "full", { url: "http://x" }, root, "browser_navigate"),
+    ).toBe(true);
+    expect(
+      shouldConfirmRisk("medium", "full", { path: path.join(root, "a.txt") }, root, "write_file"),
+    ).toBe(false);
+  });
+
+  it("blocks .git paths and nulls MCP remember keys", () => {
+    expect(() =>
+      assertAllowedPath(path.join(root, ".git", "config"), "project", root),
+    ).toThrow(/\.git/);
+    expect(approvalRememberKey("mcp_foo", {})).toBeNull();
   });
 
   it("blocks cd outside roots and download|iex", () => {

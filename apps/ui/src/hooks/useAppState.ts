@@ -46,6 +46,7 @@ export function useAppState() {
     summary: string;
     risk: string;
     diff?: string;
+    canRemember?: boolean;
   } | null>(null);
   const [agentChanges, setAgentChanges] = useState<AgentChangeItem[]>([]);
   const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
@@ -133,6 +134,7 @@ export function useAppState() {
           summary: ev.confirmation.summary,
           risk: ev.confirmation.risk,
           diff: ev.confirmation.diff,
+          canRemember: ev.confirmation.canRemember !== false,
         });
         const pathGuess =
           typeof ev.confirmation.args.path === "string"
@@ -212,8 +214,25 @@ export function useAppState() {
       if (ev.type === "confirmation_timeout") {
         setPendingConfirm((cur) => (cur?.id === ev.confirmationId ? null : cur));
         setConfirmBusy(false);
+        setAgentChanges((cur) =>
+          cur.map((c) =>
+            c.confirmationId === ev.confirmationId ||
+            (c.status === "pending" && c.summary.includes(ev.toolName))
+              ? { ...c, status: "rejected" as const }
+              : c,
+          ),
+        );
         setError(
           `Подтверждение «${ev.toolName}» истекло (${ev.timeoutSec ?? 120} с) — действие отклонено`,
+        );
+      }
+      if (ev.type === "tool_result" && ev.isError) {
+        setAgentChanges((cur) =>
+          cur.map((c) =>
+            c.id === ev.callId && c.status === "pending"
+              ? { ...c, status: "rejected" as const }
+              : c,
+          ),
         );
       }
       if (ev.type === "incomplete") {
@@ -253,11 +272,23 @@ export function useAppState() {
       if (!pendingConfirm || confirmBusy) return;
       setConfirmBusy(true);
       try {
-        await api.resolveConfirmation({
+        const ok = await api.resolveConfirmation({
           confirmationId: pendingConfirm.id,
           approved,
           rememberForSession: remember,
         });
+        // Silent no-op (timeout already resolved) — do not mark accepted.
+        if (ok === false) {
+          setAgentChanges((cur) =>
+            cur.map((c) =>
+              c.confirmationId === pendingConfirm.id
+                ? { ...c, status: "rejected" as const }
+                : c,
+            ),
+          );
+          setPendingConfirm(null);
+          return;
+        }
         setAgentChanges((cur) =>
           cur.map((c) =>
             c.confirmationId === pendingConfirm.id
@@ -280,11 +311,20 @@ export function useAppState() {
       if (!item.confirmationId || confirmBusy) return;
       setConfirmBusy(true);
       try {
-        await api.resolveConfirmation({
+        const ok = await api.resolveConfirmation({
           confirmationId: item.confirmationId,
           approved,
           rememberForSession: false,
         });
+        if (ok === false) {
+          setAgentChanges((cur) =>
+            cur.map((c) =>
+              c.id === item.id ? { ...c, status: "rejected" as const } : c,
+            ),
+          );
+          setPendingConfirm((cur) => (cur?.id === item.confirmationId ? null : cur));
+          return;
+        }
         setAgentChanges((cur) =>
           cur.map((c) =>
             c.id === item.id ? { ...c, status: approved ? "accepted" : "rejected" } : c,

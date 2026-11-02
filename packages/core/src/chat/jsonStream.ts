@@ -2,18 +2,48 @@
  * Helpers for streaming agent JSON without exposing mid-token broken drafts.
  */
 
-/** True when braces are unbalanced or the text ends mid-string / trailing comma. */
+/**
+ * True when braces are unbalanced outside strings, or the text ends mid-string / trailing comma.
+ * Must ignore `{`/`}` inside JSON string values (e.g. write_file content with code).
+ */
 export function looksBrokenJson(text: string): boolean {
   const t = text.trim();
   if (!t) return true;
-  const open = (t.match(/\{/g) || []).length;
-  const close = (t.match(/\}/g) || []).length;
-  return (
-    open !== close ||
-    /["']\s*$/.test(t) ||
-    /,\s*$/.test(t) ||
-    (t.includes("{") && !t.includes("}"))
-  );
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let sawObject = false;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i]!;
+    if (inStr) {
+      if (esc) {
+        esc = false;
+        continue;
+      }
+      if (c === "\\") {
+        esc = true;
+        continue;
+      }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      continue;
+    }
+    if (c === "{") {
+      depth += 1;
+      sawObject = true;
+    } else if (c === "}") {
+      depth = Math.max(0, depth - 1);
+    }
+  }
+  if (inStr) return true;
+  if (sawObject && depth !== 0) return true;
+  if (/,\s*$/.test(t)) return true;
+  if (sawObject && depth === 0) return false;
+  // No object braces at all — treat as broken for agent JSON.
+  return !sawObject;
 }
 
 /**

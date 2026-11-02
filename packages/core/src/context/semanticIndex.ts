@@ -192,7 +192,10 @@ function loadVectors(dir: string, count: number, dim: number): Float32Array | nu
     const buf = fs.readFileSync(vectorsPath(dir));
     const expected = count * dim * 4;
     if (buf.byteLength < expected) return null;
-    return new Float32Array(buf.buffer, buf.byteOffset, count * dim);
+    // Copy into an aligned ArrayBuffer — Node Buffer byteOffset is often not % 4.
+    const copy = Buffer.allocUnsafe(expected);
+    buf.copy(copy, 0, 0, expected);
+    return new Float32Array(copy.buffer, copy.byteOffset, count * dim);
   } catch {
     return null;
   }
@@ -324,6 +327,11 @@ async function incrementalUpdate(
         { role: "document" },
       )
     : [];
+  if (newVecs.some((v) => v.length !== spec.dim)) {
+    throw new Error(
+      `Dim mismatch при incremental update: ожидалось ${spec.dim} — нужна полная переиндексация`,
+    );
+  }
 
   const finalChunks: IndexedChunk[] = [
     ...keep,
@@ -362,20 +370,28 @@ export async function ensureProjectIndex(
     return getCodebaseIndexStatus(root);
   }
 
-  const existing = indexJobs.get(key);
-  if (existing) {
-    await existing;
-    // After wait: if force or meta no longer matches active model — run again.
-    const dir = indexDirForProject(root);
-    const meta = readMeta(dir);
-    const spec = getActiveEmbeddingSpec();
-    const needsAgain =
-      opts?.force ||
-      !meta ||
-      meta.modelId !== spec.metaModelId ||
-      meta.dim !== spec.dim;
-    if (!needsAgain) return getCodebaseIndexStatus(root);
-    // Fall through to a new job (map entry cleared by previous finally).
+  // Single-flight: wait and re-join if another waiter already scheduled a follow-up.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const existing = indexJobs.get(key);
+    if (existing) {
+      await existing;
+      const dir = indexDirForProject(root);
+      const meta = readMeta(dir);
+      const spec = getActiveEmbeddingSpec();
+      const needsAgain =
+        opts?.force ||
+        !meta ||
+        meta.modelId !== spec.metaModelId ||
+        meta.dim !== spec.dim;
+      if (!needsAgain) return getCodebaseIndexStatus(root);
+      // Another waiter may have started a job while we checked — loop.
+      if (indexJobs.has(key)) continue;
+    }
+    break;
+  }
+  if (indexJobs.has(key)) {
+    await indexJobs.get(key);
+    return getCodebaseIndexStatus(root);
   }
 
   const job = (async () => {
@@ -478,13 +494,18 @@ export async function semanticSearch(
   const dir = indexDirForProject(root);
   const meta = readMeta(dir);
   if (!meta || meta.chunkCount === 0) return [];
+  const spec = getActiveEmbeddingSpec();
+  // Refuse cross-dim search (e.g. new model id applied before index rebuild).
+  if (meta.modelId !== spec.metaModelId || meta.dim !== spec.dim) {
+    return [];
+  }
   const dim = meta.dim || getEmbeddingDim();
   const chunks = loadChunks(dir);
   const vectors = loadVectors(dir, meta.chunkCount, dim);
   if (!vectors || !chunks.length) return [];
 
   const [qVec] = await embedTexts([query], { role: "query" });
-  if (!qVec) return [];
+  if (!qVec || qVec.length !== dim) return [];
 
   const scored: Array<{ chunk: IndexedChunk; score: number }> = [];
   for (const c of chunks) {

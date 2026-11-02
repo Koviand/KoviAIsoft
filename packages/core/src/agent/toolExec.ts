@@ -17,6 +17,11 @@ import {
   gitPushTool,
   gitStatusTool,
 } from "../tools/git.js";
+import {
+  internetDisabledMessage,
+  isInternetEnabled,
+  isNetworkTool,
+} from "../tools/internetAccess.js";
 import { runTerminal } from "../tools/terminal.js";
 import { webSearch } from "../tools/websearch.js";
 import type { McpManager } from "../mcp/manager.js";
@@ -38,6 +43,17 @@ export async function execAgentTool(opts: {
   checkpointRunId?: string;
 }): Promise<string> {
   const { name, args, settings, normalize, browser, mcp, checkpointRunId } = opts;
+  if (isNetworkTool(name) && !isInternetEnabled(settings)) {
+    return internetDisabledMessage(name);
+  }
+  // MCP tools that clearly hit the network when internetAccessMode=off.
+  if (
+    name.startsWith("mcp_") &&
+    !isInternetEnabled(settings) &&
+    /fetch|http|web|browse|url|download/i.test(name)
+  ) {
+    return internetDisabledMessage(name);
+  }
   const a = normalize(name, args, settings.projectRoot);
   switch (name) {
     case "list_dir":
@@ -96,8 +112,11 @@ export async function execAgentTool(opts: {
         String(a.cwd ?? a.dir ?? a.workdir ?? ""),
         settings,
       );
-    case "web_search":
-      return webSearch(String(args.query), settings);
+    case "web_search": {
+      const q = String(args.query ?? "").trim();
+      if (!q) return "web_search: укажите args.query";
+      return webSearch(q, settings);
+    }
     case "browser_navigate":
       return browser.navigate(String(args.url));
     case "browser_snapshot":

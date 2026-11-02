@@ -6,6 +6,18 @@ function isPrivateIp(ip: string): boolean {
   const lower = ip.toLowerCase();
   if (lower === "::1" || lower === "0:0:0:0:0:0:0:1") return true;
   if (lower.startsWith("fc") || lower.startsWith("fd") || lower.startsWith("fe80")) return true;
+  // IPv4-mapped IPv6 (::ffff:127.0.0.1 or compressed ::ffff:7f00:1)
+  if (lower.startsWith("::ffff:")) {
+    const rest = lower.slice("::ffff:".length);
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(rest)) return isPrivateIp(rest);
+    const hex = rest.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+    if (hex) {
+      const hi = parseInt(hex[1]!, 16);
+      const lo = parseInt(hex[2]!, 16);
+      const dotted = `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+      return isPrivateIp(dotted);
+    }
+  }
   if (net.isIP(ip) === 4) {
     const parts = ip.split(".").map(Number);
     if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return true;
@@ -84,7 +96,15 @@ export class BrowserTooling {
         // Abort navigations (incl. redirects) to private/local targets mid-flight.
         await this.context.route("**/*", async (route) => {
           const req = route.request();
-          if (req.isNavigationRequest() || req.resourceType() === "document") {
+          // Block navigations and XHR/fetch/WS to private hosts (SSRF).
+          const kind = req.resourceType();
+          if (
+            req.isNavigationRequest() ||
+            kind === "document" ||
+            kind === "xhr" ||
+            kind === "fetch" ||
+            kind === "websocket"
+          ) {
             try {
               await assertSafeNavigateUrl(req.url());
               await route.continue();

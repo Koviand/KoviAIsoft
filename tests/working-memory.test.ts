@@ -60,4 +60,26 @@ describe("agent working memory", () => {
     expect(wm.lastError).toMatch(/cwd/);
     expect(wm.notes.some((n) => /error run_terminal/.test(n))).toBe(true);
   });
+
+  it("apply_patch success notes use wrote prefix for resume filesWritten", () => {
+    const wm = createWorkingMemory("patch-me");
+    rememberToolSuccess(
+      wm,
+      "apply_patch",
+      { path: "C:\\proj\\main.py", oldText: "a", newText: "b" },
+      "Patched C:\\proj\\main.py",
+    );
+    expect(wm.notes.some((n) => n === "wrote C:\\proj\\main.py")).toBe(true);
+    rememberToolSuccess(
+      wm,
+      "read_file",
+      { path: "C:\\proj\\readme.md" },
+      "file contents here",
+    );
+    // reads touch files but must not look like writes
+    expect(wm.filesTouched).toContain("C:\\proj\\readme.md");
+    expect(wm.notes.some((n) => /^wrote\s+.*readme/.test(n))).toBe(false);
+    const writeNotes = wm.notes.filter((n) => /^wrote\s+\S/.test(n));
+    expect(writeNotes).toHaveLength(1);
+  });
 });

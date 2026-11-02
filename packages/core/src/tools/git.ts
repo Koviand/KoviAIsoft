@@ -30,6 +30,23 @@ function assertGitName(value: string, label: string): string {
   return t;
 }
 
+/** Prefix every git spawn so repo hooks/fsmonitor cannot RCE the agent. */
+function safeGitArgs(args: string[], opts?: { disableCredentialHelper?: boolean }): string[] {
+  const harden = [
+    "-c",
+    "core.hooksPath=",
+    "-c",
+    "core.fsmonitor=",
+    "-c",
+    "core.useBuiltinFSMonitor=false",
+  ];
+  const cred =
+    opts?.disableCredentialHelper
+      ? (["-c", "credential.helper="] as string[])
+      : [];
+  return [...harden, ...cred, ...args];
+}
+
 function runGit(
   root: string,
   args: string[],
@@ -37,10 +54,9 @@ function runGit(
   opts?: { disableCredentialHelper?: boolean },
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const finalArgs =
-      opts?.disableCredentialHelper || envExtra?.KOVI_GIT_ASKPASS_TOKEN
-        ? ["-c", "credential.helper=", ...args]
-        : args;
+    const disableCred =
+      Boolean(opts?.disableCredentialHelper) || Boolean(envExtra?.KOVI_GIT_ASKPASS_TOKEN);
+    const finalArgs = safeGitArgs(args, { disableCredentialHelper: disableCred });
     const child = spawn("git", finalArgs, {
       cwd: root,
       env: {
@@ -192,11 +208,10 @@ function ensureAskPassScript(): string {
     "const t = process.env.KOVI_GIT_ASKPASS_TOKEN || '';",
     "const q = process.argv.slice(2).join(' ').toLowerCase();",
     "if (q.includes('username')) { process.stdout.write('x-access-token'); process.exit(0); }",
-    "if (q.includes('github.com') || (!q.includes('://') && !q.includes('@'))) {",
-    "  process.stdout.write(t);",
-    "} else {",
-    "  process.stdout.write('');",
-    "}",
+    "// Host-aware: github.com as hostname, not a path substring.",
+    "const hostOk = /(?:^|[\\s@/:])github\\.com(?:[:/\\s]|$)/.test(q) ||",
+    "  (/password|passphrase|token/.test(q) && !q.includes('://') && !q.includes('@'));",
+    "if (hostOk) { process.stdout.write(t); } else { process.stdout.write(''); }",
   ].join("\n");
   try {
     if (!fs.existsSync(jsDest) || fs.readFileSync(jsDest, "utf8") !== script) {
